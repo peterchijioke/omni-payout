@@ -1,6 +1,14 @@
 {
   "name": "@peterchijioke/omni-payout",
-  "version": "1.0.0",
+  "version": "1.0.2",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/peterchijioke/omni-payout.git"
+  },
+  "homepage": "https://github.com/peterchijioke/omni-payout#readme",
+  "bugs": {
+    "url": "https://github.com/peterchijioke/omni-payout/issues"
+  },
   "description": "Unified multi-rail marketplace payout and transfer engine bridging Stripe Connect (US/Europe) and Flutterwave / NIP bank transfers & Mobile Money (Africa).",
   "main": "./dist/index.js",
   "module": "./dist/index.mjs",
