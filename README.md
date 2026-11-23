@@ -22,6 +22,7 @@ Cross-border marketplaces and platforms expanding between the **United States/Eu
 - 🚀 **Stripe Connect Express**: Supports instant debit card payouts and standard transfers.
 - 🏦 **African Bank Name Resolution**: Validates account numbers and retrieves verified legal entity names before sending money.
 - 📱 **Mobile Money Support**: Native payouts to M-Pesa, MTN MoMo, Airtel, Vodafone, Orange, and Wave.
+- 🔁 **Idempotent Retries & Clear Settlement Status**: Deterministic `Idempotency-Key` headers (Stripe) and stable `reference` tracking across retries, normalized `PENDING` / `SUCCESSFUL` / `FAILED` statuses (plus `providerStatus`), and `getPayoutStatus()` / `GetPayoutStatus()` for checking unsettled payouts.
 - 🔒 **Zero Dependencies**: Pure standard library implementation in both Go and TypeScript.
 
 ---
@@ -111,12 +112,21 @@ await payoutEngine.disburse({
 });
 
 // Automatically routes to Flutterwave NIP Bank Transfer
-await payoutEngine.disburse({
+const payout = await payoutEngine.disburse({
   amount: 45000,
   currency: 'NGN',
-  reference: 'PAYOUT-NG-002',
+  reference: 'PAYOUT-NG-002', // Safe to reuse on retry; stays identical in responses
   bankDetails: { bankCode: '058', accountNumber: '0123456789' },
 });
+
+// If accepted by the provider but not yet received by the recipient, status is 'PENDING'
+if (payout.status === 'PENDING') {
+  const latest = await payoutEngine.getPayoutStatus({
+    transactionId: payout.transactionId,
+    rail: payout.rail,
+  });
+  console.log(latest.reference, latest.status, latest.providerStatus);
+}
 ```
 
 ---

@@ -8,6 +8,7 @@ import {
   OnboardingLinkResult,
   OmniPayoutConfig,
   PayoutRail,
+  PayoutStatusParams,
 } from './types';
 
 const AFRICAN_CURRENCIES = new Set(['NGN', 'KES', 'GHS', 'UGX', 'TZS', 'RWF', 'XOF', 'XAF', 'ZAR']);
@@ -64,6 +65,35 @@ export class OmniPayoutEngine {
     }
 
     throw new Error(`Unsupported payout rail: ${rail}`);
+  }
+
+  /**
+   * Fetches the latest settlement status for a previously initiated payout.
+   */
+  async getPayoutStatus(params: PayoutStatusParams): Promise<DisburseResult> {
+    if (!params.transactionId) {
+      throw new Error('transactionId is required to check payout status');
+    }
+
+    if (params.rail === 'STRIPE_CONNECT') {
+      if (!this.stripe) {
+        throw new Error('Stripe Connect provider is not configured (missing secretKey)');
+      }
+      return this.stripe.getPayoutStatus(
+        params.transactionId,
+        params.stripeAccountId,
+        params.reference
+      );
+    }
+
+    if (params.rail === 'FLUTTERWAVE') {
+      if (!this.flutterwave) {
+        throw new Error('Flutterwave provider is not configured (missing secretKey)');
+      }
+      return this.flutterwave.getPayoutStatus(params.transactionId, params.reference);
+    }
+
+    throw new Error(`Unsupported payout rail: ${params.rail}`);
   }
 
   /**

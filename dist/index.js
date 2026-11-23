@@ -27,6 +27,21 @@ __export(index_exports, {
 module.exports = __toCommonJS(index_exports);
 
 // src/adapters/stripe.adapter.ts
+function normalizeStripeStatus(rawStatus, defaultStatus) {
+  if (!rawStatus) return defaultStatus;
+  switch (rawStatus.toLowerCase()) {
+    case "paid":
+    case "succeeded":
+    case "successful":
+      return "SUCCESSFUL";
+    case "failed":
+    case "canceled":
+    case "cancelled":
+      return "FAILED";
+    default:
+      return "PENDING";
+  }
+}
 var StripeConnectAdapter = class {
   constructor(secretKey) {
     this.secretKey = secretKey;
@@ -37,9 +52,11 @@ var StripeConnectAdapter = class {
     const url = `https://api.stripe.com/v1${endpoint}`;
     const headers = {
       Authorization: `Bearer ${this.secretKey}`,
-      "Content-Type": "application/x-www-form-urlencoded",
       ...options.headers
     };
+    if (options.method && options.method.toUpperCase() !== "GET" && !headers["Content-Type"]) {
+      headers["Content-Type"] = "application/x-www-form-urlencoded";
+    }
     const res = await fetch(url, { ...options, headers });
     const data = await res.json();
     if (!res.ok) {
@@ -63,31 +80,70 @@ var StripeConnectAdapter = class {
     }
     const transfer = await this.request("/transfers", {
       method: "POST",
+      headers: {
+        "Idempotency-Key": `${params.reference}:transfer`
+      },
       body: transferBody.toString()
     });
     let transactionId = transfer.id;
+    let providerStatus = transfer.status;
+    let status = normalizeStripeStatus(transfer.status, "SUCCESSFUL");
+    let failureMessage;
+    let rawResponse = transfer;
     if (params.speed === "instant") {
       const payoutBody = new URLSearchParams({
         amount: String(amountInCents),
         currency: params.currency.toLowerCase(),
-        method: "instant"
+        method: "instant",
+        "metadata[reference]": params.reference
       });
       const payout = await this.request("/payouts", {
         method: "POST",
-        headers: { "Stripe-Account": params.stripeAccountId },
+        headers: {
+          "Stripe-Account": params.stripeAccountId,
+          "Idempotency-Key": `${params.reference}:payout`
+        },
         body: payoutBody.toString()
       });
       transactionId = payout.id;
+      providerStatus = payout.status;
+      status = normalizeStripeStatus(payout.status, "PENDING");
+      failureMessage = payout.failure_message || void 0;
+      rawResponse = payout;
     }
     return {
-      success: true,
+      success: status !== "FAILED",
       transactionId,
       reference: params.reference,
-      status: "SUCCESSFUL",
+      status,
+      providerStatus,
       rail: "STRIPE_CONNECT",
       amount: params.amount,
       currency: params.currency.toUpperCase(),
-      rawResponse: transfer
+      error: status === "FAILED" ? failureMessage || "Stripe payout failed" : void 0,
+      rawResponse
+    };
+  }
+  async getPayoutStatus(transactionId, stripeAccountId, reference) {
+    const isPayout = transactionId.startsWith("po_");
+    const endpoint = isPayout ? `/payouts/${transactionId}` : `/transfers/${transactionId}`;
+    const headers = {};
+    if (isPayout && stripeAccountId) {
+      headers["Stripe-Account"] = stripeAccountId;
+    }
+    const data = await this.request(endpoint, { method: "GET", headers });
+    const status = normalizeStripeStatus(data.status, isPayout ? "PENDING" : "SUCCESSFUL");
+    return {
+      success: status !== "FAILED",
+      transactionId: data.id || transactionId,
+      reference: data.metadata?.reference || reference || transactionId,
+      status,
+      providerStatus: data.status,
+      rail: "STRIPE_CONNECT",
+      amount: typeof data.amount === "number" ? data.amount / 100 : 0,
+      currency: (data.currency || "").toUpperCase(),
+      error: status === "FAILED" ? data.failure_message || "Stripe payout failed" : void 0,
+      rawResponse: data
     };
   }
   async createOnboardingLink(params) {
@@ -109,6 +165,21 @@ var StripeConnectAdapter = class {
 };
 
 // src/adapters/flutterwave.adapter.ts
+function normalizeFlutterwaveStatus(rawStatus) {
+  if (!rawStatus) return "PENDING";
+  switch (rawStatus.toUpperCase()) {
+    case "SUCCESSFUL":
+    case "SUCCESS":
+      return "SUCCESSFUL";
+    case "FAILED":
+    case "FAIL":
+    case "CANCELLED":
+    case "CANCELED":
+      return "FAILED";
+    default:
+      return "PENDING";
+  }
+}
 var FlutterwaveAdapter = class {
   constructor(secretKey) {
     this.secretKey = secretKey;
@@ -171,17 +242,41 @@ var FlutterwaveAdapter = class {
       method: "POST",
       body: JSON.stringify(payload)
     });
-    const isSuccess = res.status === "success";
     const transferData = res.data || {};
+    const status = normalizeFlutterwaveStatus(transferData.status);
+    const isSuccess = res.status === "success" && status !== "FAILED";
     return {
       success: isSuccess,
       transactionId: String(transferData.id || params.reference),
-      reference: params.reference,
-      status: transferData.status === "SUCCESSFUL" ? "SUCCESSFUL" : "PENDING",
+      reference: transferData.reference || params.reference,
+      status,
+      providerStatus: transferData.status,
       rail: "FLUTTERWAVE",
       amount: params.amount,
       currency: params.currency.toUpperCase(),
       fee: transferData.fee ? Number(transferData.fee) : void 0,
+      error: status === "FAILED" ? transferData.complete_message || res.message : void 0,
+      rawResponse: res
+    };
+  }
+  async getPayoutStatus(transactionId, reference) {
+    const res = await this.request(`/transfers/${transactionId}`, {
+      method: "GET"
+    });
+    const transferData = res.data || {};
+    const status = normalizeFlutterwaveStatus(transferData.status);
+    const isSuccess = res.status === "success" && status !== "FAILED";
+    return {
+      success: isSuccess,
+      transactionId: String(transferData.id || transactionId),
+      reference: transferData.reference || reference || transactionId,
+      status,
+      providerStatus: transferData.status,
+      rail: "FLUTTERWAVE",
+      amount: transferData.amount ? Number(transferData.amount) : 0,
+      currency: (transferData.currency || "").toUpperCase(),
+      fee: transferData.fee ? Number(transferData.fee) : void 0,
+      error: status === "FAILED" ? transferData.complete_message || res.message : void 0,
       rawResponse: res
     };
   }
@@ -234,6 +329,31 @@ var OmniPayoutEngine = class {
       return this.flutterwave.disburse(params);
     }
     throw new Error(`Unsupported payout rail: ${rail}`);
+  }
+  /**
+   * Fetches the latest settlement status for a previously initiated payout.
+   */
+  async getPayoutStatus(params) {
+    if (!params.transactionId) {
+      throw new Error("transactionId is required to check payout status");
+    }
+    if (params.rail === "STRIPE_CONNECT") {
+      if (!this.stripe) {
+        throw new Error("Stripe Connect provider is not configured (missing secretKey)");
+      }
+      return this.stripe.getPayoutStatus(
+        params.transactionId,
+        params.stripeAccountId,
+        params.reference
+      );
+    }
+    if (params.rail === "FLUTTERWAVE") {
+      if (!this.flutterwave) {
+        throw new Error("Flutterwave provider is not configured (missing secretKey)");
+      }
+      return this.flutterwave.getPayoutStatus(params.transactionId, params.reference);
+    }
+    throw new Error(`Unsupported payout rail: ${params.rail}`);
   }
   /**
    * Resolves a Nigerian / African bank account name using NIP inquiry.

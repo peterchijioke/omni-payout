@@ -1,4 +1,29 @@
-import { DisburseParams, DisburseResult, OnboardingLinkParams, OnboardingLinkResult } from '../types';
+import {
+  DisburseParams,
+  DisburseResult,
+  OnboardingLinkParams,
+  OnboardingLinkResult,
+  PayoutStatus,
+} from '../types';
+
+function normalizeStripeStatus(
+  rawStatus: string | undefined,
+  defaultStatus: PayoutStatus
+): PayoutStatus {
+  if (!rawStatus) return defaultStatus;
+  switch (rawStatus.toLowerCase()) {
+    case 'paid':
+    case 'succeeded':
+    case 'successful':
+      return 'SUCCESSFUL';
+    case 'failed':
+    case 'canceled':
+    case 'cancelled':
+      return 'FAILED';
+    default:
+      return 'PENDING';
+  }
+}
 
 export class StripeConnectAdapter {
   constructor(private readonly secretKey: string) {
@@ -7,11 +32,13 @@ export class StripeConnectAdapter {
 
   private async request(endpoint: string, options: RequestInit = {}): Promise<any> {
     const url = `https://api.stripe.com/v1${endpoint}`;
-    const headers = {
+    const headers: Record<string, string> = {
       Authorization: `Bearer ${this.secretKey}`,
-      'Content-Type': 'application/x-www-form-urlencoded',
-      ...options.headers,
+      ...(options.headers as Record<string, string>),
     };
+    if (options.method && options.method.toUpperCase() !== 'GET' && !headers['Content-Type']) {
+      headers['Content-Type'] = 'application/x-www-form-urlencoded';
+    }
 
     const res = await fetch(url, { ...options, headers });
     const data = await res.json();
@@ -29,7 +56,7 @@ export class StripeConnectAdapter {
     // Convert decimal amount to cents/smallest currency unit
     const amountInCents = Math.round(params.amount * 100);
 
-    // 1. Transfer funds from platform to connected account
+    // 1. Transfer funds from platform to connected account (idempotent per reference)
     const transferBody = new URLSearchParams({
       amount: String(amountInCents),
       currency: params.currency.toLowerCase(),
@@ -42,10 +69,17 @@ export class StripeConnectAdapter {
 
     const transfer = await this.request('/transfers', {
       method: 'POST',
+      headers: {
+        'Idempotency-Key': `${params.reference}:transfer`,
+      },
       body: transferBody.toString(),
     });
 
     let transactionId = transfer.id;
+    let providerStatus: string | undefined = transfer.status;
+    let status: PayoutStatus = normalizeStripeStatus(transfer.status, 'SUCCESSFUL');
+    let failureMessage: string | undefined;
+    let rawResponse: any = transfer;
 
     // 2. If instant payout requested, trigger an instant payout on the connected account
     if (params.speed === 'instant') {
@@ -53,25 +87,64 @@ export class StripeConnectAdapter {
         amount: String(amountInCents),
         currency: params.currency.toLowerCase(),
         method: 'instant',
+        'metadata[reference]': params.reference,
       });
 
       const payout = await this.request('/payouts', {
         method: 'POST',
-        headers: { 'Stripe-Account': params.stripeAccountId },
+        headers: {
+          'Stripe-Account': params.stripeAccountId,
+          'Idempotency-Key': `${params.reference}:payout`,
+        },
         body: payoutBody.toString(),
       });
       transactionId = payout.id;
+      providerStatus = payout.status;
+      status = normalizeStripeStatus(payout.status, 'PENDING');
+      failureMessage = payout.failure_message || undefined;
+      rawResponse = payout;
     }
 
     return {
-      success: true,
+      success: status !== 'FAILED',
       transactionId,
       reference: params.reference,
-      status: 'SUCCESSFUL',
+      status,
+      providerStatus,
       rail: 'STRIPE_CONNECT',
       amount: params.amount,
       currency: params.currency.toUpperCase(),
-      rawResponse: transfer,
+      error: status === 'FAILED' ? failureMessage || 'Stripe payout failed' : undefined,
+      rawResponse,
+    };
+  }
+
+  async getPayoutStatus(
+    transactionId: string,
+    stripeAccountId?: string,
+    reference?: string
+  ): Promise<DisburseResult> {
+    const isPayout = transactionId.startsWith('po_');
+    const endpoint = isPayout ? `/payouts/${transactionId}` : `/transfers/${transactionId}`;
+    const headers: Record<string, string> = {};
+    if (isPayout && stripeAccountId) {
+      headers['Stripe-Account'] = stripeAccountId;
+    }
+
+    const data = await this.request(endpoint, { method: 'GET', headers });
+    const status = normalizeStripeStatus(data.status, isPayout ? 'PENDING' : 'SUCCESSFUL');
+
+    return {
+      success: status !== 'FAILED',
+      transactionId: data.id || transactionId,
+      reference: data.metadata?.reference || reference || transactionId,
+      status,
+      providerStatus: data.status,
+      rail: 'STRIPE_CONNECT',
+      amount: typeof data.amount === 'number' ? data.amount / 100 : 0,
+      currency: (data.currency || '').toUpperCase(),
+      error: status === 'FAILED' ? data.failure_message || 'Stripe payout failed' : undefined,
+      rawResponse: data,
     };
   }
 

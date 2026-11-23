@@ -1,5 +1,6 @@
 type PayoutRail = 'STRIPE_CONNECT' | 'FLUTTERWAVE';
 type PayoutSpeed = 'standard' | 'instant';
+type PayoutStatus = 'PENDING' | 'SUCCESSFUL' | 'FAILED';
 interface BankAccountDetails {
     bankCode: string;
     accountNumber: string;
@@ -25,13 +26,20 @@ interface DisburseResult {
     success: boolean;
     transactionId: string;
     reference: string;
-    status: 'PENDING' | 'SUCCESSFUL' | 'FAILED';
+    status: PayoutStatus;
+    providerStatus?: string;
     rail: PayoutRail;
     amount: number;
     currency: string;
     fee?: number;
     error?: string;
     rawResponse?: any;
+}
+interface PayoutStatusParams {
+    transactionId: string;
+    rail: PayoutRail;
+    stripeAccountId?: string;
+    reference?: string;
 }
 interface BankResolutionResult {
     accountName: string;
@@ -65,6 +73,7 @@ declare class StripeConnectAdapter {
     constructor(secretKey: string);
     private request;
     disburse(params: DisburseParams): Promise<DisburseResult>;
+    getPayoutStatus(transactionId: string, stripeAccountId?: string, reference?: string): Promise<DisburseResult>;
     createOnboardingLink(params: OnboardingLinkParams): Promise<OnboardingLinkResult>;
 }
 
@@ -74,6 +83,7 @@ declare class FlutterwaveAdapter {
     private request;
     resolveBankAccount(bankCode: string, accountNumber: string): Promise<BankResolutionResult>;
     disburse(params: DisburseParams): Promise<DisburseResult>;
+    getPayoutStatus(transactionId: string, reference?: string): Promise<DisburseResult>;
 }
 
 declare class OmniPayoutEngine {
@@ -89,6 +99,10 @@ declare class OmniPayoutEngine {
      */
     disburse(params: DisburseParams): Promise<DisburseResult>;
     /**
+     * Fetches the latest settlement status for a previously initiated payout.
+     */
+    getPayoutStatus(params: PayoutStatusParams): Promise<DisburseResult>;
+    /**
      * Resolves a Nigerian / African bank account name using NIP inquiry.
      */
     resolveBankAccount(bankCode: string, accountNumber: string): Promise<BankResolutionResult>;
@@ -98,4 +112,4 @@ declare class OmniPayoutEngine {
     createConnectOnboardingLink(params: OnboardingLinkParams): Promise<OnboardingLinkResult>;
 }
 
-export { type BankAccountDetails, type BankResolutionResult, type DisburseParams, type DisburseResult, FlutterwaveAdapter, type MobileMoneyDetails, type OmniPayoutConfig, OmniPayoutEngine, type OnboardingLinkParams, type OnboardingLinkResult, type PayoutRail, type PayoutSpeed, StripeConnectAdapter };
+export { type BankAccountDetails, type BankResolutionResult, type DisburseParams, type DisburseResult, FlutterwaveAdapter, type MobileMoneyDetails, type OmniPayoutConfig, OmniPayoutEngine, type OnboardingLinkParams, type OnboardingLinkResult, type PayoutRail, type PayoutSpeed, type PayoutStatus, type PayoutStatusParams, StripeConnectAdapter };

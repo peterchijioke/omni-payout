@@ -2,6 +2,8 @@ export type PayoutRail = 'STRIPE_CONNECT' | 'FLUTTERWAVE';
 
 export type PayoutSpeed = 'standard' | 'instant';
 
+export type PayoutStatus = 'PENDING' | 'SUCCESSFUL' | 'FAILED';
+
 export interface BankAccountDetails {
   bankCode: string;
   accountNumber: string;
@@ -30,13 +32,21 @@ export interface DisburseResult {
   success: boolean;
   transactionId: string;
   reference: string;
-  status: 'PENDING' | 'SUCCESSFUL' | 'FAILED';
+  status: PayoutStatus;
+  providerStatus?: string;
   rail: PayoutRail;
   amount: number;
   currency: string;
   fee?: number;
   error?: string;
   rawResponse?: any;
+}
+
+export interface PayoutStatusParams {
+  transactionId: string;
+  rail: PayoutRail;
+  stripeAccountId?: string;
+  reference?: string;
 }
 
 export interface BankResolutionResult {

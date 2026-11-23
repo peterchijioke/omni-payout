@@ -17,6 +17,34 @@ var africanCurrencies = map[string]bool{
 	"TZS": true, "RWF": true, "XOF": true, "XAF": true, "ZAR": true,
 }
 
+func normalizeStripeStatus(rawStatus string, defaultStatus PayoutStatus) string {
+	if rawStatus == "" {
+		return string(defaultStatus)
+	}
+	switch strings.ToLower(rawStatus) {
+	case "paid", "succeeded", "successful":
+		return string(StatusSuccessful)
+	case "failed", "canceled", "cancelled":
+		return string(StatusFailed)
+	default:
+		return string(StatusPending)
+	}
+}
+
+func normalizeFlutterwaveStatus(rawStatus string) string {
+	if rawStatus == "" {
+		return string(StatusPending)
+	}
+	switch strings.ToUpper(rawStatus) {
+	case "SUCCESSFUL", "SUCCESS":
+		return string(StatusSuccessful)
+	case "FAILED", "FAIL", "CANCELLED", "CANCELED":
+		return string(StatusFailed)
+	default:
+		return string(StatusPending)
+	}
+}
+
 // Engine is the central multi-rail payout client.
 type Engine struct {
 	config     Config
@@ -94,6 +122,7 @@ func (e *Engine) disburseStripe(params DisburseParams) (*DisburseResult, error) 
 	}
 	req.Header.Set("Authorization", "Bearer "+e.config.StripeSecretKey)
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	req.Header.Set("Idempotency-Key", params.Reference+":transfer")
 
 	resp, err := e.httpClient.Do(req)
 	if err != nil {
@@ -103,8 +132,10 @@ func (e *Engine) disburseStripe(params DisburseParams) (*DisburseResult, error) 
 
 	bodyBytes, _ := io.ReadAll(resp.Body)
 	var stripeResp struct {
-		ID    string `json:"id"`
-		Error *struct {
+		ID             string `json:"id"`
+		Status         string `json:"status"`
+		FailureMessage string `json:"failure_message"`
+		Error          *struct {
 			Message string `json:"message"`
 		} `json:"error"`
 	}
@@ -119,6 +150,9 @@ func (e *Engine) disburseStripe(params DisburseParams) (*DisburseResult, error) 
 	}
 
 	txID := stripeResp.ID
+	providerStatus := stripeResp.Status
+	status := normalizeStripeStatus(stripeResp.Status, StatusSuccessful)
+	failureMsg := stripeResp.FailureMessage
 
 	// Instant payout execution if requested
 	if params.Speed == SpeedInstant {
@@ -126,34 +160,69 @@ func (e *Engine) disburseStripe(params DisburseParams) (*DisburseResult, error) 
 		payoutForm.Set("amount", fmt.Sprintf("%d", amountInCents))
 		payoutForm.Set("currency", strings.ToLower(params.Currency))
 		payoutForm.Set("method", "instant")
+		payoutForm.Set("metadata[reference]", params.Reference)
 
-		payoutReq, _ := http.NewRequest("POST", "https://api.stripe.com/v1/payouts", strings.NewReader(payoutForm.Encode()))
+		payoutReq, err := http.NewRequest("POST", "https://api.stripe.com/v1/payouts", strings.NewReader(payoutForm.Encode()))
+		if err != nil {
+			return nil, err
+		}
 		payoutReq.Header.Set("Authorization", "Bearer "+e.config.StripeSecretKey)
 		payoutReq.Header.Set("Stripe-Account", params.StripeAccountID)
 		payoutReq.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+		payoutReq.Header.Set("Idempotency-Key", params.Reference+":payout")
 
 		pResp, pErr := e.httpClient.Do(payoutReq)
-		if pErr == nil {
-			defer pResp.Body.Close()
-			var pData struct {
-				ID string `json:"id"`
+		if pErr != nil {
+			return nil, pErr
+		}
+		defer pResp.Body.Close()
+
+		var pData struct {
+			ID             string `json:"id"`
+			Status         string `json:"status"`
+			FailureMessage string `json:"failure_message"`
+			Error          *struct {
+				Message string `json:"message"`
+			} `json:"error"`
+		}
+		pBytes, _ := io.ReadAll(pResp.Body)
+		_ = json.Unmarshal(pBytes, &pData)
+
+		if pResp.StatusCode >= 400 || pData.Error != nil {
+			msg := "stripe instant payout failed"
+			if pData.Error != nil {
+				msg = pData.Error.Message
 			}
-			pBytes, _ := io.ReadAll(pResp.Body)
-			_ = json.Unmarshal(pBytes, &pData)
-			if pData.ID != "" {
-				txID = pData.ID
-			}
+			return nil, fmt.Errorf("%s", msg)
+		}
+
+		if pData.ID != "" {
+			txID = pData.ID
+		}
+		providerStatus = pData.Status
+		status = normalizeStripeStatus(pData.Status, StatusPending)
+		failureMsg = pData.FailureMessage
+	}
+
+	errMsg := ""
+	if status == string(StatusFailed) {
+		if failureMsg != "" {
+			errMsg = failureMsg
+		} else {
+			errMsg = "stripe payout failed"
 		}
 	}
 
 	return &DisburseResult{
-		Success:       true,
-		TransactionID: txID,
-		Reference:     params.Reference,
-		Status:        "SUCCESSFUL",
-		Rail:          RailStripeConnect,
-		Amount:        params.Amount,
-		Currency:      strings.ToUpper(params.Currency),
+		Success:        status != string(StatusFailed),
+		TransactionID:  txID,
+		Reference:      params.Reference,
+		Status:         status,
+		ProviderStatus: providerStatus,
+		Rail:           RailStripeConnect,
+		Amount:         params.Amount,
+		Currency:       strings.ToUpper(params.Currency),
+		Error:          errMsg,
 	}, nil
 }
 
@@ -199,9 +268,11 @@ func (e *Engine) disburseFlutterwave(params DisburseParams) (*DisburseResult, er
 		Status  string `json:"status"`
 		Message string `json:"message"`
 		Data    *struct {
-			ID     int64   `json:"id"`
-			Status string  `json:"status"`
-			Fee    float64 `json:"fee"`
+			ID              int64   `json:"id"`
+			Status          string  `json:"status"`
+			Reference       string  `json:"reference"`
+			Fee             float64 `json:"fee"`
+			CompleteMessage string  `json:"complete_message"`
 		} `json:"data"`
 	}
 	_ = json.Unmarshal(bodyBytes, &flwResp)
@@ -211,25 +282,226 @@ func (e *Engine) disburseFlutterwave(params DisburseParams) (*DisburseResult, er
 	}
 
 	txID := params.Reference
+	ref := params.Reference
 	fee := 0.0
-	status := "PENDING"
+	providerStatus := ""
+	status := string(StatusPending)
+	errMsg := ""
 	if flwResp.Data != nil {
-		txID = fmt.Sprintf("%d", flwResp.Data.ID)
+		if flwResp.Data.ID != 0 {
+			txID = fmt.Sprintf("%d", flwResp.Data.ID)
+		}
+		if flwResp.Data.Reference != "" {
+			ref = flwResp.Data.Reference
+		}
 		fee = flwResp.Data.Fee
-		if flwResp.Data.Status == "SUCCESSFUL" {
-			status = "SUCCESSFUL"
+		providerStatus = flwResp.Data.Status
+		status = normalizeFlutterwaveStatus(flwResp.Data.Status)
+		if status == string(StatusFailed) {
+			if flwResp.Data.CompleteMessage != "" {
+				errMsg = flwResp.Data.CompleteMessage
+			} else {
+				errMsg = flwResp.Message
+			}
 		}
 	}
 
 	return &DisburseResult{
-		Success:       true,
-		TransactionID: txID,
-		Reference:     params.Reference,
-		Status:        status,
-		Rail:          RailFlutterwave,
-		Amount:        params.Amount,
-		Currency:      strings.ToUpper(params.Currency),
-		Fee:           fee,
+		Success:        flwResp.Status == "success" && status != string(StatusFailed),
+		TransactionID:  txID,
+		Reference:      ref,
+		Status:         status,
+		ProviderStatus: providerStatus,
+		Rail:           RailFlutterwave,
+		Amount:         params.Amount,
+		Currency:       strings.ToUpper(params.Currency),
+		Fee:            fee,
+		Error:          errMsg,
+	}, nil
+}
+
+// GetPayoutStatus fetches the latest settlement status for a previously initiated payout.
+func (e *Engine) GetPayoutStatus(params PayoutStatusParams) (*DisburseResult, error) {
+	if params.TransactionID == "" {
+		return nil, fmt.Errorf("transactionId is required to check payout status")
+	}
+
+	switch params.Rail {
+	case RailStripeConnect:
+		return e.getStripePayoutStatus(params)
+	case RailFlutterwave:
+		return e.getFlutterwavePayoutStatus(params)
+	default:
+		return nil, fmt.Errorf("unsupported rail: %s", params.Rail)
+	}
+}
+
+func (e *Engine) getStripePayoutStatus(params PayoutStatusParams) (*DisburseResult, error) {
+	if e.config.StripeSecretKey == "" {
+		return nil, fmt.Errorf("stripe secret key is not configured")
+	}
+
+	isPayout := strings.HasPrefix(params.TransactionID, "po_")
+	endpoint := "https://api.stripe.com/v1/transfers/" + params.TransactionID
+	defaultStatus := StatusSuccessful
+	if isPayout {
+		endpoint = "https://api.stripe.com/v1/payouts/" + params.TransactionID
+		defaultStatus = StatusPending
+	}
+
+	req, err := http.NewRequest("GET", endpoint, nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Authorization", "Bearer "+e.config.StripeSecretKey)
+	if isPayout && params.StripeAccountID != "" {
+		req.Header.Set("Stripe-Account", params.StripeAccountID)
+	}
+
+	resp, err := e.httpClient.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	bodyBytes, _ := io.ReadAll(resp.Body)
+	var data struct {
+		ID             string            `json:"id"`
+		Status         string            `json:"status"`
+		Amount         int64             `json:"amount"`
+		Currency       string            `json:"currency"`
+		FailureMessage string            `json:"failure_message"`
+		Metadata       map[string]string `json:"metadata"`
+		Error          *struct {
+			Message string `json:"message"`
+		} `json:"error"`
+	}
+	_ = json.Unmarshal(bodyBytes, &data)
+
+	if resp.StatusCode >= 400 || data.Error != nil {
+		msg := "stripe status lookup failed"
+		if data.Error != nil {
+			msg = data.Error.Message
+		}
+		return nil, fmt.Errorf("%s", msg)
+	}
+
+	status := normalizeStripeStatus(data.Status, defaultStatus)
+	ref := data.Metadata["reference"]
+	if ref == "" {
+		ref = params.Reference
+	}
+	if ref == "" {
+		ref = params.TransactionID
+	}
+
+	errMsg := ""
+	if status == string(StatusFailed) {
+		if data.FailureMessage != "" {
+			errMsg = data.FailureMessage
+		} else {
+			errMsg = "stripe payout failed"
+		}
+	}
+
+	txID := data.ID
+	if txID == "" {
+		txID = params.TransactionID
+	}
+
+	return &DisburseResult{
+		Success:        status != string(StatusFailed),
+		TransactionID:  txID,
+		Reference:      ref,
+		Status:         status,
+		ProviderStatus: data.Status,
+		Rail:           RailStripeConnect,
+		Amount:         float64(data.Amount) / 100.0,
+		Currency:       strings.ToUpper(data.Currency),
+		Error:          errMsg,
+	}, nil
+}
+
+func (e *Engine) getFlutterwavePayoutStatus(params PayoutStatusParams) (*DisburseResult, error) {
+	if e.config.FlutterwaveSecretKey == "" {
+		return nil, fmt.Errorf("flutterwave secret key is not configured")
+	}
+
+	req, err := http.NewRequest("GET", "https://api.flutterwave.com/v3/transfers/"+params.TransactionID, nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Authorization", "Bearer "+e.config.FlutterwaveSecretKey)
+
+	resp, err := e.httpClient.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	bodyBytes, _ := io.ReadAll(resp.Body)
+	var flwResp struct {
+		Status  string `json:"status"`
+		Message string `json:"message"`
+		Data    *struct {
+			ID              int64   `json:"id"`
+			Status          string  `json:"status"`
+			Reference       string  `json:"reference"`
+			Amount          float64 `json:"amount"`
+			Currency        string  `json:"currency"`
+			Fee             float64 `json:"fee"`
+			CompleteMessage string  `json:"complete_message"`
+		} `json:"data"`
+	}
+	_ = json.Unmarshal(bodyBytes, &flwResp)
+
+	if resp.StatusCode >= 400 || flwResp.Status == "error" {
+		return nil, fmt.Errorf("flutterwave status lookup error: %s", flwResp.Message)
+	}
+
+	txID := params.TransactionID
+	ref := params.Reference
+	if ref == "" {
+		ref = params.TransactionID
+	}
+	amount := 0.0
+	currency := ""
+	fee := 0.0
+	providerStatus := ""
+	status := string(StatusPending)
+	errMsg := ""
+	if flwResp.Data != nil {
+		if flwResp.Data.ID != 0 {
+			txID = fmt.Sprintf("%d", flwResp.Data.ID)
+		}
+		if flwResp.Data.Reference != "" {
+			ref = flwResp.Data.Reference
+		}
+		amount = flwResp.Data.Amount
+		currency = strings.ToUpper(flwResp.Data.Currency)
+		fee = flwResp.Data.Fee
+		providerStatus = flwResp.Data.Status
+		status = normalizeFlutterwaveStatus(flwResp.Data.Status)
+		if status == string(StatusFailed) {
+			if flwResp.Data.CompleteMessage != "" {
+				errMsg = flwResp.Data.CompleteMessage
+			} else {
+				errMsg = flwResp.Message
+			}
+		}
+	}
+
+	return &DisburseResult{
+		Success:        flwResp.Status == "success" && status != string(StatusFailed),
+		TransactionID:  txID,
+		Reference:      ref,
+		Status:         status,
+		ProviderStatus: providerStatus,
+		Rail:           RailFlutterwave,
+		Amount:         amount,
+		Currency:       currency,
+		Fee:            fee,
+		Error:          errMsg,
 	}, nil
 }
 

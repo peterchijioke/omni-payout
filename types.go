@@ -45,17 +45,35 @@ type DisburseParams struct {
 	Metadata           map[string]string   `json:"metadata,omitempty"`
 }
 
+// PayoutStatus represents the normalized settlement status of a payout.
+type PayoutStatus string
+
+const (
+	StatusPending    PayoutStatus = "PENDING"
+	StatusSuccessful PayoutStatus = "SUCCESSFUL"
+	StatusFailed     PayoutStatus = "FAILED"
+)
+
 // DisburseResult is the normalized result returned from any payout rail.
 type DisburseResult struct {
-	Success       bool       `json:"success"`
-	TransactionID string     `json:"transactionId"`
-	Reference     string     `json:"reference"`
-	Status        string     `json:"status"` // "SUCCESSFUL", "PENDING", "FAILED"
-	Rail          PayoutRail `json:"rail"`
-	Amount        float64    `json:"amount"`
-	Currency      string     `json:"currency"`
-	Fee           float64    `json:"fee,omitempty"`
-	Error         string     `json:"error,omitempty"`
+	Success        bool       `json:"success"`
+	TransactionID  string     `json:"transactionId"`
+	Reference      string     `json:"reference"`
+	Status         string     `json:"status"` // "SUCCESSFUL", "PENDING", "FAILED"
+	ProviderStatus string     `json:"providerStatus,omitempty"`
+	Rail           PayoutRail `json:"rail"`
+	Amount         float64    `json:"amount"`
+	Currency       string     `json:"currency"`
+	Fee            float64    `json:"fee,omitempty"`
+	Error          string     `json:"error,omitempty"`
+}
+
+// PayoutStatusParams defines inputs to fetch the latest status of a payout.
+type PayoutStatusParams struct {
+	TransactionID   string     `json:"transactionId"`
+	Rail            PayoutRail `json:"rail"`
+	StripeAccountID string     `json:"stripeAccountId,omitempty"`
+	Reference       string     `json:"reference,omitempty"`
 }
 
 // BankResolutionResult holds the resolved account details from NIP inquiry.

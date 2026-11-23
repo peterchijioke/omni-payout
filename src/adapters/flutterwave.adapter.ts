@@ -1,4 +1,20 @@
-import { BankResolutionResult, DisburseParams, DisburseResult } from '../types';
+import { BankResolutionResult, DisburseParams, DisburseResult, PayoutStatus } from '../types';
+
+function normalizeFlutterwaveStatus(rawStatus?: string): PayoutStatus {
+  if (!rawStatus) return 'PENDING';
+  switch (rawStatus.toUpperCase()) {
+    case 'SUCCESSFUL':
+    case 'SUCCESS':
+      return 'SUCCESSFUL';
+    case 'FAILED':
+    case 'FAIL':
+    case 'CANCELLED':
+    case 'CANCELED':
+      return 'FAILED';
+    default:
+      return 'PENDING';
+  }
+}
 
 export class FlutterwaveAdapter {
   constructor(private readonly secretKey: string) {
@@ -68,18 +84,45 @@ export class FlutterwaveAdapter {
       body: JSON.stringify(payload),
     });
 
-    const isSuccess = res.status === 'success';
     const transferData = res.data || {};
+    const status = normalizeFlutterwaveStatus(transferData.status);
+    const isSuccess = res.status === 'success' && status !== 'FAILED';
 
     return {
       success: isSuccess,
       transactionId: String(transferData.id || params.reference),
-      reference: params.reference,
-      status: transferData.status === 'SUCCESSFUL' ? 'SUCCESSFUL' : 'PENDING',
+      reference: transferData.reference || params.reference,
+      status,
+      providerStatus: transferData.status,
       rail: 'FLUTTERWAVE',
       amount: params.amount,
       currency: params.currency.toUpperCase(),
       fee: transferData.fee ? Number(transferData.fee) : undefined,
+      error: status === 'FAILED' ? transferData.complete_message || res.message : undefined,
+      rawResponse: res,
+    };
+  }
+
+  async getPayoutStatus(transactionId: string, reference?: string): Promise<DisburseResult> {
+    const res = await this.request(`/transfers/${transactionId}`, {
+      method: 'GET',
+    });
+
+    const transferData = res.data || {};
+    const status = normalizeFlutterwaveStatus(transferData.status);
+    const isSuccess = res.status === 'success' && status !== 'FAILED';
+
+    return {
+      success: isSuccess,
+      transactionId: String(transferData.id || transactionId),
+      reference: transferData.reference || reference || transactionId,
+      status,
+      providerStatus: transferData.status,
+      rail: 'FLUTTERWAVE',
+      amount: transferData.amount ? Number(transferData.amount) : 0,
+      currency: (transferData.currency || '').toUpperCase(),
+      fee: transferData.fee ? Number(transferData.fee) : undefined,
+      error: status === 'FAILED' ? transferData.complete_message || res.message : undefined,
       rawResponse: res,
     };
   }
