@@ -77,7 +77,7 @@ func main() {
 	ngResult, err := engine.Disburse(omnipayout.DisburseParams{
 		Amount:    45000,
 		Currency:  "NGN",
-		Reference: "PAYOUT-NG-002",
+		Reference: "PAYOUT-NG-002", // Safe to reuse on retry; stays identical in responses
 		BankDetails: &omnipayout.BankAccountDetails{
 			BankCode:      "058", // GTBank
 			AccountNumber: "0123456789",
@@ -87,7 +87,19 @@ func main() {
 	if err != nil {
 		log.Fatalf("Flutterwave payout error: %v", err)
 	}
-	fmt.Printf("NG Payout Success: %s (TxID: %s)\n", ngResult.Status, ngResult.TransactionID)
+	fmt.Printf("NG Payout: %s (Ref: %s, TxID: %s)\n", ngResult.Status, ngResult.Reference, ngResult.TransactionID)
+
+	// 3. Check settlement status if the payout was accepted but not yet received
+	if ngResult.Status == string(omnipayout.StatusPending) {
+		latest, err := engine.GetPayoutStatus(omnipayout.PayoutStatusParams{
+			TransactionID: ngResult.TransactionID,
+			Rail:          ngResult.Rail,
+		})
+		if err != nil {
+			log.Fatalf("Status lookup error: %v", err)
+		}
+		fmt.Printf("Latest Status: %s (Provider: %s, Ref: %s)\n", latest.Status, latest.ProviderStatus, latest.Reference)
+	}
 }
 ```
 
