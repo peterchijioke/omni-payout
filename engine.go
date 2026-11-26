@@ -68,6 +68,7 @@ func normalizePaystackStatus(rawStatus string) string {
 type Engine struct {
 	config     Config
 	httpClient *http.Client
+	health     *railHealthTracker
 }
 
 // NewEngine initializes a new multi-rail payout engine.
@@ -75,7 +76,44 @@ func NewEngine(cfg Config) *Engine {
 	return &Engine{
 		config:     cfg,
 		httpClient: &http.Client{Timeout: 30 * time.Second},
+		health:     newRailHealthTracker(cfg.Health),
 	}
+}
+
+func (e *Engine) getConfiguredRails() []PayoutRail {
+	var rails []PayoutRail
+	if e.config.StripeSecretKey != "" {
+		rails = append(rails, RailStripeConnect)
+	}
+	if e.config.FlutterwaveSecretKey != "" {
+		rails = append(rails, RailFlutterwave)
+	}
+	if e.config.PaystackSecretKey != "" {
+		rails = append(rails, RailPaystack)
+	}
+	if e.config.PawaPayAPIToken != "" {
+		rails = append(rails, RailPawaPay)
+	}
+	if e.config.YellowCardAPIKey != "" && e.config.YellowCardSecretKey != "" {
+		rails = append(rails, RailYellowCard)
+	}
+	if e.config.MpesaDaraja != nil && e.config.MpesaDaraja.ConsumerKey != "" {
+		rails = append(rails, RailMpesaDaraja)
+	}
+	return rails
+}
+
+// GetRailHealth returns live uptime/latency and circuit-breaker state for one or all configured rails.
+func (e *Engine) GetRailHealth(rail PayoutRail) []RailHealth {
+	if rail != "" {
+		return []RailHealth{e.health.getHealth(rail)}
+	}
+	rails := e.getConfiguredRails()
+	out := make([]RailHealth, 0, len(rails))
+	for _, r := range rails {
+		out = append(out, e.health.getHealth(r))
+	}
+	return out
 }
 
 // ResolveRail determines the optimal primary payment rail based on parameters or currency.
@@ -86,9 +124,34 @@ func (e *Engine) ResolveRail(params DisburseParams) PayoutRail {
 	if params.StripeAccountID != "" {
 		return RailStripeConnect
 	}
-	if params.BankDetails != nil || params.MobileMoneyDetails != nil || africanCurrencies[strings.ToUpper(params.Currency)] {
-		if e.config.FlutterwaveSecretKey == "" && e.config.PaystackSecretKey != "" {
+	cur := strings.ToUpper(params.Currency)
+	if params.MobileMoneyDetails != nil {
+		if e.config.FlutterwaveSecretKey != "" {
+			return RailFlutterwave
+		}
+		if cur == "KES" && strings.EqualFold(params.MobileMoneyDetails.Network, "MPESA") && e.config.MpesaDaraja != nil {
+			return RailMpesaDaraja
+		}
+		if e.config.PawaPayAPIToken != "" {
+			return RailPawaPay
+		}
+		if e.config.YellowCardAPIKey != "" {
+			return RailYellowCard
+		}
+		if e.config.PaystackSecretKey != "" {
 			return RailPaystack
+		}
+		return RailFlutterwave
+	}
+	if params.BankDetails != nil || africanCurrencies[cur] {
+		if e.config.FlutterwaveSecretKey != "" {
+			return RailFlutterwave
+		}
+		if e.config.PaystackSecretKey != "" {
+			return RailPaystack
+		}
+		if e.config.YellowCardAPIKey != "" {
+			return RailYellowCard
 		}
 		return RailFlutterwave
 	}
@@ -103,12 +166,18 @@ func (e *Engine) disburseOnRail(rail PayoutRail, params DisburseParams) (*Disbur
 		return e.disburseFlutterwave(params)
 	case RailPaystack:
 		return e.disbursePaystack(params)
+	case RailPawaPay:
+		return e.disbursePawaPay(params)
+	case RailYellowCard:
+		return e.disburseYellowCard(params)
+	case RailMpesaDaraja:
+		return e.disburseMpesaDaraja(params)
 	default:
 		return nil, fmt.Errorf("unsupported rail: %s", rail)
 	}
 }
 
-// Disburse executes a disbursement with optional pre-flight balance checks and automatic failover.
+// Disburse executes a disbursement with circuit-breaker health checks, pre-flight balance checks, and automatic failover.
 func (e *Engine) Disburse(params DisburseParams) (*DisburseResult, error) {
 	if params.Amount <= 0 {
 		return nil, fmt.Errorf("disbursement amount must be greater than zero")
@@ -134,6 +203,13 @@ func (e *Engine) Disburse(params DisburseParams) (*DisburseResult, error) {
 
 	for i, rail := range candidates {
 		hasFallback := i < len(candidates)-1
+
+		// Proactive circuit-breaker skip when rail is unhealthy and a fallback exists
+		if !e.health.isAvailable(rail) && hasFallback {
+			lastErr = fmt.Errorf("rail %s circuit breaker is open (unhealthy)", rail)
+			continue
+		}
+
 		attempted = append(attempted, rail)
 
 		if params.CheckBalanceBeforeDisburse {
@@ -161,18 +237,26 @@ func (e *Engine) Disburse(params DisburseParams) (*DisburseResult, error) {
 			}
 		}
 
+		start := time.Now()
 		res, err := e.disburseOnRail(rail, params)
+		latency := time.Since(start)
 		if err != nil {
+			e.health.recordFailure(rail, latency, err.Error())
 			lastErr = err
 			if hasFallback {
 				continue
 			}
 			return nil, err
 		}
-		if res.Status == string(StatusFailed) && hasFallback {
-			lastFailed = res
-			lastErr = fmt.Errorf("%s disbursement returned FAILED: %s", rail, res.Error)
-			continue
+		if res.Status == string(StatusFailed) {
+			e.health.recordFailure(rail, latency, res.Error)
+			if hasFallback {
+				lastFailed = res
+				lastErr = fmt.Errorf("%s disbursement returned FAILED: %s", rail, res.Error)
+				continue
+			}
+		} else {
+			e.health.recordSuccess(rail, latency)
 		}
 
 		res.AttemptedRails = attempted
@@ -425,6 +509,12 @@ func (e *Engine) GetPayoutStatus(params PayoutStatusParams) (*DisburseResult, er
 		return e.getFlutterwavePayoutStatus(params)
 	case RailPaystack:
 		return e.getPaystackPayoutStatus(params)
+	case RailPawaPay:
+		return e.getPawaPayPayoutStatus(params)
+	case RailYellowCard:
+		return e.getYellowCardPayoutStatus(params)
+	case RailMpesaDaraja:
+		return e.getMpesaDarajaPayoutStatus(params)
 	default:
 		return nil, fmt.Errorf("unsupported rail: %s", params.Rail)
 	}
@@ -890,6 +980,12 @@ func (e *Engine) GetBalances(rail PayoutRail) ([]RailBalance, error) {
 			return e.getFlutterwaveBalances()
 		case RailPaystack:
 			return e.getPaystackBalances()
+		case RailPawaPay:
+			return e.getPawaPayBalances()
+		case RailYellowCard:
+			return e.getYellowCardBalances()
+		case RailMpesaDaraja:
+			return e.getMpesaDarajaBalances()
 		default:
 			return nil, fmt.Errorf("unsupported rail: %s", rail)
 		}
@@ -912,6 +1008,27 @@ func (e *Engine) GetBalances(rail PayoutRail) ([]RailBalance, error) {
 	}
 	if e.config.PaystackSecretKey != "" {
 		b, err := e.getPaystackBalances()
+		if err != nil {
+			return nil, err
+		}
+		all = append(all, b...)
+	}
+	if e.config.PawaPayAPIToken != "" {
+		b, err := e.getPawaPayBalances()
+		if err != nil {
+			return nil, err
+		}
+		all = append(all, b...)
+	}
+	if e.config.YellowCardAPIKey != "" && e.config.YellowCardSecretKey != "" {
+		b, err := e.getYellowCardBalances()
+		if err != nil {
+			return nil, err
+		}
+		all = append(all, b...)
+	}
+	if e.config.MpesaDaraja != nil && e.config.MpesaDaraja.ConsumerKey != "" {
+		b, err := e.getMpesaDarajaBalances()
 		if err != nil {
 			return nil, err
 		}
@@ -1088,6 +1205,12 @@ func (e *Engine) VerifyWebhook(rail PayoutRail, rawBody []byte, signature string
 		return e.verifyFlutterwaveWebhook(rawBody, signature)
 	case RailPaystack:
 		return e.verifyPaystackWebhook(rawBody, signature)
+	case RailPawaPay:
+		return e.verifyPawaPayWebhook(rawBody, signature)
+	case RailYellowCard:
+		return e.verifyYellowCardWebhook(rawBody, signature)
+	case RailMpesaDaraja:
+		return e.verifyMpesaDarajaWebhook(rawBody, signature)
 	default:
 		return nil, fmt.Errorf("unsupported rail: %s", rail)
 	}

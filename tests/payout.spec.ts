@@ -453,5 +453,172 @@ describe('OmniPayoutEngine', () => {
         'Invalid Paystack webhook signature'
       );
     });
+
+    it('disburses via PawaPay, Yellow Card, and M-Pesa Daraja and verifies their webhooks', async () => {
+      const africaEngine = new OmniPayoutEngine({
+        pawapay: { apiToken: 'pp_token_mock', webhookSecret: 'pp_wh_secret' },
+        yellowCard: { apiKey: 'yc_key_mock', secretKey: 'yc_secret_mock', webhookSecret: 'yc_wh_secret' },
+        mpesaDaraja: {
+          consumerKey: 'mpesa_key',
+          consumerSecret: 'mpesa_secret',
+          shortCode: '600999',
+          initiatorName: 'testapi',
+          securityCredential: 'encrypted_cred',
+          resultUrl: 'https://example.com/mpesa/result',
+          queueTimeoutUrl: 'https://example.com/mpesa/timeout',
+          webhookSecret: 'mpesa_wh_secret',
+        },
+      });
+
+      const fetchMock = jest.fn().mockImplementation(async (url: string, init?: any) => {
+        if (url.includes('pawapay.io')) {
+          return {
+            ok: true,
+            json: async () => ({ payoutId: 'PP-REF-001', status: 'ACCEPTED' }),
+          };
+        }
+        if (url.includes('yellowcard.io')) {
+          expect(init.headers['Authorization']).toMatch(/^YcHmacV1 yc_key_mock:/);
+          expect(init.headers['X-YC-Timestamp']).toBeDefined();
+          return {
+            ok: true,
+            json: async () => ({ id: 'yc_tx_1', sequenceId: 'YC-REF-001', status: 'processing' }),
+          };
+        }
+        if (url.includes('/oauth/v1/generate')) {
+          return {
+            ok: true,
+            json: async () => ({ access_token: 'mpesa_oauth_token', expires_in: '3599' }),
+          };
+        }
+        return {
+          ok: true,
+          json: async () => ({
+            ResponseCode: '0',
+            ConversationID: 'AG_2026_MPESA_1',
+            OriginatorConversationID: 'MPESA-REF-001',
+          }),
+        };
+      });
+      global.fetch = fetchMock;
+
+      const ppRes = await africaEngine.disburse({
+        amount: 2500,
+        currency: 'KES',
+        reference: 'PP-REF-001',
+        rail: 'PAWAPAY',
+        mobileMoneyDetails: { phone: '254712345678', network: 'MPESA' },
+      });
+      expect(ppRes.rail).toBe('PAWAPAY');
+      expect(ppRes.status).toBe('PENDING');
+      expect(ppRes.reference).toBe('PP-REF-001');
+
+      const ycRes = await africaEngine.disburse({
+        amount: 50000,
+        currency: 'NGN',
+        reference: 'YC-REF-001',
+        rail: 'YELLOW_CARD',
+        bankDetails: { bankCode: '058', accountNumber: '0123456789' },
+      });
+      expect(ycRes.rail).toBe('YELLOW_CARD');
+      expect(ycRes.status).toBe('PENDING');
+      expect(ycRes.reference).toBe('YC-REF-001');
+
+      const mpesaRes = await africaEngine.disburse({
+        amount: 1500,
+        currency: 'KES',
+        reference: 'MPESA-REF-001',
+        rail: 'MPESA_DARAJA',
+        mobileMoneyDetails: { phone: '254712345678', network: 'MPESA' },
+      });
+      expect(mpesaRes.rail).toBe('MPESA_DARAJA');
+      expect(mpesaRes.status).toBe('PENDING');
+      expect(mpesaRes.reference).toBe('MPESA-REF-001');
+
+      // Verify webhooks for all 3 new rails
+      const ppBody = JSON.stringify({ payoutId: 'PP-REF-001', status: 'COMPLETED', amount: '2500', currency: 'KES' });
+      const ppSig = crypto.createHmac('sha256', 'pp_wh_secret').update(ppBody).digest('hex');
+      expect(africaEngine.verifyWebhook('PAWAPAY', ppBody, ppSig).status).toBe('SUCCESSFUL');
+
+      const ycBody = JSON.stringify({ id: 'yc_tx_1', sequenceId: 'YC-REF-001', status: 'complete', localAmount: 50000, currency: 'NGN' });
+      const ycSig = crypto.createHmac('sha256', 'yc_wh_secret').update(ycBody).digest('base64');
+      expect(africaEngine.verifyWebhook('YELLOW_CARD', ycBody, ycSig).status).toBe('SUCCESSFUL');
+
+      const mpesaBody = JSON.stringify({
+        Result: {
+          ResultCode: 0,
+          OriginatorConversationID: 'MPESA-REF-001',
+          TransactionID: 'QWE123RTY',
+          ResultParameters: { ResultParameter: [{ Key: 'TransactionAmount', Value: 1500 }] },
+        },
+      });
+      const mpesaEv = africaEngine.verifyWebhook('MPESA_DARAJA', mpesaBody, 'mpesa_wh_secret');
+      expect(mpesaEv.status).toBe('SUCCESSFUL');
+      expect(mpesaEv.amount).toBe(1500);
+    });
+
+    it('opens circuit breaker after repeated failures and proactively skips the stalled rail', async () => {
+      const cbEngine = new OmniPayoutEngine({
+        flutterwave: { secretKey: 'flw_mock' },
+        paystack: { secretKey: 'ps_mock' },
+        health: { failureThreshold: 2, cooldownMs: 60_000 },
+      });
+
+      let flwCalls = 0;
+      global.fetch = jest.fn().mockImplementation(async (url: string) => {
+        if (url.includes('api.flutterwave.com')) {
+          flwCalls++;
+          return { ok: false, status: 503, json: async () => ({ status: 'error', message: 'Gateway timeout' }) };
+        }
+        if (url.includes('/transferrecipient')) {
+          return { ok: true, json: async () => ({ status: true, data: { recipient_code: 'RCP_cb_1' } }) };
+        }
+        return {
+          ok: true,
+          json: async () => ({ status: true, data: { transfer_code: 'TRF_cb_1', reference: 'REF-CB', status: 'pending' } }),
+        };
+      });
+
+      // Trip the circuit breaker with 2 consecutive failures on Flutterwave
+      await expect(
+        cbEngine.disburse({
+          amount: 10000,
+          currency: 'NGN',
+          reference: 'REF-CB-1',
+          rail: 'FLUTTERWAVE',
+          bankDetails: { bankCode: '058', accountNumber: '0123456789' },
+        })
+      ).rejects.toThrow();
+
+      await expect(
+        cbEngine.disburse({
+          amount: 10000,
+          currency: 'NGN',
+          reference: 'REF-CB-2',
+          rail: 'FLUTTERWAVE',
+          bankDetails: { bankCode: '058', accountNumber: '0123456789' },
+        })
+      ).rejects.toThrow();
+
+      expect(flwCalls).toBe(2);
+      const [flwHealth] = cbEngine.getRailHealth('FLUTTERWAVE');
+      expect(flwHealth.circuitOpen).toBe(true);
+      expect(flwHealth.healthy).toBe(false);
+
+      // Next payout with fallbackRails should proactively skip Flutterwave (flwCalls stays 2!)
+      const res = await cbEngine.disburse({
+        amount: 10000,
+        currency: 'NGN',
+        reference: 'REF-CB',
+        rail: 'FLUTTERWAVE',
+        fallbackRails: ['PAYSTACK'],
+        bankDetails: { bankCode: '058', accountNumber: '0123456789' },
+      });
+
+      expect(flwCalls).toBe(2);
+      expect(res.rail).toBe('PAYSTACK');
+      expect(res.failoverFrom).toBe('FLUTTERWAVE');
+      expect(res.attemptedRails).toEqual(['PAYSTACK']);
+    });
   });
 });

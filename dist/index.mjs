@@ -1,3 +1,92 @@
+// src/health.ts
+var RailHealthTracker = class {
+  failureThreshold;
+  cooldownMs;
+  maxLatencyMs;
+  stats = /* @__PURE__ */ new Map();
+  constructor(config) {
+    this.failureThreshold = config?.failureThreshold ?? 3;
+    this.cooldownMs = config?.cooldownMs ?? 3e4;
+    this.maxLatencyMs = config?.maxLatencyMs ?? 1e4;
+  }
+  getOrCreate(rail) {
+    let state = this.stats.get(rail);
+    if (!state) {
+      state = {
+        consecutiveFailures: 0,
+        totalRequests: 0,
+        totalFailures: 0,
+        totalLatencyMs: 0,
+        lastLatencyMs: 0,
+        circuitOpenUntil: 0
+      };
+      this.stats.set(rail, state);
+    }
+    return state;
+  }
+  isAvailable(rail) {
+    const state = this.stats.get(rail);
+    if (!state) return true;
+    return Date.now() >= state.circuitOpenUntil;
+  }
+  recordSuccess(rail, latencyMs) {
+    const state = this.getOrCreate(rail);
+    state.totalRequests += 1;
+    state.lastLatencyMs = latencyMs;
+    state.totalLatencyMs += latencyMs;
+    if (latencyMs > this.maxLatencyMs) {
+      state.consecutiveFailures += 1;
+      state.lastError = `Latency ${latencyMs}ms exceeded threshold ${this.maxLatencyMs}ms`;
+      if (state.consecutiveFailures >= this.failureThreshold) {
+        state.circuitOpenUntil = Date.now() + this.cooldownMs;
+      }
+      return;
+    }
+    state.consecutiveFailures = 0;
+    state.circuitOpenUntil = 0;
+  }
+  recordFailure(rail, latencyMs, errorMessage) {
+    const state = this.getOrCreate(rail);
+    state.totalRequests += 1;
+    state.totalFailures += 1;
+    state.consecutiveFailures += 1;
+    state.lastLatencyMs = latencyMs;
+    state.totalLatencyMs += latencyMs;
+    state.lastError = errorMessage;
+    if (state.consecutiveFailures >= this.failureThreshold) {
+      state.circuitOpenUntil = Date.now() + this.cooldownMs;
+    }
+  }
+  getHealth(rail) {
+    const state = this.stats.get(rail);
+    if (!state) {
+      return {
+        rail,
+        healthy: true,
+        circuitOpen: false,
+        consecutiveFailures: 0,
+        totalRequests: 0,
+        totalFailures: 0,
+        lastLatencyMs: 0,
+        avgLatencyMs: 0
+      };
+    }
+    const circuitOpen = Date.now() < state.circuitOpenUntil;
+    return {
+      rail,
+      healthy: !circuitOpen,
+      circuitOpen,
+      consecutiveFailures: state.consecutiveFailures,
+      totalRequests: state.totalRequests,
+      totalFailures: state.totalFailures,
+      lastLatencyMs: state.lastLatencyMs,
+      avgLatencyMs: state.totalRequests > 0 ? Math.round(state.totalLatencyMs / state.totalRequests) : 0,
+      lastError: state.lastError,
+      circuitOpenUntil: circuitOpen ? new Date(state.circuitOpenUntil) : void 0
+    };
+  }
+};
+
 // src/adapters/stripe.adapter.ts
 import crypto from "crypto";
 function normalizeStripeStatus(rawStatus, defaultStatus) {
@@ -520,12 +609,490 @@ var PaystackAdapter = class {
   }
 };
 
+// src/adapters/pawapay.adapter.ts
+import crypto4 from "crypto";
+function normalizePawaPayStatus(rawStatus) {
+  if (!rawStatus) return "PENDING";
+  switch (rawStatus.toUpperCase()) {
+    case "COMPLETED":
+    case "SUCCESSFUL":
+      return "SUCCESSFUL";
+    case "FAILED":
+    case "REJECTED":
+    case "CANCELLED":
+      return "FAILED";
+    default:
+      return "PENDING";
+  }
+}
+function resolvePawaPayCorrespondent(network, currency) {
+  const key = `${network.toUpperCase()}_${currency.toUpperCase()}`;
+  const map = {
+    MPESA_KES: "MPESA_KEN",
+    MTN_GHS: "MTN_MOMO_GHA",
+    VODAFONE_GHS: "VODAFONE_GHA",
+    AIRTEL_GHS: "AIRTELTIGO_GHA",
+    MTN_UGX: "MTN_MOMO_UGA",
+    AIRTEL_UGX: "AIRTEL_OAPI_UGA",
+    MTN_RWF: "MTN_MOMO_RWA",
+    AIRTEL_RWF: "AIRTEL_OAPI_RWA",
+    AIRTEL_TZS: "AIRTEL_TZA",
+    ORANGE_XOF: "ORANGE_CIV",
+    MTN_XOF: "MTN_MOMO_CIV",
+    WAVE_XOF: "WAVE_SEN"
+  };
+  return map[key] || `${network.toUpperCase()}_${currency.toUpperCase()}`;
+}
+var PawaPayAdapter = class {
+  constructor(apiToken, baseUrl, webhookSecret) {
+    this.apiToken = apiToken;
+    this.webhookSecret = webhookSecret;
+    if (!apiToken) throw new Error("PawaPay apiToken is required");
+    this.baseUrl = (baseUrl || "https://api.pawapay.io").replace(/\/$/, "");
+  }
+  apiToken;
+  webhookSecret;
+  baseUrl;
+  async request(endpoint, options = {}) {
+    const url = `${this.baseUrl}${endpoint}`;
+    const headers = {
+      Authorization: `Bearer ${this.apiToken}`,
+      ...options.headers
+    };
+    if (options.method && options.method.toUpperCase() !== "GET" && !headers["Content-Type"]) {
+      headers["Content-Type"] = "application/json";
+    }
+    const res = await fetch(url, { ...options, headers });
+    const data = await res.json();
+    if (!res.ok) {
+      throw new Error(
+        data?.failureReason?.failureMessage || data?.message || `PawaPay request failed with status ${res.status}`
+      );
+    }
+    return data;
+  }
+  async disburse(params) {
+    if (!params.mobileMoneyDetails) {
+      throw new Error("mobileMoneyDetails is required for PawaPay disbursements");
+    }
+    const currency = params.currency.toUpperCase();
+    const correspondent = params.metadata?.correspondent || resolvePawaPayCorrespondent(params.mobileMoneyDetails.network, currency);
+    const payload = {
+      payoutId: params.reference,
+      amount: String(params.amount),
+      currency,
+      correspondent,
+      recipient: {
+        type: "MSISDN",
+        address: {
+          value: params.mobileMoneyDetails.phone
+        }
+      },
+      customerTimestamp: (/* @__PURE__ */ new Date()).toISOString(),
+      statementDescription: (params.narration || "Marketplace payout").slice(0, 22)
+    };
+    const data = await this.request("/payouts", {
+      method: "POST",
+      body: JSON.stringify(payload)
+    });
+    const rawStatus = data.status || "ACCEPTED";
+    const status = normalizePawaPayStatus(rawStatus);
+    const errMsg = data.rejectionReason?.rejectionMessage || data.failureReason?.failureMessage;
+    return {
+      success: status !== "FAILED",
+      transactionId: String(data.payoutId || params.reference),
+      reference: String(data.payoutId || params.reference),
+      status,
+      providerStatus: rawStatus,
+      rail: "PAWAPAY",
+      amount: params.amount,
+      currency,
+      error: status === "FAILED" ? errMsg || "PawaPay payout rejected" : void 0,
+      rawResponse: data
+    };
+  }
+  async getPayoutStatus(transactionId, reference) {
+    const id = reference || transactionId;
+    const raw = await this.request(`/payouts/${encodeURIComponent(id)}`, { method: "GET" });
+    const data = Array.isArray(raw) ? raw[0] || {} : raw.data || raw;
+    const status = normalizePawaPayStatus(data.status);
+    return {
+      success: status !== "FAILED",
+      transactionId: String(data.payoutId || transactionId),
+      reference: String(data.payoutId || reference || transactionId),
+      status,
+      providerStatus: data.status,
+      rail: "PAWAPAY",
+      amount: data.amount ? Number(data.amount) : 0,
+      currency: String(data.currency || "").toUpperCase(),
+      error: status === "FAILED" ? data.failureReason?.failureMessage || "PawaPay payout failed" : void 0,
+      rawResponse: raw
+    };
+  }
+  async getBalances() {
+    const res = await this.request("/wallets/balances", { method: "GET" });
+    const rows = Array.isArray(res.balances) ? res.balances : Array.isArray(res) ? res : [];
+    return rows.map((row) => ({
+      rail: "PAWAPAY",
+      currency: String(row.currency || "").toUpperCase(),
+      available: Number(row.balance ?? row.availableBalance ?? 0)
+    }));
+  }
+  verifyWebhook(rawBody, signature) {
+    if (this.webhookSecret) {
+      const expected = crypto4.createHmac("sha256", this.webhookSecret).update(rawBody).digest("hex");
+      const sigBuf = Buffer.from(signature || "", "utf8");
+      const expBuf = Buffer.from(expected, "utf8");
+      if (sigBuf.length !== expBuf.length || !crypto4.timingSafeEqual(sigBuf, expBuf)) {
+        throw new Error("Invalid PawaPay webhook signature");
+      }
+    }
+    const payload = JSON.parse(rawBody);
+    const status = normalizePawaPayStatus(payload.status);
+    return {
+      rail: "PAWAPAY",
+      eventType: `payout.${String(payload.status || "updated").toLowerCase()}`,
+      transactionId: String(payload.payoutId || ""),
+      reference: String(payload.payoutId || ""),
+      status,
+      providerStatus: payload.status,
+      amount: payload.amount ? Number(payload.amount) : 0,
+      currency: String(payload.currency || "").toUpperCase(),
+      error: status === "FAILED" ? payload.failureReason?.failureMessage || "PawaPay payout failed" : void 0,
+      rawPayload: payload
+    };
+  }
+};
+
+// src/adapters/yellowcard.adapter.ts
+import crypto5 from "crypto";
+function normalizeYellowCardStatus(rawStatus) {
+  if (!rawStatus) return "PENDING";
+  switch (rawStatus.toLowerCase()) {
+    case "complete":
+    case "completed":
+    case "settled":
+    case "successful":
+      return "SUCCESSFUL";
+    case "failed":
+    case "cancelled":
+    case "canceled":
+    case "rejected":
+    case "expired":
+      return "FAILED";
+    default:
+      return "PENDING";
+  }
+}
+var YellowCardAdapter = class {
+  constructor(apiKey, secretKey, baseUrl, webhookSecret) {
+    this.apiKey = apiKey;
+    this.secretKey = secretKey;
+    this.webhookSecret = webhookSecret;
+    if (!apiKey || !secretKey) {
+      throw new Error("Yellow Card apiKey and secretKey are required");
+    }
+    this.baseUrl = (baseUrl || "https://api.yellowcard.io").replace(/\/$/, "");
+  }
+  apiKey;
+  secretKey;
+  webhookSecret;
+  baseUrl;
+  buildAuthHeaders(method, path, body) {
+    const timestamp = (/* @__PURE__ */ new Date()).toISOString();
+    const upperMethod = method.toUpperCase();
+    const hmac = crypto5.createHmac("sha256", this.secretKey);
+    hmac.update(timestamp);
+    hmac.update(path);
+    hmac.update(upperMethod);
+    if (body) {
+      const bodyHash = crypto5.createHash("sha256").update(body).digest("base64");
+      hmac.update(bodyHash);
+    }
+    const signature = hmac.digest("base64");
+    return {
+      "X-YC-Timestamp": timestamp,
+      Authorization: `YcHmacV1 ${this.apiKey}:${signature}`
+    };
+  }
+  async request(path, method, bodyObj) {
+    const body = bodyObj ? JSON.stringify(bodyObj) : void 0;
+    const headers = {
+      ...this.buildAuthHeaders(method, path, body),
+      ...body ? { "Content-Type": "application/json" } : {}
+    };
+    const res = await fetch(`${this.baseUrl}${path}`, { method, headers, body });
+    const data = await res.json();
+    if (!res.ok) {
+      throw new Error(data?.message || data?.error || `Yellow Card request failed with status ${res.status}`);
+    }
+    return data;
+  }
+  async disburse(params) {
+    if (!params.bankDetails && !params.mobileMoneyDetails) {
+      throw new Error("Either bankDetails or mobileMoneyDetails is required for Yellow Card disbursements");
+    }
+    const currency = params.currency.toUpperCase();
+    const destination = params.bankDetails ? {
+      accountType: "bank",
+      accountNumber: params.bankDetails.accountNumber,
+      accountName: params.bankDetails.accountName || params.bankDetails.accountNumber,
+      accountBank: params.bankDetails.bankCode,
+      networkId: params.metadata?.networkId || params.bankDetails.bankCode
+    } : {
+      accountType: "momo",
+      accountNumber: params.mobileMoneyDetails.phone,
+      networkId: params.metadata?.networkId || params.mobileMoneyDetails.network
+    };
+    const payload = {
+      sequenceId: params.reference,
+      channelId: params.metadata?.channelId || `${currency}_PAYOUT`,
+      localAmount: params.amount,
+      currency,
+      reason: params.narration || "Marketplace disbursement",
+      destination,
+      forceAccept: true
+    };
+    const data = await this.request("/business/payments", "POST", payload);
+    const status = normalizeYellowCardStatus(data.status);
+    return {
+      success: status !== "FAILED",
+      transactionId: String(data.id || params.reference),
+      reference: String(data.sequenceId || params.reference),
+      status,
+      providerStatus: data.status,
+      rail: "YELLOW_CARD",
+      amount: params.amount,
+      currency,
+      error: status === "FAILED" ? data.failureReason || data.message || "Yellow Card payout failed" : void 0,
+      rawResponse: data
+    };
+  }
+  async getPayoutStatus(transactionId, reference) {
+    const path = reference ? `/business/payments/sequence-id/${encodeURIComponent(reference)}` : `/business/payments/${encodeURIComponent(transactionId)}`;
+    const data = await this.request(path, "GET");
+    const status = normalizeYellowCardStatus(data.status);
+    return {
+      success: status !== "FAILED",
+      transactionId: String(data.id || transactionId),
+      reference: String(data.sequenceId || reference || transactionId),
+      status,
+      providerStatus: data.status,
+      rail: "YELLOW_CARD",
+      amount: Number(data.localAmount ?? data.amount ?? 0),
+      currency: String(data.currency || "").toUpperCase(),
+      error: status === "FAILED" ? data.failureReason || "Yellow Card payout failed" : void 0,
+      rawResponse: data
+    };
+  }
+  async getBalances() {
+    const res = await this.request("/business/account", "GET");
+    const accounts = Array.isArray(res.accounts) ? res.accounts : Array.isArray(res.balances) ? res.balances : [res];
+    return accounts.filter((row) => row && (row.currency || row.code)).map((row) => ({
+      rail: "YELLOW_CARD",
+      currency: String(row.currency || row.code || "").toUpperCase(),
+      available: Number(row.availableBalance ?? row.balance ?? 0),
+      pending: row.pendingBalance !== void 0 ? Number(row.pendingBalance) : void 0
+    }));
+  }
+  verifyWebhook(rawBody, signature) {
+    const secret = this.webhookSecret || this.secretKey;
+    const expected = crypto5.createHmac("sha256", secret).update(rawBody).digest("base64");
+    const sigBuf = Buffer.from(signature || "", "utf8");
+    const expBuf = Buffer.from(expected, "utf8");
+    if (sigBuf.length !== expBuf.length || !crypto5.timingSafeEqual(sigBuf, expBuf)) {
+      throw new Error("Invalid Yellow Card webhook signature");
+    }
+    const payload = JSON.parse(rawBody);
+    const status = normalizeYellowCardStatus(payload.status);
+    return {
+      rail: "YELLOW_CARD",
+      eventType: String(payload.event || `payment.${String(payload.status || "updated").toLowerCase()}`),
+      transactionId: String(payload.id || ""),
+      reference: String(payload.sequenceId || payload.reference || ""),
+      status,
+      providerStatus: payload.status,
+      amount: Number(payload.localAmount ?? payload.amount ?? 0),
+      currency: String(payload.currency || "").toUpperCase(),
+      error: status === "FAILED" ? payload.failureReason || "Yellow Card payout failed" : void 0,
+      rawPayload: payload
+    };
+  }
+};
+
+// src/adapters/mpesa.adapter.ts
+import crypto6 from "crypto";
+var MpesaDarajaAdapter = class {
+  constructor(config) {
+    this.config = config;
+    if (!config.consumerKey || !config.consumerSecret) {
+      throw new Error("M-Pesa Daraja consumerKey and consumerSecret are required");
+    }
+    this.baseUrl = (config.baseUrl || "https://api.safaricom.co.ke").replace(/\/$/, "");
+  }
+  config;
+  baseUrl;
+  cachedToken;
+  tokenExpiresAt = 0;
+  async getAccessToken() {
+    if (this.cachedToken && Date.now() < this.tokenExpiresAt) {
+      return this.cachedToken;
+    }
+    const basic = Buffer.from(`${this.config.consumerKey}:${this.config.consumerSecret}`).toString(
+      "base64"
+    );
+    const res = await fetch(`${this.baseUrl}/oauth/v1/generate?grant_type=client_credentials`, {
+      method: "GET",
+      headers: { Authorization: `Basic ${basic}` }
+    });
+    const data = await res.json();
+    if (!res.ok || !data.access_token) {
+      throw new Error(data?.errorMessage || `M-Pesa OAuth failed with status ${res.status}`);
+    }
+    this.cachedToken = data.access_token;
+    const expiresInSec = Number(data.expires_in || 3500);
+    this.tokenExpiresAt = Date.now() + Math.max(expiresInSec - 60, 60) * 1e3;
+    return data.access_token;
+  }
+  async request(path, body) {
+    const token = await this.getAccessToken();
+    const res = await fetch(`${this.baseUrl}${path}`, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${token}`,
+        "Content-Type": "application/json"
+      },
+      body: JSON.stringify(body)
+    });
+    const data = await res.json();
+    if (!res.ok || data.ResponseCode && data.ResponseCode !== "0") {
+      throw new Error(
+        data?.errorMessage || data?.ResponseDescription || `M-Pesa Daraja request failed with status ${res.status}`
+      );
+    }
+    return data;
+  }
+  async disburse(params) {
+    if (!params.mobileMoneyDetails) {
+      throw new Error("mobileMoneyDetails is required for M-Pesa Daraja disbursements");
+    }
+    const data = await this.request("/mpesa/b2c/v3/paymentrequest", {
+      OriginatorConversationID: params.reference,
+      InitiatorName: this.config.initiatorName,
+      SecurityCredential: this.config.securityCredential,
+      CommandID: params.metadata?.commandId || "BusinessPayment",
+      Amount: Math.round(params.amount),
+      PartyA: this.config.shortCode,
+      PartyB: params.mobileMoneyDetails.phone,
+      Remarks: params.narration || "Marketplace payout",
+      QueueTimeOutURL: this.config.queueTimeoutUrl,
+      ResultURL: this.config.resultUrl,
+      Occasion: params.reference
+    });
+    return {
+      success: true,
+      transactionId: String(data.ConversationID || data.OriginatorConversationID || params.reference),
+      reference: String(data.OriginatorConversationID || params.reference),
+      status: "PENDING",
+      providerStatus: "ACCEPTED",
+      rail: "MPESA_DARAJA",
+      amount: params.amount,
+      currency: params.currency.toUpperCase(),
+      rawResponse: data
+    };
+  }
+  async getPayoutStatus(transactionId, reference) {
+    const data = await this.request("/mpesa/transactionstatus/v1/query", {
+      Initiator: this.config.initiatorName,
+      SecurityCredential: this.config.securityCredential,
+      CommandID: "TransactionStatusQuery",
+      TransactionID: transactionId,
+      OriginatorConversationID: reference || transactionId,
+      PartyA: this.config.shortCode,
+      IdentifierType: "4",
+      ResultURL: this.config.resultUrl,
+      QueueTimeOutURL: this.config.queueTimeoutUrl,
+      Remarks: "Payout status check",
+      Occasion: reference || transactionId
+    });
+    return {
+      success: true,
+      transactionId: String(data.ConversationID || transactionId),
+      reference: String(data.OriginatorConversationID || reference || transactionId),
+      status: "PENDING",
+      providerStatus: "QUERY_ACCEPTED",
+      rail: "MPESA_DARAJA",
+      amount: 0,
+      currency: "KES",
+      rawResponse: data
+    };
+  }
+  async getBalances() {
+    const data = await this.request("/mpesa/accountbalance/v1/query", {
+      Initiator: this.config.initiatorName,
+      SecurityCredential: this.config.securityCredential,
+      CommandID: "AccountBalance",
+      PartyA: this.config.shortCode,
+      IdentifierType: "4",
+      Remarks: "Float balance check",
+      QueueTimeOutURL: this.config.queueTimeoutUrl,
+      ResultURL: this.config.resultUrl
+    });
+    if (typeof data.availableBalance === "number") {
+      return [
+        {
+          rail: "MPESA_DARAJA",
+          currency: String(data.currency || "KES").toUpperCase(),
+          available: data.availableBalance
+        }
+      ];
+    }
+    return [];
+  }
+  verifyWebhook(rawBody, signature) {
+    if (this.config.webhookSecret) {
+      const sigBuf = Buffer.from(signature || "", "utf8");
+      const expBuf = Buffer.from(this.config.webhookSecret, "utf8");
+      if (sigBuf.length !== expBuf.length || !crypto6.timingSafeEqual(sigBuf, expBuf)) {
+        throw new Error("Invalid M-Pesa Daraja webhook signature");
+      }
+    }
+    const payload = JSON.parse(rawBody);
+    const result = payload.Result || payload;
+    const resultCode = Number(result.ResultCode);
+    const status = resultCode === 0 ? "SUCCESSFUL" : "FAILED";
+    let amount = 0;
+    const params = result.ResultParameters?.ResultParameter || [];
+    for (const p of params) {
+      if (p.Key === "TransactionAmount") {
+        amount = Number(p.Value || 0);
+      }
+    }
+    return {
+      rail: "MPESA_DARAJA",
+      eventType: status === "SUCCESSFUL" ? "b2c.result.success" : "b2c.result.failed",
+      transactionId: String(result.TransactionID || result.ConversationID || ""),
+      reference: String(result.OriginatorConversationID || result.TransactionID || ""),
+      status,
+      providerStatus: String(result.ResultCode ?? ""),
+      amount,
+      currency: "KES",
+      error: status === "FAILED" ? result.ResultDesc || "M-Pesa B2C payout failed" : void 0,
+      rawPayload: payload
+    };
+  }
+};
+
 // src/engine.ts
 var AFRICAN_CURRENCIES = /* @__PURE__ */ new Set(["NGN", "KES", "GHS", "UGX", "TZS", "RWF", "XOF", "XAF", "ZAR"]);
 var OmniPayoutEngine = class {
   stripe;
   flutterwave;
   paystack;
+  pawapay;
+  yellowCard;
+  mpesaDaraja;
+  health;
   constructor(config) {
     if (config.stripe?.secretKey) {
       this.stripe = new StripeConnectAdapter(config.stripe.secretKey, config.stripe.webhookSecret);
@@ -539,6 +1106,35 @@ var OmniPayoutEngine = class {
     if (config.paystack?.secretKey) {
       this.paystack = new PaystackAdapter(config.paystack.secretKey, config.paystack.webhookSecret);
     }
+    if (config.pawapay?.apiToken) {
+      this.pawapay = new PawaPayAdapter(
+        config.pawapay.apiToken,
+        config.pawapay.baseUrl,
+        config.pawapay.webhookSecret
+      );
+    }
+    if (config.yellowCard?.apiKey && config.yellowCard?.secretKey) {
+      this.yellowCard = new YellowCardAdapter(
+        config.yellowCard.apiKey,
+        config.yellowCard.secretKey,
+        config.yellowCard.baseUrl,
+        config.yellowCard.webhookSecret
+      );
+    }
+    if (config.mpesaDaraja?.consumerKey && config.mpesaDaraja?.consumerSecret) {
+      this.mpesaDaraja = new MpesaDarajaAdapter(config.mpesaDaraja);
+    }
+    this.health = new RailHealthTracker(config.health);
+  }
+  getConfiguredRails() {
+    const rails = [];
+    if (this.stripe) rails.push("STRIPE_CONNECT");
+    if (this.flutterwave) rails.push("FLUTTERWAVE");
+    if (this.paystack) rails.push("PAYSTACK");
+    if (this.pawapay) rails.push("PAWAPAY");
+    if (this.yellowCard) rails.push("YELLOW_CARD");
+    if (this.mpesaDaraja) rails.push("MPESA_DARAJA");
+    return rails;
   }
   /**
    * Automatically resolves the best primary payout rail based on explicit parameters or currency.
@@ -546,8 +1142,21 @@ var OmniPayoutEngine = class {
   resolveRail(params) {
     if (params.rail) return params.rail;
     if (params.stripeAccountId) return "STRIPE_CONNECT";
-    if (params.bankDetails || params.mobileMoneyDetails || AFRICAN_CURRENCIES.has(params.currency.toUpperCase())) {
-      if (!this.flutterwave && this.paystack) return "PAYSTACK";
+    const currency = params.currency.toUpperCase();
+    if (params.mobileMoneyDetails) {
+      if (this.flutterwave) return "FLUTTERWAVE";
+      if (currency === "KES" && params.mobileMoneyDetails.network === "MPESA" && this.mpesaDaraja) {
+        return "MPESA_DARAJA";
+      }
+      if (this.pawapay) return "PAWAPAY";
+      if (this.yellowCard) return "YELLOW_CARD";
+      if (this.paystack) return "PAYSTACK";
+      return "FLUTTERWAVE";
+    }
+    if (params.bankDetails || AFRICAN_CURRENCIES.has(currency)) {
+      if (this.flutterwave) return "FLUTTERWAVE";
+      if (this.paystack) return "PAYSTACK";
+      if (this.yellowCard) return "YELLOW_CARD";
       return "FLUTTERWAVE";
     }
     return "STRIPE_CONNECT";
@@ -571,10 +1180,28 @@ var OmniPayoutEngine = class {
       }
       return this.paystack.disburse(params);
     }
+    if (rail === "PAWAPAY") {
+      if (!this.pawapay) {
+        throw new Error("PawaPay provider is not configured (missing apiToken)");
+      }
+      return this.pawapay.disburse(params);
+    }
+    if (rail === "YELLOW_CARD") {
+      if (!this.yellowCard) {
+        throw new Error("Yellow Card provider is not configured (missing apiKey/secretKey)");
+      }
+      return this.yellowCard.disburse(params);
+    }
+    if (rail === "MPESA_DARAJA") {
+      if (!this.mpesaDaraja) {
+        throw new Error("M-Pesa Daraja provider is not configured (missing consumerKey/consumerSecret)");
+      }
+      return this.mpesaDaraja.disburse(params);
+    }
     throw new Error(`Unsupported payout rail: ${rail}`);
   }
   /**
-   * Unified disbursement method with optional pre-flight balance checks and automatic failover.
+   * Unified disbursement method with circuit-breaker health checks, pre-flight balance checks, and automatic failover.
    */
   async disburse(params) {
     if (params.amount <= 0) {
@@ -597,6 +1224,10 @@ var OmniPayoutEngine = class {
     for (let i = 0; i < candidateRails.length; i++) {
       const rail = candidateRails[i];
       const hasFallback = i < candidateRails.length - 1;
+      if (!this.health.isAvailable(rail) && hasFallback) {
+        lastError = new Error(`Rail ${rail} circuit breaker is open (unhealthy)`);
+        continue;
+      }
       attemptedRails.push(rail);
       if (params.checkBalanceBeforeDisburse) {
         try {
@@ -620,12 +1251,19 @@ var OmniPayoutEngine = class {
           throw lastError;
         }
       }
+      const startMs = Date.now();
       try {
         const result = await this.disburseOnRail(rail, params);
-        if (result.status === "FAILED" && hasFallback) {
-          lastFailedResult = result;
-          lastError = new Error(result.error || `${rail} disbursement returned FAILED`);
-          continue;
+        const latencyMs = Date.now() - startMs;
+        if (result.status === "FAILED") {
+          this.health.recordFailure(rail, latencyMs, result.error || `${rail} disbursement failed`);
+          if (hasFallback) {
+            lastFailedResult = result;
+            lastError = new Error(result.error || `${rail} disbursement returned FAILED`);
+            continue;
+          }
+        } else {
+          this.health.recordSuccess(rail, latencyMs);
         }
         return {
           ...result,
@@ -633,7 +1271,9 @@ var OmniPayoutEngine = class {
           failoverFrom: rail !== primaryRail ? primaryRail : void 0
         };
       } catch (err) {
+        const latencyMs = Date.now() - startMs;
         lastError = err instanceof Error ? err : new Error(String(err));
+        this.health.recordFailure(rail, latencyMs, lastError.message);
         if (hasFallback) {
           continue;
         }
@@ -649,6 +1289,15 @@ var OmniPayoutEngine = class {
     throw lastError || new Error("All configured payout rails failed");
   }
   /**
+   * Returns live uptime/latency health and circuit-breaker state for one or all configured rails.
+   */
+  getRailHealth(rail) {
+    if (rail) {
+      return [this.health.getHealth(rail)];
+    }
+    return this.getConfiguredRails().map((r) => this.health.getHealth(r));
+  }
+  /**
    * Fetches the latest settlement status for a previously initiated payout.
    */
   async getPayoutStatus(params) {
@@ -656,26 +1305,28 @@ var OmniPayoutEngine = class {
       throw new Error("transactionId is required to check payout status");
     }
     if (params.rail === "STRIPE_CONNECT") {
-      if (!this.stripe) {
-        throw new Error("Stripe Connect provider is not configured (missing secretKey)");
-      }
-      return this.stripe.getPayoutStatus(
-        params.transactionId,
-        params.stripeAccountId,
-        params.reference
-      );
+      if (!this.stripe) throw new Error("Stripe Connect provider is not configured (missing secretKey)");
+      return this.stripe.getPayoutStatus(params.transactionId, params.stripeAccountId, params.reference);
     }
     if (params.rail === "FLUTTERWAVE") {
-      if (!this.flutterwave) {
-        throw new Error("Flutterwave provider is not configured (missing secretKey)");
-      }
+      if (!this.flutterwave) throw new Error("Flutterwave provider is not configured (missing secretKey)");
       return this.flutterwave.getPayoutStatus(params.transactionId, params.reference);
     }
     if (params.rail === "PAYSTACK") {
-      if (!this.paystack) {
-        throw new Error("Paystack provider is not configured (missing secretKey)");
-      }
+      if (!this.paystack) throw new Error("Paystack provider is not configured (missing secretKey)");
       return this.paystack.getPayoutStatus(params.transactionId, params.reference);
+    }
+    if (params.rail === "PAWAPAY") {
+      if (!this.pawapay) throw new Error("PawaPay provider is not configured (missing apiToken)");
+      return this.pawapay.getPayoutStatus(params.transactionId, params.reference);
+    }
+    if (params.rail === "YELLOW_CARD") {
+      if (!this.yellowCard) throw new Error("Yellow Card provider is not configured");
+      return this.yellowCard.getPayoutStatus(params.transactionId, params.reference);
+    }
+    if (params.rail === "MPESA_DARAJA") {
+      if (!this.mpesaDaraja) throw new Error("M-Pesa Daraja provider is not configured");
+      return this.mpesaDaraja.getPayoutStatus(params.transactionId, params.reference);
     }
     throw new Error(`Unsupported payout rail: ${params.rail}`);
   }
@@ -695,10 +1346,25 @@ var OmniPayoutEngine = class {
       if (!this.paystack) throw new Error("Paystack provider is not configured (missing secretKey)");
       return this.paystack.getBalances();
     }
+    if (rail === "PAWAPAY") {
+      if (!this.pawapay) throw new Error("PawaPay provider is not configured (missing apiToken)");
+      return this.pawapay.getBalances();
+    }
+    if (rail === "YELLOW_CARD") {
+      if (!this.yellowCard) throw new Error("Yellow Card provider is not configured");
+      return this.yellowCard.getBalances();
+    }
+    if (rail === "MPESA_DARAJA") {
+      if (!this.mpesaDaraja) throw new Error("M-Pesa Daraja provider is not configured");
+      return this.mpesaDaraja.getBalances();
+    }
     const tasks = [];
     if (this.stripe) tasks.push(this.stripe.getBalances());
     if (this.flutterwave) tasks.push(this.flutterwave.getBalances());
     if (this.paystack) tasks.push(this.paystack.getBalances());
+    if (this.pawapay) tasks.push(this.pawapay.getBalances());
+    if (this.yellowCard) tasks.push(this.yellowCard.getBalances());
+    if (this.mpesaDaraja) tasks.push(this.mpesaDaraja.getBalances());
     const results = await Promise.all(tasks);
     return results.flat();
   }
@@ -717,6 +1383,18 @@ var OmniPayoutEngine = class {
     if (rail === "PAYSTACK") {
       if (!this.paystack) throw new Error("Paystack provider is not configured");
       return this.paystack.verifyWebhook(rawBody, signature);
+    }
+    if (rail === "PAWAPAY") {
+      if (!this.pawapay) throw new Error("PawaPay provider is not configured");
+      return this.pawapay.verifyWebhook(rawBody, signature);
+    }
+    if (rail === "YELLOW_CARD") {
+      if (!this.yellowCard) throw new Error("Yellow Card provider is not configured");
+      return this.yellowCard.verifyWebhook(rawBody, signature);
+    }
+    if (rail === "MPESA_DARAJA") {
+      if (!this.mpesaDaraja) throw new Error("M-Pesa Daraja provider is not configured");
+      return this.mpesaDaraja.verifyWebhook(rawBody, signature);
     }
     throw new Error(`Unsupported payout rail: ${rail}`);
   }
@@ -747,8 +1425,12 @@ var OmniPayoutEngine = class {
 };
 export {
   FlutterwaveAdapter,
+  MpesaDarajaAdapter,
   OmniPayoutEngine,
+  PawaPayAdapter,
   PaystackAdapter,
-  StripeConnectAdapter
+  RailHealthTracker,
+  StripeConnectAdapter,
+  YellowCardAdapter
 };
 //# sourceMappingURL=index.mjs.map

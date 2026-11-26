@@ -1,4 +1,10 @@
-export type PayoutRail = 'STRIPE_CONNECT' | 'FLUTTERWAVE' | 'PAYSTACK';
+export type PayoutRail =
+  | 'STRIPE_CONNECT'
+  | 'FLUTTERWAVE'
+  | 'PAYSTACK'
+  | 'PAWAPAY'
+  | 'YELLOW_CARD'
+  | 'MPESA_DARAJA';
 
 export type PayoutSpeed = 'standard' | 'instant';
 
@@ -60,6 +66,25 @@ export interface RailBalance {
   pending?: number;
 }
 
+export interface RailHealth {
+  rail: PayoutRail;
+  healthy: boolean;
+  circuitOpen: boolean;
+  consecutiveFailures: number;
+  totalRequests: number;
+  totalFailures: number;
+  lastLatencyMs: number;
+  avgLatencyMs: number;
+  lastError?: string;
+  circuitOpenUntil?: Date;
+}
+
+export interface HealthConfig {
+  failureThreshold?: number;
+  cooldownMs?: number;
+  maxLatencyMs?: number;
+}
+
 export interface WebhookEvent {
   rail: PayoutRail;
   eventType: string;
@@ -105,4 +130,27 @@ export interface OmniPayoutConfig {
     secretKey: string;
     webhookSecret?: string;
   };
+  pawapay?: {
+    apiToken: string;
+    baseUrl?: string;
+    webhookSecret?: string;
+  };
+  yellowCard?: {
+    apiKey: string;
+    secretKey: string;
+    baseUrl?: string;
+    webhookSecret?: string;
+  };
+  mpesaDaraja?: {
+    consumerKey: string;
+    consumerSecret: string;
+    shortCode: string;
+    initiatorName: string;
+    securityCredential: string;
+    resultUrl: string;
+    queueTimeoutUrl: string;
+    baseUrl?: string;
+    webhookSecret?: string;
+  };
+  health?: HealthConfig;
 }

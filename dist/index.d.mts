@@ -1,4 +1,4 @@
-type PayoutRail = 'STRIPE_CONNECT' | 'FLUTTERWAVE' | 'PAYSTACK';
+type PayoutRail = 'STRIPE_CONNECT' | 'FLUTTERWAVE' | 'PAYSTACK' | 'PAWAPAY' | 'YELLOW_CARD' | 'MPESA_DARAJA';
 type PayoutSpeed = 'standard' | 'instant';
 type PayoutStatus = 'PENDING' | 'SUCCESSFUL' | 'FAILED';
 interface BankAccountDetails {
@@ -51,6 +51,23 @@ interface RailBalance {
     available: number;
     pending?: number;
 }
+interface RailHealth {
+    rail: PayoutRail;
+    healthy: boolean;
+    circuitOpen: boolean;
+    consecutiveFailures: number;
+    totalRequests: number;
+    totalFailures: number;
+    lastLatencyMs: number;
+    avgLatencyMs: number;
+    lastError?: string;
+    circuitOpenUntil?: Date;
+}
+interface HealthConfig {
+    failureThreshold?: number;
+    cooldownMs?: number;
+    maxLatencyMs?: number;
+}
 interface WebhookEvent {
     rail: PayoutRail;
     eventType: string;
@@ -92,6 +109,42 @@ interface OmniPayoutConfig {
         secretKey: string;
         webhookSecret?: string;
     };
+    pawapay?: {
+        apiToken: string;
+        baseUrl?: string;
+        webhookSecret?: string;
+    };
+    yellowCard?: {
+        apiKey: string;
+        secretKey: string;
+        baseUrl?: string;
+        webhookSecret?: string;
+    };
+    mpesaDaraja?: {
+        consumerKey: string;
+        consumerSecret: string;
+        shortCode: string;
+        initiatorName: string;
+        securityCredential: string;
+        resultUrl: string;
+        queueTimeoutUrl: string;
+        baseUrl?: string;
+        webhookSecret?: string;
+    };
+    health?: HealthConfig;
+}
+
+declare class RailHealthTracker {
+    private readonly failureThreshold;
+    private readonly cooldownMs;
+    private readonly maxLatencyMs;
+    private readonly stats;
+    constructor(config?: HealthConfig);
+    private getOrCreate;
+    isAvailable(rail: PayoutRail): boolean;
+    recordSuccess(rail: PayoutRail, latencyMs: number): void;
+    recordFailure(rail: PayoutRail, latencyMs: number, errorMessage: string): void;
+    getHealth(rail: PayoutRail): RailHealth;
 }
 
 declare class StripeConnectAdapter {
@@ -130,20 +183,80 @@ declare class PaystackAdapter {
     verifyWebhook(rawBody: string, signature: string): WebhookEvent;
 }
 
+declare class PawaPayAdapter {
+    private readonly apiToken;
+    private readonly webhookSecret?;
+    private readonly baseUrl;
+    constructor(apiToken: string, baseUrl?: string, webhookSecret?: string | undefined);
+    private request;
+    disburse(params: DisburseParams): Promise<DisburseResult>;
+    getPayoutStatus(transactionId: string, reference?: string): Promise<DisburseResult>;
+    getBalances(): Promise<RailBalance[]>;
+    verifyWebhook(rawBody: string, signature: string): WebhookEvent;
+}
+
+declare class YellowCardAdapter {
+    private readonly apiKey;
+    private readonly secretKey;
+    private readonly webhookSecret?;
+    private readonly baseUrl;
+    constructor(apiKey: string, secretKey: string, baseUrl?: string, webhookSecret?: string | undefined);
+    private buildAuthHeaders;
+    private request;
+    disburse(params: DisburseParams): Promise<DisburseResult>;
+    getPayoutStatus(transactionId: string, reference?: string): Promise<DisburseResult>;
+    getBalances(): Promise<RailBalance[]>;
+    verifyWebhook(rawBody: string, signature: string): WebhookEvent;
+}
+
+interface MpesaDarajaConfig {
+    consumerKey: string;
+    consumerSecret: string;
+    shortCode: string;
+    initiatorName: string;
+    securityCredential: string;
+    resultUrl: string;
+    queueTimeoutUrl: string;
+    baseUrl?: string;
+    webhookSecret?: string;
+}
+declare class MpesaDarajaAdapter {
+    private readonly config;
+    private readonly baseUrl;
+    private cachedToken?;
+    private tokenExpiresAt;
+    constructor(config: MpesaDarajaConfig);
+    private getAccessToken;
+    private request;
+    disburse(params: DisburseParams): Promise<DisburseResult>;
+    getPayoutStatus(transactionId: string, reference?: string): Promise<DisburseResult>;
+    getBalances(): Promise<RailBalance[]>;
+    verifyWebhook(rawBody: string, signature: string): WebhookEvent;
+}
+
 declare class OmniPayoutEngine {
     private readonly stripe?;
     private readonly flutterwave?;
     private readonly paystack?;
+    private readonly pawapay?;
+    private readonly yellowCard?;
+    private readonly mpesaDaraja?;
+    private readonly health;
     constructor(config: OmniPayoutConfig);
+    private getConfiguredRails;
     /**
      * Automatically resolves the best primary payout rail based on explicit parameters or currency.
      */
     resolveRail(params: DisburseParams): PayoutRail;
     private disburseOnRail;
     /**
-     * Unified disbursement method with optional pre-flight balance checks and automatic failover.
+     * Unified disbursement method with circuit-breaker health checks, pre-flight balance checks, and automatic failover.
      */
     disburse(params: DisburseParams): Promise<DisburseResult>;
+    /**
+     * Returns live uptime/latency health and circuit-breaker state for one or all configured rails.
+     */
+    getRailHealth(rail?: PayoutRail): RailHealth[];
     /**
      * Fetches the latest settlement status for a previously initiated payout.
      */
@@ -166,4 +279,4 @@ declare class OmniPayoutEngine {
     createConnectOnboardingLink(params: OnboardingLinkParams): Promise<OnboardingLinkResult>;
 }
 
-export { type BankAccountDetails, type BankResolutionResult, type DisburseParams, type DisburseResult, FlutterwaveAdapter, type MobileMoneyDetails, type OmniPayoutConfig, OmniPayoutEngine, type OnboardingLinkParams, type OnboardingLinkResult, type PayoutRail, type PayoutSpeed, type PayoutStatus, type PayoutStatusParams, PaystackAdapter, type RailBalance, StripeConnectAdapter, type WebhookEvent };
+export { type BankAccountDetails, type BankResolutionResult, type DisburseParams, type DisburseResult, FlutterwaveAdapter, type HealthConfig, type MobileMoneyDetails, MpesaDarajaAdapter, type MpesaDarajaConfig, type OmniPayoutConfig, OmniPayoutEngine, type OnboardingLinkParams, type OnboardingLinkResult, PawaPayAdapter, type PayoutRail, type PayoutSpeed, type PayoutStatus, type PayoutStatusParams, PaystackAdapter, type RailBalance, type RailHealth, RailHealthTracker, StripeConnectAdapter, type WebhookEvent, YellowCardAdapter };

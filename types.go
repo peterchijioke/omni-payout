@@ -9,6 +9,9 @@ const (
 	RailStripeConnect PayoutRail = "STRIPE_CONNECT"
 	RailFlutterwave   PayoutRail = "FLUTTERWAVE"
 	RailPaystack      PayoutRail = "PAYSTACK"
+	RailPawaPay       PayoutRail = "PAWAPAY"
+	RailYellowCard    PayoutRail = "YELLOW_CARD"
+	RailMpesaDaraja   PayoutRail = "MPESA_DARAJA"
 )
 
 // PayoutSpeed specifies whether payout is standard ACH/batch or instant debit card.
@@ -89,6 +92,27 @@ type RailBalance struct {
 	Pending   float64    `json:"pending,omitempty"`
 }
 
+// RailHealth reports live uptime/latency and circuit-breaker state for a rail.
+type RailHealth struct {
+	Rail                PayoutRail `json:"rail"`
+	Healthy             bool       `json:"healthy"`
+	CircuitOpen         bool       `json:"circuitOpen"`
+	ConsecutiveFailures int        `json:"consecutiveFailures"`
+	TotalRequests       int        `json:"totalRequests"`
+	TotalFailures       int        `json:"totalFailures"`
+	LastLatencyMs       int64      `json:"lastLatencyMs"`
+	AvgLatencyMs        int64      `json:"avgLatencyMs"`
+	LastError           string     `json:"lastError,omitempty"`
+	CircuitOpenUntil    *time.Time `json:"circuitOpenUntil,omitempty"`
+}
+
+// HealthConfig configures circuit-breaker thresholds per rail.
+type HealthConfig struct {
+	FailureThreshold int
+	Cooldown         time.Duration
+	MaxLatency       time.Duration
+}
+
 // WebhookEvent is the verified, normalized webhook payload from any supported rail.
 type WebhookEvent struct {
 	Rail           PayoutRail `json:"rail"`
@@ -123,7 +147,20 @@ type OnboardingLinkResult struct {
 	ExpiresAt *time.Time `json:"expiresAt,omitempty"`
 }
 
-// Config provides API credentials and webhook secrets for Stripe, Flutterwave, and Paystack.
+// MpesaDarajaConfig provides Safaricom M-Pesa Daraja B2C credentials.
+type MpesaDarajaConfig struct {
+	ConsumerKey        string
+	ConsumerSecret     string
+	ShortCode          string
+	InitiatorName      string
+	SecurityCredential string
+	ResultURL          string
+	QueueTimeoutURL    string
+	BaseURL            string
+	WebhookSecret      string
+}
+
+// Config provides API credentials, webhook secrets, and health thresholds for all rails.
 type Config struct {
 	StripeSecretKey          string
 	StripeWebhookSecret      string
@@ -131,4 +168,13 @@ type Config struct {
 	FlutterwaveWebhookSecret string
 	PaystackSecretKey        string
 	PaystackWebhookSecret    string
+	PawaPayAPIToken          string
+	PawaPayBaseURL           string
+	PawaPayWebhookSecret     string
+	YellowCardAPIKey         string
+	YellowCardSecretKey      string
+	YellowCardBaseURL        string
+	YellowCardWebhookSecret  string
+	MpesaDaraja              *MpesaDarajaConfig
+	Health                   *HealthConfig
 }

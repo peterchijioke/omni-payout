@@ -358,3 +358,119 @@ func TestVerifyWebhooks(t *testing.T) {
 		t.Errorf("expected error for invalid paystack webhook signature")
 	}
 }
+
+func TestPawaPayYellowCardMpesaAndCircuitBreaker(t *testing.T) {
+	engine := NewEngine(Config{
+		FlutterwaveSecretKey: "flw_mock",
+		PaystackSecretKey:    "ps_mock",
+		PawaPayAPIToken:      "pp_mock",
+		YellowCardAPIKey:     "yc_key",
+		YellowCardSecretKey:  "yc_secret",
+		MpesaDaraja: &MpesaDarajaConfig{
+			ConsumerKey:        "mpesa_key",
+			ConsumerSecret:     "mpesa_secret",
+			ShortCode:          "600999",
+			InitiatorName:      "testapi",
+			SecurityCredential: "cred",
+			ResultURL:          "https://example.com/result",
+			QueueTimeoutURL:    "https://example.com/timeout",
+		},
+		Health: &HealthConfig{FailureThreshold: 2},
+	})
+
+	flwCalls := 0
+	engine.httpClient = &http.Client{
+		Transport: roundTripFunc(func(req *http.Request) *http.Response {
+			switch req.URL.Host {
+			case "api.pawapay.io":
+				return &http.Response{
+					StatusCode: 200,
+					Body:       io.NopCloser(bytes.NewBufferString(`{"payoutId":"PP-GO-1","status":"ACCEPTED"}`)),
+					Header:     make(http.Header),
+				}
+			case "api.yellowcard.io":
+				return &http.Response{
+					StatusCode: 200,
+					Body:       io.NopCloser(bytes.NewBufferString(`{"id":"yc_1","sequenceId":"YC-GO-1","status":"processing"}`)),
+					Header:     make(http.Header),
+				}
+			case "api.safaricom.co.ke":
+				if req.URL.Path == "/oauth/v1/generate" {
+					return &http.Response{
+						StatusCode: 200,
+						Body:       io.NopCloser(bytes.NewBufferString(`{"access_token":"tok_123"}`)),
+						Header:     make(http.Header),
+					}
+				}
+				return &http.Response{
+					StatusCode: 200,
+					Body:       io.NopCloser(bytes.NewBufferString(`{"ResponseCode":"0","ConversationID":"AG_1","OriginatorConversationID":"MP-GO-1"}`)),
+					Header:     make(http.Header),
+				}
+			case "api.flutterwave.com":
+				flwCalls++
+				return &http.Response{
+					StatusCode: 503,
+					Body:       io.NopCloser(bytes.NewBufferString(`{"status":"error","message":"timeout"}`)),
+					Header:     make(http.Header),
+				}
+			default: // Paystack
+				if req.URL.Path == "/transferrecipient" {
+					return &http.Response{
+						StatusCode: 200,
+						Body:       io.NopCloser(bytes.NewBufferString(`{"status":true,"data":{"recipient_code":"RCP_cb"}}`)),
+						Header:     make(http.Header),
+					}
+				}
+				return &http.Response{
+					StatusCode: 200,
+					Body:       io.NopCloser(bytes.NewBufferString(`{"status":true,"data":{"transfer_code":"TRF_cb","reference":"CB-GO","status":"pending"}}`)),
+					Header:     make(http.Header),
+				}
+			}
+		}),
+	}
+
+	ppRes, err := engine.Disburse(DisburseParams{
+		Amount: 2500, Currency: "KES", Reference: "PP-GO-1", Rail: RailPawaPay,
+		MobileMoneyDetails: &MobileMoneyDetails{Phone: "254712345678", Network: "MPESA"},
+	})
+	if err != nil || ppRes.Rail != RailPawaPay || ppRes.Status != string(StatusPending) {
+		t.Fatalf("unexpected pawapay result: %+v, err=%v", ppRes, err)
+	}
+
+	ycRes, err := engine.Disburse(DisburseParams{
+		Amount: 50000, Currency: "NGN", Reference: "YC-GO-1", Rail: RailYellowCard,
+		BankDetails: &BankAccountDetails{BankCode: "058", AccountNumber: "0123456789"},
+	})
+	if err != nil || ycRes.Rail != RailYellowCard || ycRes.Status != string(StatusPending) {
+		t.Fatalf("unexpected yellowcard result: %+v, err=%v", ycRes, err)
+	}
+
+	mpRes, err := engine.Disburse(DisburseParams{
+		Amount: 1500, Currency: "KES", Reference: "MP-GO-1", Rail: RailMpesaDaraja,
+		MobileMoneyDetails: &MobileMoneyDetails{Phone: "254712345678", Network: "MPESA"},
+	})
+	if err != nil || mpRes.Rail != RailMpesaDaraja || mpRes.Status != string(StatusPending) {
+		t.Fatalf("unexpected mpesa result: %+v, err=%v", mpRes, err)
+	}
+
+	// Trip Flutterwave circuit breaker (2 failures)
+	_, _ = engine.Disburse(DisburseParams{Amount: 5000, Currency: "NGN", Reference: "CB-1", Rail: RailFlutterwave, BankDetails: &BankAccountDetails{BankCode: "058", AccountNumber: "0123456789"}})
+	_, _ = engine.Disburse(DisburseParams{Amount: 5000, Currency: "NGN", Reference: "CB-2", Rail: RailFlutterwave, BankDetails: &BankAccountDetails{BankCode: "058", AccountNumber: "0123456789"}})
+
+	health := engine.GetRailHealth(RailFlutterwave)
+	if len(health) != 1 || !health[0].CircuitOpen || health[0].Healthy {
+		t.Fatalf("expected Flutterwave circuit breaker to be open, got: %+v", health)
+	}
+
+	// Next payout with fallback proactively skips Flutterwave (flwCalls remains 2)
+	cbRes, err := engine.Disburse(DisburseParams{
+		Amount: 5000, Currency: "NGN", Reference: "CB-GO",
+		Rail: RailFlutterwave, FallbackRails: []PayoutRail{RailPaystack},
+		BankDetails: &BankAccountDetails{BankCode: "058", AccountNumber: "0123456789"},
+	})
+	if err != nil || flwCalls != 2 || cbRes.Rail != RailPaystack || cbRes.FailoverFrom != RailFlutterwave {
+		t.Fatalf("expected proactive circuit-breaker failover to Paystack, flwCalls=%d res=%+v err=%v", flwCalls, cbRes, err)
+	}
+}
