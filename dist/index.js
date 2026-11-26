@@ -1928,8 +1928,9 @@ var OmniPayoutEngine = class {
           continue;
         }
         if (rule.rails.length > 0) {
-          let ordered = [...rule.rails];
-          if (rule.fees) {
+          const ordered = [...rule.rails];
+          const strategy = rule.strategy ?? (rule.fees ? "lowest_fee" : "priority");
+          if (strategy === "lowest_fee" && rule.fees) {
             const fees = rule.fees;
             ordered.sort((a, b) => {
               const fa = fees[a];
@@ -1937,6 +1938,15 @@ var OmniPayoutEngine = class {
               const costA = fa ? (fa.flat ?? 0) + params.amount * (fa.percent ?? 0) / 100 : Number.MAX_SAFE_INTEGER;
               const costB = fb ? (fb.flat ?? 0) + params.amount * (fb.percent ?? 0) / 100 : Number.MAX_SAFE_INTEGER;
               return costA - costB;
+            });
+          } else if (strategy === "health_first") {
+            const stateRank = (s) => s === "CLOSED" ? 0 : s === "HALF_OPEN" ? 1 : 2;
+            ordered.sort((a, b) => {
+              const ha = this.#health.getHealth(a);
+              const hb = this.#health.getHealth(b);
+              const rankDiff = stateRank(ha.state) - stateRank(hb.state);
+              if (rankDiff !== 0) return rankDiff;
+              return ha.avgLatencyMs - hb.avgLatencyMs;
             });
           }
           for (const fb of params.fallbackRails || []) {
@@ -2065,6 +2075,41 @@ var OmniPayoutEngine = class {
         if (existing.result) {
           return existing.result;
         }
+        if (existing.state === "IN_PROGRESS") {
+          throw new PayoutProviderError({
+            message: `Payout "${refKey}" is currently in progress on another instance`,
+            rail: existing.rail || this.resolveRail(params),
+            code: "IN_PROGRESS",
+            isAmbiguous: false,
+            retryable: true
+          });
+        }
+        if (existing.state === "AMBIGUOUS" && !params.allowUnsafeTimeoutFailover) {
+          const origRail = existing.rail || this.resolveRail(params);
+          if (REFERENCE_LOOKUP_RAILS.has(origRail)) {
+            try {
+              const reconciled = await this.getPayoutStatus({
+                transactionId: refKey,
+                reference: refKey,
+                rail: origRail
+              });
+              if (reconciled.status !== "FAILED") {
+                await this.#idempotencyStore.set(
+                  refKey,
+                  { fingerprint, state: "COMPLETED", rail: origRail, updatedAt: Date.now(), result: reconciled },
+                  this.#idempotencyTtlMs
+                );
+                return reconciled;
+              }
+            } catch (statusErr) {
+              if (!(statusErr instanceof PayoutProviderError && statusErr.statusCode === 404)) {
+                throw new PayoutAmbiguousError(origRail, refKey, "prior instance left payout in AMBIGUOUS state");
+              }
+            }
+          } else {
+            throw new PayoutAmbiguousError(origRail, refKey, "prior instance left payout in AMBIGUOUS state");
+          }
+        }
       }
     }
     const candidateRails = this.resolveRoute(params);
@@ -2125,6 +2170,13 @@ var OmniPayoutEngine = class {
           throw lastError;
         }
       }
+      if (this.#idempotencyStore) {
+        await this.#idempotencyStore.set(
+          refKey,
+          { fingerprint, state: "IN_PROGRESS", rail, updatedAt: Date.now() },
+          this.#idempotencyTtlMs
+        );
+      }
       const startMs = Date.now();
       try {
         const result = await withRetry(
@@ -2153,6 +2205,9 @@ var OmniPayoutEngine = class {
             lastError = new Error(result.error || `${rail} disbursement returned FAILED`);
             continue;
           }
+          if (this.#idempotencyStore) {
+            await this.#idempotencyStore.delete?.(refKey);
+          }
         } else {
           this.#health.recordSuccess(rail, latencyMs);
           const nextState = this.#health.getHealth(rail).state;
@@ -2178,7 +2233,7 @@ var OmniPayoutEngine = class {
         if (this.#idempotencyStore && finalResult.status !== "FAILED") {
           await this.#idempotencyStore.set(
             refKey,
-            { fingerprint, result: finalResult },
+            { fingerprint, state: "COMPLETED", rail, updatedAt: Date.now(), result: finalResult },
             this.#idempotencyTtlMs
           );
         }
@@ -2222,7 +2277,7 @@ var OmniPayoutEngine = class {
               if (this.#idempotencyStore && recovered.status !== "FAILED") {
                 await this.#idempotencyStore.set(
                   refKey,
-                  { fingerprint, result: recovered },
+                  { fingerprint, state: "COMPLETED", rail, updatedAt: Date.now(), result: recovered },
                   this.#idempotencyTtlMs
                 );
               }
@@ -2230,14 +2285,25 @@ var OmniPayoutEngine = class {
             } catch (statusErr) {
               if (statusErr instanceof PayoutProviderError && statusErr.statusCode === 404) {
                 if (hasFallback) continue;
+                if (this.#idempotencyStore) await this.#idempotencyStore.delete?.(refKey);
                 throw lastError;
               }
             }
+          }
+          if (this.#idempotencyStore) {
+            await this.#idempotencyStore.set(
+              refKey,
+              { fingerprint, state: "AMBIGUOUS", rail, updatedAt: Date.now() },
+              this.#idempotencyTtlMs
+            );
           }
           throw new PayoutAmbiguousError(rail, params.reference, lastError.message);
         }
         if (hasFallback) {
           continue;
+        }
+        if (this.#idempotencyStore) {
+          await this.#idempotencyStore.delete?.(refKey);
         }
         throw lastError;
       }

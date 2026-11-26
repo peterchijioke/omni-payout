@@ -40,6 +40,7 @@ type ErrorCode string
 const (
 	ErrValidation            ErrorCode = "VALIDATION_ERROR"
 	ErrIdempotencyConflict   ErrorCode = "IDEMPOTENCY_CONFLICT"
+	ErrInProgress            ErrorCode = "IN_PROGRESS"
 	ErrAuthFailed            ErrorCode = "AUTH_FAILED"
 	ErrInvalidAccount        ErrorCode = "INVALID_ACCOUNT"
 	ErrInsufficientFloat     ErrorCode = "INSUFFICIENT_FLOAT"
@@ -52,6 +53,24 @@ const (
 	ErrWebhookSignature      ErrorCode = "WEBHOOK_SIGNATURE_INVALID"
 	ErrReconciliationTimeout ErrorCode = "RECONCILIATION_TIMEOUT"
 	ErrProvider              ErrorCode = "PROVIDER_ERROR"
+)
+
+// RoutingStrategy controls how candidate rails in a RoutingRule are ordered.
+type RoutingStrategy string
+
+const (
+	StrategyPriority    RoutingStrategy = "priority"
+	StrategyLowestFee   RoutingStrategy = "lowest_fee"
+	StrategyHealthFirst RoutingStrategy = "health_first"
+)
+
+// IdempotencyState tracks multi-instance disbursement lifecycle state in IdempotencyStore.
+type IdempotencyState string
+
+const (
+	IdempotencyInProgress IdempotencyState = "IN_PROGRESS"
+	IdempotencyCompleted  IdempotencyState = "COMPLETED"
+	IdempotencyAmbiguous  IdempotencyState = "AMBIGUOUS"
 )
 
 // BankAccountDetails holds African NIP bank transfer destination information.
@@ -176,19 +195,23 @@ type RailLimit struct {
 	MaxAmount float64
 }
 
-// RoutingRule defines configurable routing by currency, country, amount limits, and fees.
+// RoutingRule defines configurable routing by currency, country, amount limits, strategy, and fees.
 type RoutingRule struct {
 	Currencies []string
 	Countries  []string
 	MinAmount  float64
 	MaxAmount  float64
 	Rails      []PayoutRail
+	Strategy   RoutingStrategy
 	Fees       map[PayoutRail]ProviderFeeRule
 }
 
-// IdempotencyRecord holds the parameter fingerprint and optional settled/pending result.
+// IdempotencyRecord holds the parameter fingerprint, lifecycle state, and optional result.
 type IdempotencyRecord struct {
 	Fingerprint string
+	State       IdempotencyState
+	Rail        PayoutRail
+	UpdatedAt   time.Time
 	Result      *DisburseResult
 }
 

@@ -15,6 +15,7 @@ export type CircuitState = 'CLOSED' | 'OPEN' | 'HALF_OPEN';
 export type PayoutErrorCode =
   | 'VALIDATION_ERROR'
   | 'IDEMPOTENCY_CONFLICT'
+  | 'IN_PROGRESS'
   | 'AUTH_FAILED'
   | 'INVALID_ACCOUNT'
   | 'INSUFFICIENT_FLOAT'
@@ -27,6 +28,8 @@ export type PayoutErrorCode =
   | 'WEBHOOK_SIGNATURE_INVALID'
   | 'RECONCILIATION_TIMEOUT'
   | 'PROVIDER_ERROR';
+
+export type RoutingStrategy = 'priority' | 'lowest_fee' | 'health_first';
 
 export interface BankAccountDetails {
   bankCode: string;
@@ -152,7 +155,9 @@ export interface RoutingRule {
   maxAmount?: number;
   /** Ordered candidate rails when this rule matches. */
   rails: PayoutRail[];
-  /** Optional fee schedule: when set, candidate rails are sorted lowest-cost first. */
+  /** Routing priority mode: 'priority' (declared order), 'lowest_fee', or 'health_first' (reliability/latency). */
+  strategy?: RoutingStrategy;
+  /** Optional fee schedule used when strategy is 'lowest_fee' (or omitted with fees set). */
   fees?: Partial<Record<PayoutRail, ProviderFeeRule>>;
 }
 
@@ -163,8 +168,13 @@ export interface WebhookDeduplicationConfig {
   rejectDuplicates?: boolean;
 }
 
+export type IdempotencyState = 'IN_PROGRESS' | 'COMPLETED' | 'AMBIGUOUS';
+
 export interface IdempotencyRecord {
   fingerprint: string;
+  state?: IdempotencyState;
+  rail?: PayoutRail;
+  updatedAt?: number;
   result?: DisburseResult;
 }
 

@@ -2,7 +2,8 @@ type PayoutRail = 'STRIPE_CONNECT' | 'FLUTTERWAVE' | 'PAYSTACK' | 'PAWAPAY' | 'Y
 type PayoutSpeed = 'standard' | 'instant';
 type PayoutStatus = 'PENDING' | 'SUCCESSFUL' | 'FAILED';
 type CircuitState = 'CLOSED' | 'OPEN' | 'HALF_OPEN';
-type PayoutErrorCode = 'VALIDATION_ERROR' | 'IDEMPOTENCY_CONFLICT' | 'AUTH_FAILED' | 'INVALID_ACCOUNT' | 'INSUFFICIENT_FLOAT' | 'LIMIT_EXCEEDED' | 'RATE_LIMITED' | 'PROVIDER_DOWN' | 'AMBIGUOUS_TIMEOUT' | 'DUPLICATE_REFERENCE' | 'DUPLICATE_WEBHOOK' | 'WEBHOOK_SIGNATURE_INVALID' | 'RECONCILIATION_TIMEOUT' | 'PROVIDER_ERROR';
+type PayoutErrorCode = 'VALIDATION_ERROR' | 'IDEMPOTENCY_CONFLICT' | 'IN_PROGRESS' | 'AUTH_FAILED' | 'INVALID_ACCOUNT' | 'INSUFFICIENT_FLOAT' | 'LIMIT_EXCEEDED' | 'RATE_LIMITED' | 'PROVIDER_DOWN' | 'AMBIGUOUS_TIMEOUT' | 'DUPLICATE_REFERENCE' | 'DUPLICATE_WEBHOOK' | 'WEBHOOK_SIGNATURE_INVALID' | 'RECONCILIATION_TIMEOUT' | 'PROVIDER_ERROR';
+type RoutingStrategy = 'priority' | 'lowest_fee' | 'health_first';
 interface BankAccountDetails {
     bankCode: string;
     accountNumber: string;
@@ -115,7 +116,9 @@ interface RoutingRule {
     maxAmount?: number;
     /** Ordered candidate rails when this rule matches. */
     rails: PayoutRail[];
-    /** Optional fee schedule: when set, candidate rails are sorted lowest-cost first. */
+    /** Routing priority mode: 'priority' (declared order), 'lowest_fee', or 'health_first' (reliability/latency). */
+    strategy?: RoutingStrategy;
+    /** Optional fee schedule used when strategy is 'lowest_fee' (or omitted with fees set). */
     fees?: Partial<Record<PayoutRail, ProviderFeeRule>>;
 }
 interface WebhookDeduplicationConfig {
@@ -124,8 +127,12 @@ interface WebhookDeduplicationConfig {
     /** Throw DUPLICATE_WEBHOOK error instead of returning `duplicate: true` (default: false). */
     rejectDuplicates?: boolean;
 }
+type IdempotencyState = 'IN_PROGRESS' | 'COMPLETED' | 'AMBIGUOUS';
 interface IdempotencyRecord {
     fingerprint: string;
+    state?: IdempotencyState;
+    rail?: PayoutRail;
+    updatedAt?: number;
     result?: DisburseResult;
 }
 /**
@@ -502,4 +509,4 @@ declare class OmniPayoutEngine {
     createConnectOnboardingLink(params: OnboardingLinkParams): Promise<OnboardingLinkResult>;
 }
 
-export { type BankAccountDetails, type BankResolutionResult, CURRENCY_COUNTRIES, type CircuitState, type DisburseParams, type DisburseResult, FlutterwaveAdapter, type HealthConfig, type IdempotencyRecord, type IdempotencyStore, InMemoryIdempotencyStore, InMemoryWebhookStore, type MobileMoneyDetails, MpesaDarajaAdapter, type MpesaDarajaConfig, type NameMatchResult, type OmniPayoutConfig, OmniPayoutEngine, type OnboardingLinkParams, type OnboardingLinkResult, PawaPayAdapter, PayoutAmbiguousError, type PayoutErrorCode, PayoutProviderError, type PayoutRail, type PayoutSpeed, type PayoutStatus, type PayoutStatusParams, type PayoutTelemetryEvent, PaystackAdapter, type ProviderFeeRule, type RailBalance, type RailHealth, RailHealthTracker, type RailLimit, type ReconcileOptions, type RetryConfig, type RoutingRule, StripeConnectAdapter, type WebhookDeduplicationConfig, type WebhookEvent, type WebhookStore, YellowCardAdapter, canTransitionStatus, classifyProviderError, constantTimeHexEqual, constantTimeStringEqual, currencyExponent, encryptMpesaInitiatorPassword, fetchWithTimeout, fromMinorUnits, isHttpStatusAmbiguous, matchAccountNames, normalizeMsisdn, resolveProviderCode, sanitizeBaseUrl, sleepMs, toDeterministicUuid, toMinorUnits, validateDisburseInputs, validateSafeIdentifier, withRetry };
+export { type BankAccountDetails, type BankResolutionResult, CURRENCY_COUNTRIES, type CircuitState, type DisburseParams, type DisburseResult, FlutterwaveAdapter, type HealthConfig, type IdempotencyRecord, type IdempotencyState, type IdempotencyStore, InMemoryIdempotencyStore, InMemoryWebhookStore, type MobileMoneyDetails, MpesaDarajaAdapter, type MpesaDarajaConfig, type NameMatchResult, type OmniPayoutConfig, OmniPayoutEngine, type OnboardingLinkParams, type OnboardingLinkResult, PawaPayAdapter, PayoutAmbiguousError, type PayoutErrorCode, PayoutProviderError, type PayoutRail, type PayoutSpeed, type PayoutStatus, type PayoutStatusParams, type PayoutTelemetryEvent, PaystackAdapter, type ProviderFeeRule, type RailBalance, type RailHealth, RailHealthTracker, type RailLimit, type ReconcileOptions, type RetryConfig, type RoutingRule, type RoutingStrategy, StripeConnectAdapter, type WebhookDeduplicationConfig, type WebhookEvent, type WebhookStore, YellowCardAdapter, canTransitionStatus, classifyProviderError, constantTimeHexEqual, constantTimeStringEqual, currencyExponent, encryptMpesaInitiatorPassword, fetchWithTimeout, fromMinorUnits, isHttpStatusAmbiguous, matchAccountNames, normalizeMsisdn, resolveProviderCode, sanitizeBaseUrl, sleepMs, toDeterministicUuid, toMinorUnits, validateDisburseInputs, validateSafeIdentifier, withRetry };

@@ -276,7 +276,15 @@ func (e *Engine) ResolveRoute(params DisburseParams) []PayoutRail {
 			if len(rule.Rails) > 0 {
 				ordered := make([]PayoutRail, len(rule.Rails))
 				copy(ordered, rule.Rails)
-				if len(rule.Fees) > 0 {
+				strategy := rule.Strategy
+				if strategy == "" {
+					if len(rule.Fees) > 0 {
+						strategy = StrategyLowestFee
+					} else {
+						strategy = StrategyPriority
+					}
+				}
+				if strategy == StrategyLowestFee && len(rule.Fees) > 0 {
 					sort.SliceStable(ordered, func(i, j int) bool {
 						fi, okI := rule.Fees[ordered[i]]
 						fj, okJ := rule.Fees[ordered[j]]
@@ -289,6 +297,24 @@ func (e *Engine) ResolveRoute(params DisburseParams) []PayoutRail {
 							costJ = fj.Flat + (params.Amount*fj.Percent)/100.0
 						}
 						return costI < costJ
+					})
+				} else if strategy == StrategyHealthFirst {
+					stateRank := func(s CircuitState) int {
+						if s == CircuitClosed {
+							return 0
+						}
+						if s == CircuitHalfOpen {
+							return 1
+						}
+						return 2
+					}
+					sort.SliceStable(ordered, func(i, j int) bool {
+						hi := e.health.getHealth(ordered[i])
+						hj := e.health.getHealth(ordered[j])
+						if stateRank(hi.State) != stateRank(hj.State) {
+							return stateRank(hi.State) < stateRank(hj.State)
+						}
+						return hi.AvgLatencyMs < hj.AvgLatencyMs
 					})
 				}
 				seen := map[PayoutRail]bool{}
@@ -446,6 +472,54 @@ func (e *Engine) DisburseContext(ctx context.Context, params DisburseParams) (*D
 				call.res = existing.Result
 				return existing.Result, nil
 			}
+			if existing.State == IdempotencyInProgress {
+				ipErr := &ProviderError{
+					Rail:      existing.Rail,
+					Code:      ErrInProgress,
+					Message:   fmt.Sprintf("payout %q is currently in progress on another instance", refKey),
+					Retryable: true,
+				}
+				call.err = ipErr
+				return nil, ipErr
+			}
+			if existing.State == IdempotencyAmbiguous && !params.AllowUnsafeTimeoutFailover {
+				origRail := existing.Rail
+				if origRail == "" {
+					origRail = e.ResolveRail(params)
+				}
+				if referenceLookupRails[origRail] {
+					reconciled, sErr := e.GetPayoutStatusContext(ctx, PayoutStatusParams{
+						TransactionID: refKey,
+						Reference:     refKey,
+						Rail:          origRail,
+					})
+					if sErr == nil && reconciled.Status != string(StatusFailed) {
+						ttl := e.config.IdempotencyTTL
+						if ttl <= 0 {
+							ttl = 24 * time.Hour
+						}
+						_ = e.config.IdempotencyStore.Set(ctx, refKey, IdempotencyRecord{
+							Fingerprint: fingerprint,
+							State:       IdempotencyCompleted,
+							Rail:        origRail,
+							UpdatedAt:   time.Now().UTC(),
+							Result:      reconciled,
+						}, ttl)
+						call.res = reconciled
+						return reconciled, nil
+					}
+					var lookupErr *ProviderError
+					if sErr != nil && !(errors.As(sErr, &lookupErr) && lookupErr.StatusCode == http.StatusNotFound) {
+						ambErr := &AmbiguousPayoutError{Rail: origRail, Reference: refKey, Code: ErrAmbiguousTimeout, Cause: "prior instance left payout in AMBIGUOUS state"}
+						call.err = ambErr
+						return nil, ambErr
+					}
+				} else {
+					ambErr := &AmbiguousPayoutError{Rail: origRail, Reference: refKey, Code: ErrAmbiguousTimeout, Cause: "prior instance left payout in AMBIGUOUS state"}
+					call.err = ambErr
+					return nil, ambErr
+				}
+			}
 		}
 	}
 
@@ -528,6 +602,16 @@ func (e *Engine) executeDisbursePipeline(ctx context.Context, params DisbursePar
 			}
 		}
 
+		// Persist pre-dispatch IN_PROGRESS lock for multi-instance safety when IdempotencyStore is configured
+		if e.config.IdempotencyStore != nil {
+			_ = e.config.IdempotencyStore.Set(ctx, refKey, IdempotencyRecord{
+				Fingerprint: fingerprint,
+				State:       IdempotencyInProgress,
+				Rail:        rail,
+				UpdatedAt:   time.Now().UTC(),
+			}, idempTTL)
+		}
+
 		start := time.Now()
 		res, err := withRetry(ctx, e.config.Retry, func() (*DisburseResult, error) {
 			return e.disburseOnRail(ctx, rail, params)
@@ -572,7 +656,7 @@ func (e *Engine) executeDisbursePipeline(ctx context.Context, params DisbursePar
 							reconciled.FailoverFrom = primaryRail
 						}
 						if e.config.IdempotencyStore != nil && reconciled.Status != string(StatusFailed) {
-							_ = e.config.IdempotencyStore.Set(ctx, refKey, IdempotencyRecord{Fingerprint: fingerprint, Result: reconciled}, idempTTL)
+							_ = e.config.IdempotencyStore.Set(ctx, refKey, IdempotencyRecord{Fingerprint: fingerprint, State: IdempotencyCompleted, Rail: rail, UpdatedAt: time.Now().UTC(), Result: reconciled}, idempTTL)
 						}
 						return reconciled, nil
 					}
@@ -581,8 +665,19 @@ func (e *Engine) executeDisbursePipeline(ctx context.Context, params DisbursePar
 						if hasFallback {
 							continue
 						}
+						if e.config.IdempotencyStore != nil {
+							_ = e.config.IdempotencyStore.Delete(ctx, refKey)
+						}
 						return nil, lastErr
 					}
+				}
+				if e.config.IdempotencyStore != nil {
+					_ = e.config.IdempotencyStore.Set(ctx, refKey, IdempotencyRecord{
+						Fingerprint: fingerprint,
+						State:       IdempotencyAmbiguous,
+						Rail:        rail,
+						UpdatedAt:   time.Now().UTC(),
+					}, idempTTL)
 				}
 				return nil, &AmbiguousPayoutError{
 					Rail:      rail,
@@ -594,6 +689,9 @@ func (e *Engine) executeDisbursePipeline(ctx context.Context, params DisbursePar
 
 			if hasFallback {
 				continue
+			}
+			if e.config.IdempotencyStore != nil {
+				_ = e.config.IdempotencyStore.Delete(ctx, refKey)
 			}
 			return nil, err
 		}
@@ -608,6 +706,9 @@ func (e *Engine) executeDisbursePipeline(ctx context.Context, params DisbursePar
 				lastFailed = res
 				lastErr = fmt.Errorf("%s disbursement returned FAILED: %s", rail, res.Error)
 				continue
+			}
+			if e.config.IdempotencyStore != nil {
+				_ = e.config.IdempotencyStore.Delete(ctx, refKey)
 			}
 		} else {
 			e.health.recordSuccess(rail, latency)
@@ -624,7 +725,7 @@ func (e *Engine) executeDisbursePipeline(ctx context.Context, params DisbursePar
 		e.emit(TelemetryEvent{Type: "disburse.success", Rail: rail, Reference: refKey, LatencyMs: latency.Milliseconds()})
 
 		if e.config.IdempotencyStore != nil && res.Status != string(StatusFailed) {
-			_ = e.config.IdempotencyStore.Set(ctx, refKey, IdempotencyRecord{Fingerprint: fingerprint, Result: res}, idempTTL)
+			_ = e.config.IdempotencyStore.Set(ctx, refKey, IdempotencyRecord{Fingerprint: fingerprint, State: IdempotencyCompleted, Rail: rail, UpdatedAt: time.Now().UTC(), Result: res}, idempTTL)
 		}
 		return res, nil
 	}

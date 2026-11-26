@@ -881,3 +881,58 @@ func TestV160ConcurrencyHalfOpenRoutingRetryReconcileAndStores(t *testing.T) {
 		t.Fatalf("expected 2 balance calls after invalidation, got %d", balCalls.Load())
 	}
 }
+
+func TestMultiInstanceAmbiguousPersistenceAndRoutingStrategy(t *testing.T) {
+	sharedStore := NewInMemoryIdempotencyStore(100)
+	podA := NewEngine(Config{
+		FlutterwaveSecretKey: "flw_k",
+		PaystackSecretKey:    "ps_k",
+		IdempotencyStore:     sharedStore,
+		RoutingRules: []RoutingRule{
+			{
+				Currencies: []string{"NGN"},
+				Rails:      []PayoutRail{RailFlutterwave, RailPaystack},
+				Strategy:   StrategyPriority,
+				Fees:       map[PayoutRail]ProviderFeeRule{RailFlutterwave: {Flat: 100}, RailPaystack: {Flat: 10}},
+			},
+		},
+	})
+	podB := NewEngine(Config{
+		FlutterwaveSecretKey: "flw_k",
+		PaystackSecretKey:    "ps_k",
+		IdempotencyStore:     sharedStore,
+	})
+
+	route := podA.ResolveRoute(DisburseParams{Amount: 10000, Currency: "NGN", Reference: "R-PRIO", BankDetails: &BankAccountDetails{BankCode: "058", AccountNumber: "0123456789"}})
+	if route[0] != RailFlutterwave {
+		t.Fatalf("expected StrategyPriority to keep FLUTTERWAVE first despite higher fee, got %v", route)
+	}
+
+	var psCalls atomic.Int32
+	transport := roundTripFunc(func(req *http.Request) *http.Response {
+		if req.URL.Host == "api.flutterwave.com" {
+			return &http.Response{StatusCode: 504, Body: io.NopCloser(bytes.NewBufferString(`{"status":"error","message":"timeout"}`)), Header: make(http.Header)}
+		}
+		psCalls.Add(1)
+		return &http.Response{StatusCode: 200, Body: io.NopCloser(bytes.NewBufferString(`{"status":true}`)), Header: make(http.Header)}
+	})
+	podA.httpClient = &http.Client{Transport: transport}
+	podB.httpClient = &http.Client{Transport: transport}
+
+	params := DisburseParams{
+		Amount: 20000, Currency: "NGN", Reference: "REF-MULTI-POD-GO",
+		Rail: RailFlutterwave, FallbackRails: []PayoutRail{RailPaystack},
+		BankDetails: &BankAccountDetails{BankCode: "058", AccountNumber: "0123456789"},
+	}
+
+	var ambErr *AmbiguousPayoutError
+	if _, err := podA.Disburse(params); !errors.As(err, &ambErr) {
+		t.Fatalf("expected AmbiguousPayoutError on podA, got %v", err)
+	}
+	if _, err := podB.Disburse(params); !errors.As(err, &ambErr) {
+		t.Fatalf("expected podB to also halt with AmbiguousPayoutError from shared store, got %v", err)
+	}
+	if psCalls.Load() != 0 {
+		t.Fatalf("expected 0 Paystack calls across both pods, got %d", psCalls.Load())
+	}
+}

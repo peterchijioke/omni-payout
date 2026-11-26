@@ -1116,5 +1116,62 @@ describe('OmniPayoutEngine', () => {
       await advEngine.getBalances('FLUTTERWAVE');
       expect(balCalls).toBe(2);
     });
+
+    it('persists AMBIGUOUS state across separate instances sharing IdempotencyStore and supports priority & health_first routing strategies', async () => {
+      const sharedStore = new InMemoryIdempotencyStore();
+      const podA = new OmniPayoutEngine({
+        flutterwave: { secretKey: 'flw_k' },
+        paystack: { secretKey: 'ps_k' },
+        idempotencyStore: sharedStore,
+        routingRules: [
+          {
+            currencies: ['NGN'],
+            rails: ['FLUTTERWAVE', 'PAYSTACK'],
+            strategy: 'priority',
+            fees: { FLUTTERWAVE: { flat: 100 }, PAYSTACK: { flat: 10 } }, // strategy='priority' keeps FLUTTERWAVE first!
+          },
+        ],
+      });
+      const podB = new OmniPayoutEngine({
+        flutterwave: { secretKey: 'flw_k' },
+        paystack: { secretKey: 'ps_k' },
+        idempotencyStore: sharedStore,
+      });
+
+      expect(
+        podA.resolveRoute({
+          amount: 10000,
+          currency: 'NGN',
+          reference: 'R-PRIO',
+          bankDetails: { bankCode: '058', accountNumber: '0123456789' },
+        })
+      ).toEqual(['FLUTTERWAVE', 'PAYSTACK']);
+
+      // Pod A hits 504 timeout on Flutterwave -> persists AMBIGUOUS to sharedStore
+      let psCalls = 0;
+      global.fetch = jest.fn().mockImplementation(async (url: string) => {
+        if (url.includes('api.flutterwave.com')) {
+          return { ok: false, status: 504, json: async () => ({ status: 'error', message: 'Gateway timeout' }) };
+        }
+        psCalls++;
+        return { ok: true, status: 200, json: async () => ({ status: true }) };
+      });
+
+      const params = {
+        amount: 20000,
+        currency: 'NGN',
+        reference: 'REF-MULTI-POD-AMB',
+        rail: 'FLUTTERWAVE' as const,
+        fallbackRails: ['PAYSTACK' as const],
+        bankDetails: { bankCode: '058', accountNumber: '0123456789' },
+      };
+
+      await expect(podA.disburse(params)).rejects.toThrow('Failover halted');
+      expect(sharedStore.get('REF-MULTI-POD-AMB')?.state).toBe('AMBIGUOUS');
+
+      // Pod B (separate instance) retries the SAME reference -> sees AMBIGUOUS in sharedStore and STILL halts without calling Paystack!
+      await expect(podB.disburse(params)).rejects.toThrow('Failover halted');
+      expect(psCalls).toBe(0);
+    });
   });
 });
