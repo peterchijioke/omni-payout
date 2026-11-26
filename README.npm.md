@@ -301,6 +301,67 @@ All provider errors are normalized into `PayoutProviderError` with `.code`, `.re
 
 ---
 
+### 10. Plugging In Custom Persistence & Monitoring (Redis / Postgres / OpenTelemetry)
+
+`omni-payout` is **stateless by default**. To enforce durable idempotency (`IN_PROGRESS`, `AMBIGUOUS`, `COMPLETED`) and webhook deduplication across multiple application instances or restarts, implement `IdempotencyStore` and `WebhookStore` with your own client:
+
+```typescript
+import {
+  OmniPayoutEngine,
+  type IdempotencyStore,
+  type IdempotencyRecord,
+  type WebhookStore,
+} from '@peterchijioke/omni-payout';
+
+// 1. Implement IdempotencyStore (e.g. backed by Redis or Postgres)
+class RedisIdempotencyStore implements IdempotencyStore {
+  constructor(private readonly redis: any) {}
+
+  async get(reference: string): Promise<IdempotencyRecord | null> {
+    const raw = await this.redis.get(`omni:idemp:${reference}`);
+    return raw ? JSON.parse(raw) : null;
+  }
+
+  async set(reference: string, record: IdempotencyRecord, ttlMs = 86_400_000): Promise<void> {
+    await this.redis.set(`omni:idemp:${reference}`, JSON.stringify(record), 'PX', ttlMs);
+  }
+
+  async delete(reference: string): Promise<void> {
+    await this.redis.del(`omni:idemp:${reference}`);
+  }
+}
+
+// 2. Implement WebhookStore for duplicate-event protection
+class RedisWebhookStore implements WebhookStore {
+  constructor(private readonly redis: any) {}
+
+  async hasSeen(eventKey: string): Promise<boolean> {
+    return (await this.redis.exists(`omni:wh:${eventKey}`)) === 1;
+  }
+
+  async markSeen(eventKey: string, ttlMs = 86_400_000): Promise<void> {
+    await this.redis.set(`omni:wh:${eventKey}`, '1', 'PX', ttlMs);
+  }
+}
+
+// 3. Pass your stores and telemetry hook into OmniPayoutEngine
+const payoutEngine = new OmniPayoutEngine({
+  flutterwave: { secretKey: process.env.FLUTTERWAVE_SECRET_KEY! },
+  paystack: { secretKey: process.env.PAYSTACK_SECRET_KEY! },
+  idempotencyStore: new RedisIdempotencyStore(redisClient),
+  webhookStore: new RedisWebhookStore(redisClient),
+  webhookDeduplication: { ttlMs: 86_400_000, rejectDuplicates: false },
+  onTelemetry: (ev) => {
+    // Export to OpenTelemetry, Prometheus, Datadog, or structured logs
+    console.log({ event: ev.type, rail: ev.rail, code: ev.errorCode, latencyMs: ev.latencyMs });
+  },
+});
+```
+
+*(For single-node apps or tests, you can also import the built-in `InMemoryIdempotencyStore` and `InMemoryWebhookStore` helpers.)*
+
+---
+
 ## License
 
 MIT © [Peter Chukwu](https://github.com/peterchijioke)

@@ -268,6 +268,86 @@ const engine = new OmniPayoutEngine({
 });
 ```
 
+### How to Implement Custom Persistence Plugins (Redis / Postgres)
+
+To enforce durable idempotency (`IN_PROGRESS`, `AMBIGUOUS`, `COMPLETED`) and webhook deduplication across multiple instances or restarts, implement `IdempotencyStore` and `WebhookStore` using your existing client (no extra dependencies inside `omni-payout`).
+
+#### TypeScript (Redis Example)
+
+```typescript
+import type { IdempotencyStore, IdempotencyRecord, WebhookStore } from '@peterchijioke/omni-payout';
+// Bring your own client (e.g. ioredis, node-redis, Prisma, Drizzle, Knex)
+
+export class RedisIdempotencyStore implements IdempotencyStore {
+  constructor(private readonly redis: { get(k: string): Promise<string | null>; set(k: string, v: string, mode: 'PX', ttl: number): Promise<unknown>; del(k: string): Promise<unknown> }) {}
+
+  async get(reference: string): Promise<IdempotencyRecord | null> {
+    const raw = await this.redis.get(`omni:idemp:${reference}`);
+    return raw ? (JSON.parse(raw) as IdempotencyRecord) : null;
+  }
+
+  async set(reference: string, record: IdempotencyRecord, ttlMs = 86_400_000): Promise<void> {
+    await this.redis.set(`omni:idemp:${reference}`, JSON.stringify(record), 'PX', ttlMs);
+  }
+
+  async delete(reference: string): Promise<void> {
+    await this.redis.del(`omni:idemp:${reference}`);
+  }
+}
+
+export class RedisWebhookStore implements WebhookStore {
+  constructor(private readonly redis: { exists(k: string): Promise<number>; set(k: string, v: string, mode: 'PX', ttl: number): Promise<unknown> }) {}
+
+  async hasSeen(eventKey: string): Promise<boolean> {
+    return (await this.redis.exists(`omni:wh:${eventKey}`)) === 1;
+  }
+
+  async markSeen(eventKey: string, ttlMs = 86_400_000): Promise<void> {
+    await this.redis.set(`omni:wh:${eventKey}`, '1', 'PX', ttlMs);
+  }
+}
+```
+
+#### Go (Redis / Custom Store Example)
+
+Implement the `omnipayout.IdempotencyStore` and `omnipayout.WebhookStore` interfaces and pass them in `omnipayout.Config`:
+
+```go
+type RedisIdempotencyStore struct{ client *redis.Client }
+
+func (s *RedisIdempotencyStore) Get(ctx context.Context, ref string) (*omnipayout.IdempotencyRecord, error) {
+	raw, err := s.client.Get(ctx, "omni:idemp:"+ref).Bytes()
+	if errors.Is(err, redis.Nil) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	var rec omnipayout.IdempotencyRecord
+	return &rec, json.Unmarshal(raw, &rec)
+}
+
+func (s *RedisIdempotencyStore) Set(ctx context.Context, ref string, rec omnipayout.IdempotencyRecord, ttl time.Duration) error {
+	b, _ := json.Marshal(rec)
+	return s.client.Set(ctx, "omni:idemp:"+ref, b, ttl).Err()
+}
+
+func (s *RedisIdempotencyStore) Delete(ctx context.Context, ref string) error {
+	return s.client.Del(ctx, "omni:idemp:"+ref).Err()
+}
+
+// Wire into NewEngine:
+engine := omnipayout.NewEngine(omnipayout.Config{
+	FlutterwaveSecretKey: os.Getenv("FLW_SECRET_KEY"),
+	PaystackSecretKey:    os.Getenv("PAYSTACK_SECRET_KEY"),
+	IdempotencyStore:     &RedisIdempotencyStore{client: rdb},
+	OnTelemetry: func(ev omnipayout.TelemetryEvent) {
+		// Export to Prometheus / OpenTelemetry / structured logs
+		log.Printf("event=%s rail=%s code=%s latency_ms=%d", ev.Type, ev.Rail, ev.ErrorCode, ev.LatencyMs)
+	},
+})
+```
+
 ---
 
 ## License
