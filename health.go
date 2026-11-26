@@ -7,6 +7,8 @@ import (
 )
 
 type internalHealthState struct {
+	state               CircuitState
+	probeInFlight       bool
 	consecutiveFailures int
 	totalRequests       int
 	totalFailures       int
@@ -50,20 +52,49 @@ func newRailHealthTracker(cfg *HealthConfig) *railHealthTracker {
 func (t *railHealthTracker) getOrCreateLocked(rail PayoutRail) *internalHealthState {
 	st, ok := t.stats[rail]
 	if !ok {
-		st = &internalHealthState{}
+		st = &internalHealthState{state: CircuitClosed}
 		t.stats[rail] = st
 	}
 	return st
+}
+
+// tryAcquire transitions OPEN -> HALF_OPEN after cooldown and lets a single recovery probe through.
+func (t *railHealthTracker) tryAcquire(rail PayoutRail) bool {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	st, ok := t.stats[rail]
+	if !ok || st.state == CircuitClosed {
+		return true
+	}
+
+	now := time.Now()
+	if st.state == CircuitOpen {
+		if !now.Before(st.circuitOpenUntil) {
+			st.state = CircuitHalfOpen
+			st.probeInFlight = true
+			return true
+		}
+		return false
+	}
+
+	if !st.probeInFlight {
+		st.probeInFlight = true
+		return true
+	}
+	return false
 }
 
 func (t *railHealthTracker) isAvailable(rail PayoutRail) bool {
 	t.mu.RLock()
 	defer t.mu.RUnlock()
 	st, ok := t.stats[rail]
-	if !ok {
+	if !ok || st.state == CircuitClosed {
 		return true
 	}
-	return !time.Now().Before(st.circuitOpenUntil)
+	if st.state == CircuitOpen {
+		return !time.Now().Before(st.circuitOpenUntil)
+	}
+	return !st.probeInFlight
 }
 
 func (t *railHealthTracker) recordSuccess(rail PayoutRail, latency time.Duration) {
@@ -74,16 +105,19 @@ func (t *railHealthTracker) recordSuccess(rail PayoutRail, latency time.Duration
 	st.totalRequests++
 	st.lastLatencyMs = ms
 	st.totalLatencyMs += ms
+	st.probeInFlight = false
 
 	if latency > t.maxLatency {
 		st.consecutiveFailures++
 		st.lastError = fmt.Sprintf("latency %dms exceeded threshold %dms", ms, t.maxLatency.Milliseconds())
-		if st.consecutiveFailures >= t.failureThreshold {
+		if st.state == CircuitHalfOpen || st.consecutiveFailures >= t.failureThreshold {
+			st.state = CircuitOpen
 			st.circuitOpenUntil = time.Now().Add(t.cooldown)
 		}
 		return
 	}
 
+	st.state = CircuitClosed
 	st.consecutiveFailures = 0
 	st.circuitOpenUntil = time.Time{}
 }
@@ -99,8 +133,10 @@ func (t *railHealthTracker) recordFailure(rail PayoutRail, latency time.Duration
 	st.lastLatencyMs = ms
 	st.totalLatencyMs += ms
 	st.lastError = errMsg
+	st.probeInFlight = false
 
-	if st.consecutiveFailures >= t.failureThreshold {
+	if st.state == CircuitHalfOpen || st.consecutiveFailures >= t.failureThreshold {
+		st.state = CircuitOpen
 		st.circuitOpenUntil = time.Now().Add(t.cooldown)
 	}
 }
@@ -112,11 +148,16 @@ func (t *railHealthTracker) getHealth(rail PayoutRail) RailHealth {
 	if !ok {
 		return RailHealth{
 			Rail:    rail,
+			State:   CircuitClosed,
 			Healthy: true,
 		}
 	}
 
-	circuitOpen := time.Now().Before(st.circuitOpenUntil)
+	effectiveState := st.state
+	if st.state == CircuitOpen && !time.Now().Before(st.circuitOpenUntil) {
+		effectiveState = CircuitHalfOpen
+	}
+	circuitOpen := effectiveState == CircuitOpen
 	avgMs := int64(0)
 	if st.totalRequests > 0 {
 		avgMs = st.totalLatencyMs / int64(st.totalRequests)
@@ -128,7 +169,8 @@ func (t *railHealthTracker) getHealth(rail PayoutRail) RailHealth {
 	}
 	return RailHealth{
 		Rail:                rail,
-		Healthy:             !circuitOpen,
+		State:               effectiveState,
+		Healthy:             effectiveState == CircuitClosed,
 		CircuitOpen:         circuitOpen,
 		ConsecutiveFailures: st.consecutiveFailures,
 		TotalRequests:       st.totalRequests,

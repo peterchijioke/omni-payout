@@ -20,6 +20,8 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -707,5 +709,175 @@ func TestV150DeveloperPainPointFixes(t *testing.T) {
 	confEv, err := engine.VerifyAndConfirmWebhook(context.Background(), RailPaystack, psWhBody, hex.EncodeToString(mac.Sum(nil)), "", "")
 	if err != nil || confEv.Status != string(StatusSuccessful) || confEv.Fee != 26.88 {
 		t.Fatalf("expected confirmed Paystack webhook with fee=26.88, got %+v err=%v", confEv, err)
+	}
+}
+
+func TestV160ConcurrencyHalfOpenRoutingRetryReconcileAndStores(t *testing.T) {
+	idempStore := NewInMemoryIdempotencyStore(100)
+	whStore := NewInMemoryWebhookStore(100)
+	var retryTelemetry atomic.Int32
+
+	engine := NewEngine(Config{
+		StripeSecretKey:          "sk_test_mock",
+		FlutterwaveSecretKey:     "flw_mock",
+		FlutterwaveWebhookSecret: "flw_wh",
+		PaystackSecretKey:        "ps_mock",
+		IdempotencyStore:         idempStore,
+		WebhookStore:             whStore,
+		BalanceCacheTTL:          30 * time.Second,
+		Retry:                    &RetryConfig{MaxRetries: 2, BaseDelay: 5 * time.Millisecond, MaxDelay: 20 * time.Millisecond, DisableJitter: true},
+		Health:                   &HealthConfig{FailureThreshold: 1, Cooldown: 25 * time.Millisecond},
+		RoutingRules: []RoutingRule{
+			{
+				Currencies: []string{"NGN"},
+				Countries:  []string{"NG"},
+				Rails:      []PayoutRail{RailFlutterwave, RailPaystack},
+				Fees: map[PayoutRail]ProviderFeeRule{
+					RailFlutterwave: {Flat: 50, Percent: 0.5},
+					RailPaystack:    {Flat: 10, Percent: 0.1},
+				},
+			},
+		},
+		RailLimits: map[PayoutRail]RailLimit{
+			RailPaystack: {MaxAmount: 100000},
+		},
+		OnTelemetry: func(ev TelemetryEvent) {
+			if ev.Type == "disburse.retry" && ev.ErrorCode == ErrRateLimited {
+				retryTelemetry.Add(1)
+			}
+		},
+	})
+
+	// 1. Smart routing sorts cheapest rail first (Paystack < Flutterwave)
+	route := engine.ResolveRoute(DisburseParams{Amount: 20000, Currency: "NGN", Reference: "R-SORT", BankDetails: &BankAccountDetails{BankCode: "058", AccountNumber: "0123456789"}})
+	if len(route) != 2 || route[0] != RailPaystack || route[1] != RailFlutterwave {
+		t.Fatalf("expected [PAYSTACK FLUTTERWAVE], got %v", route)
+	}
+
+	// 2. Concurrent singleflight (10 goroutines with -race -> exactly 1 HTTP transfer!)
+	var transferCalls atomic.Int32
+	engine.httpClient = &http.Client{
+		Transport: roundTripFunc(func(req *http.Request) *http.Response {
+			if req.URL.Path == "/transferrecipient" {
+				return &http.Response{StatusCode: 200, Body: io.NopCloser(bytes.NewBufferString(`{"status":true,"data":{"recipient_code":"RCP_go_sf"}}`)), Header: make(http.Header)}
+			}
+			transferCalls.Add(1)
+			time.Sleep(15 * time.Millisecond)
+			return &http.Response{StatusCode: 200, Body: io.NopCloser(bytes.NewBufferString(`{"status":true,"data":{"transfer_code":"TRF_go_sf","reference":"REF-GO-SF","status":"pending"}}`)), Header: make(http.Header)}
+		}),
+	}
+
+	sfParams := DisburseParams{Amount: 15000, Currency: "NGN", Reference: "REF-GO-SF", BankDetails: &BankAccountDetails{BankCode: "058", AccountNumber: "0123456789"}}
+	var wg sync.WaitGroup
+	errs := make(chan error, 10)
+	for i := 0; i < 10; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			r, err := engine.Disburse(sfParams)
+			if err != nil || r.TransactionID != "TRF_go_sf" {
+				errs <- fmt.Errorf("unexpected result: %+v err=%v", r, err)
+			}
+		}()
+	}
+	wg.Wait()
+	close(errs)
+	for e := range errs {
+		t.Fatal(e)
+	}
+	if transferCalls.Load() != 1 {
+		t.Fatalf("expected exactly 1 transfer HTTP call under 10x concurrency, got %d", transferCalls.Load())
+	}
+
+	// 3. Idempotency conflict when reusing reference with different amount
+	_, confErr := engine.Disburse(DisburseParams{Amount: 99999, Currency: "NGN", Reference: "REF-GO-SF", BankDetails: &BankAccountDetails{BankCode: "058", AccountNumber: "0123456789"}})
+	var pErr *ProviderError
+	if !errors.As(confErr, &pErr) || pErr.Code != ErrIdempotencyConflict {
+		t.Fatalf("expected ErrIdempotencyConflict, got %v", confErr)
+	}
+
+	// 4. Retry on 429 + Half-Open circuit recovery + WaitForSettlement + Onboarding link + Webhook dedup + Balance cache
+	var rateAttempts atomic.Int32
+	var pollCalls atomic.Int32
+	var balCalls atomic.Int32
+	engine.httpClient = &http.Client{
+		Transport: roundTripFunc(func(req *http.Request) *http.Response {
+			switch {
+			case req.URL.Path == "/v1/account_links":
+				return &http.Response{StatusCode: 200, Body: io.NopCloser(bytes.NewBufferString(`{"url":"https://connect.stripe.com/setup/e/acct_1","expires_at":1800000000}`)), Header: make(http.Header)}
+			case req.URL.Path == "/v3/balances":
+				balCalls.Add(1)
+				return &http.Response{StatusCode: 200, Body: io.NopCloser(bytes.NewBufferString(`{"status":"success","data":[{"currency":"NGN","available_balance":500000}]}`)), Header: make(http.Header)}
+			case strings.HasPrefix(req.URL.Path, "/v3/transfers/"):
+				n := pollCalls.Add(1)
+				st := "PENDING"
+				if n >= 3 {
+					st = "SUCCESSFUL"
+				}
+				return &http.Response{StatusCode: 200, Body: io.NopCloser(bytes.NewBufferString(`{"status":"success","data":{"id":777,"reference":"REF-POLL-GO","status":"` + st + `","amount":5000,"currency":"NGN"}}`)), Header: make(http.Header)}
+			default:
+				n := rateAttempts.Add(1)
+				if n == 1 {
+					return &http.Response{StatusCode: 429, Body: io.NopCloser(bytes.NewBufferString(`{"status":"error","message":"Too many requests"}`)), Header: make(http.Header)}
+				}
+				if n == 3 {
+					return &http.Response{StatusCode: 400, Body: io.NopCloser(bytes.NewBufferString(`{"status":"error","message":"Invalid account"}`)), Header: make(http.Header)}
+				}
+				return &http.Response{StatusCode: 200, Body: io.NopCloser(bytes.NewBufferString(`{"status":"success","data":{"id":555,"status":"SUCCESSFUL"}}`)), Header: make(http.Header)}
+			}
+		}),
+	}
+
+	retryRes, err := engine.Disburse(DisburseParams{Amount: 5000, Currency: "NGN", Reference: "REF-429-GO", Rail: RailFlutterwave, BankDetails: &BankAccountDetails{BankCode: "058", AccountNumber: "0123456789"}})
+	if err != nil || retryRes.Status != string(StatusSuccessful) || retryTelemetry.Load() != 1 {
+		t.Fatalf("expected retry on 429 to succeed with telemetry, res=%+v err=%v telemetry=%d", retryRes, err, retryTelemetry.Load())
+	}
+
+	// Trip circuit -> OPEN -> wait cooldown -> HALF_OPEN -> probe succeeds -> CLOSED
+	_, _ = engine.Disburse(DisburseParams{Amount: 5000, Currency: "NGN", Reference: "REF-OPEN-GO", Rail: RailFlutterwave, BankDetails: &BankAccountDetails{BankCode: "058", AccountNumber: "0000000000"}})
+	if engine.GetRailHealth(RailFlutterwave)[0].State != CircuitOpen {
+		t.Fatalf("expected OPEN circuit state")
+	}
+	time.Sleep(35 * time.Millisecond)
+	if engine.GetRailHealth(RailFlutterwave)[0].State != CircuitHalfOpen {
+		t.Fatalf("expected HALF_OPEN circuit state after cooldown")
+	}
+	if _, err := engine.Disburse(DisburseParams{Amount: 5000, Currency: "NGN", Reference: "REF-CLOSE-GO", Rail: RailFlutterwave, BankDetails: &BankAccountDetails{BankCode: "058", AccountNumber: "0123456789"}}); err != nil {
+		t.Fatalf("expected HALF_OPEN probe to succeed: %v", err)
+	}
+	if engine.GetRailHealth(RailFlutterwave)[0].State != CircuitClosed {
+		t.Fatalf("expected CLOSED circuit state after probe success")
+	}
+
+	// WaitForSettlement
+	settled, err := engine.WaitForSettlement(context.Background(), PayoutStatusParams{TransactionID: "777", Reference: "REF-POLL-GO", Rail: RailFlutterwave}, &ReconcileOptions{Interval: 5 * time.Millisecond, MaxAttempts: 5, BackoffMultiplier: 1})
+	if err != nil || settled.Status != string(StatusSuccessful) || pollCalls.Load() != 3 {
+		t.Fatalf("expected WaitForSettlement to succeed on poll 3, got %+v err=%v calls=%d", settled, err, pollCalls.Load())
+	}
+
+	// CreateConnectOnboardingLink (Go parity)
+	link, err := engine.CreateConnectOnboardingLink(OnboardingLinkParams{AccountID: "acct_1", RefreshURL: "https://ex.com/r", ReturnURL: "https://ex.com/ok"})
+	if err != nil || link.URL != "https://connect.stripe.com/setup/e/acct_1" {
+		t.Fatalf("unexpected onboarding link: %+v err=%v", link, err)
+	}
+
+	// Webhook duplicate detection
+	whBody := []byte(`{"event":"transfer.completed","data":{"id":888,"reference":"REF-DUP-GO","status":"SUCCESSFUL","amount":5000,"currency":"NGN"}}`)
+	ev1, err := engine.VerifyWebhook(RailFlutterwave, whBody, "flw_wh")
+	ev2, err2 := engine.VerifyWebhook(RailFlutterwave, whBody, "flw_wh")
+	if err != nil || err2 != nil || ev1.Duplicate || !ev2.Duplicate {
+		t.Fatalf("expected duplicate webhook detection: ev1=%+v ev2=%+v err=%v err2=%v", ev1, ev2, err, err2)
+	}
+
+	// Balance cache TTL
+	_, _ = engine.GetBalances(RailFlutterwave)
+	_, _ = engine.GetBalances(RailFlutterwave)
+	if balCalls.Load() != 1 {
+		t.Fatalf("expected 1 cached balance call, got %d", balCalls.Load())
+	}
+	engine.InvalidateBalanceCache(RailFlutterwave)
+	_, _ = engine.GetBalances(RailFlutterwave)
+	if balCalls.Load() != 2 {
+		t.Fatalf("expected 2 balance calls after invalidation, got %d", balCalls.Load())
 	}
 }

@@ -115,7 +115,7 @@ func (e *Engine) disbursePawaPay(ctx context.Context, params DisburseParams) (*D
 
 	resp, err := e.httpClient.Do(req)
 	if err != nil {
-		return nil, &ProviderError{Rail: RailPawaPay, Message: err.Error(), IsAmbiguous: true}
+		return nil, newProviderError(RailPawaPay, 0, err.Error(), true)
 	}
 	defer resp.Body.Close()
 
@@ -140,12 +140,7 @@ func (e *Engine) disbursePawaPay(ctx context.Context, params DisburseParams) (*D
 		if msg == "" {
 			msg = fmt.Sprintf("pawapay request failed with status %d", resp.StatusCode)
 		}
-		return nil, &ProviderError{
-			Rail:        RailPawaPay,
-			StatusCode:  resp.StatusCode,
-			Message:     msg,
-			IsAmbiguous: isHTTPStatusAmbiguous(resp.StatusCode),
-		}
+		return nil, newProviderError(RailPawaPay, resp.StatusCode, msg, isHTTPStatusAmbiguous(resp.StatusCode))
 	}
 
 	rawStatus := data.Status
@@ -207,17 +202,13 @@ func (e *Engine) getPawaPayPayoutStatus(ctx context.Context, params PayoutStatus
 
 	resp, err := e.httpClient.Do(req)
 	if err != nil {
-		return nil, err
+		return nil, newProviderError(RailPawaPay, 0, err.Error(), false)
 	}
 	defer resp.Body.Close()
 
 	respBytes, _ := io.ReadAll(resp.Body)
 	if resp.StatusCode >= 400 {
-		return nil, &ProviderError{
-			Rail:       RailPawaPay,
-			StatusCode: resp.StatusCode,
-			Message:    fmt.Sprintf("pawapay status lookup failed with status %d", resp.StatusCode),
-		}
+		return nil, newProviderError(RailPawaPay, resp.StatusCode, fmt.Sprintf("pawapay status lookup failed with status %d", resp.StatusCode), false)
 	}
 
 	type pawaItem struct {
@@ -425,7 +416,11 @@ func (e *Engine) yellowCardRequest(ctx context.Context, method, path string, bod
 
 	resp, err := e.httpClient.Do(req)
 	if err != nil {
-		return nil, 0, &ProviderError{Rail: RailYellowCard, Message: err.Error(), IsAmbiguous: isMutating}
+		pErr := newProviderError(RailYellowCard, 0, err.Error(), isMutating)
+		if !isMutating {
+			pErr.Retryable = true
+		}
+		return nil, 0, pErr
 	}
 	defer resp.Body.Close()
 
@@ -513,12 +508,7 @@ func (e *Engine) disburseYellowCard(ctx context.Context, params DisburseParams) 
 		if msg == "" {
 			msg = fmt.Sprintf("yellow card request failed with status %d", statusCode)
 		}
-		return nil, &ProviderError{
-			Rail:        RailYellowCard,
-			StatusCode:  statusCode,
-			Message:     msg,
-			IsAmbiguous: isHTTPStatusAmbiguous(statusCode),
-		}
+		return nil, newProviderError(RailYellowCard, statusCode, msg, isHTTPStatusAmbiguous(statusCode))
 	}
 
 	status := normalizeYellowCardStatus(data.Status)
@@ -577,11 +567,7 @@ func (e *Engine) getYellowCardPayoutStatus(ctx context.Context, params PayoutSta
 		return nil, err
 	}
 	if statusCode >= 400 {
-		return nil, &ProviderError{
-			Rail:       RailYellowCard,
-			StatusCode: statusCode,
-			Message:    fmt.Sprintf("yellow card status lookup failed with status %d", statusCode),
-		}
+		return nil, newProviderError(RailYellowCard, statusCode, fmt.Sprintf("yellow card status lookup failed with status %d", statusCode), false)
 	}
 
 	var data struct {
@@ -780,7 +766,9 @@ func (e *Engine) getMpesaAccessToken(ctx context.Context) (string, error) {
 
 	resp, err := e.httpClient.Do(req)
 	if err != nil {
-		return "", &ProviderError{Rail: RailMpesaDaraja, Message: err.Error(), IsAmbiguous: false}
+		pErr := newProviderError(RailMpesaDaraja, 0, err.Error(), false)
+		pErr.Retryable = true
+		return "", pErr
 	}
 	defer resp.Body.Close()
 
@@ -796,7 +784,7 @@ func (e *Engine) getMpesaAccessToken(ctx context.Context) (string, error) {
 		if msg == "" {
 			msg = fmt.Sprintf("mpesa oauth failed with status %d", resp.StatusCode)
 		}
-		return "", &ProviderError{Rail: RailMpesaDaraja, StatusCode: resp.StatusCode, Message: msg, IsAmbiguous: false}
+		return "", newProviderError(RailMpesaDaraja, resp.StatusCode, msg, false)
 	}
 
 	expiresSec := int64(3500)
@@ -840,7 +828,11 @@ func (e *Engine) mpesaPost(ctx context.Context, path string, body interface{}, i
 
 	resp, err := e.httpClient.Do(req)
 	if err != nil {
-		return nil, &ProviderError{Rail: RailMpesaDaraja, Message: err.Error(), IsAmbiguous: isMutating}
+		pErr := newProviderError(RailMpesaDaraja, 0, err.Error(), isMutating)
+		if !isMutating {
+			pErr.Retryable = true
+		}
+		return nil, pErr
 	}
 	defer resp.Body.Close()
 
@@ -863,12 +855,7 @@ func (e *Engine) mpesaPost(ctx context.Context, path string, body interface{}, i
 		if st < 400 {
 			st = 400
 		}
-		return nil, &ProviderError{
-			Rail:        RailMpesaDaraja,
-			StatusCode:  st,
-			Message:     msg,
-			IsAmbiguous: isMutating && resp.StatusCode >= 500 && isHTTPStatusAmbiguous(resp.StatusCode),
-		}
+		return nil, newProviderError(RailMpesaDaraja, st, msg, isMutating && resp.StatusCode >= 500 && isHTTPStatusAmbiguous(resp.StatusCode))
 	}
 	return respBytes, nil
 }

@@ -30,7 +30,10 @@ var __toCommonJS = (mod) => __copyProps(__defProp({}, "__esModule", { value: tru
 // src/index.ts
 var index_exports = {};
 __export(index_exports, {
+  CURRENCY_COUNTRIES: () => CURRENCY_COUNTRIES,
   FlutterwaveAdapter: () => FlutterwaveAdapter,
+  InMemoryIdempotencyStore: () => InMemoryIdempotencyStore,
+  InMemoryWebhookStore: () => InMemoryWebhookStore,
   MpesaDarajaAdapter: () => MpesaDarajaAdapter,
   OmniPayoutEngine: () => OmniPayoutEngine,
   PawaPayAdapter: () => PawaPayAdapter,
@@ -41,6 +44,7 @@ __export(index_exports, {
   StripeConnectAdapter: () => StripeConnectAdapter,
   YellowCardAdapter: () => YellowCardAdapter,
   canTransitionStatus: () => canTransitionStatus,
+  classifyProviderError: () => classifyProviderError,
   constantTimeHexEqual: () => constantTimeHexEqual,
   constantTimeStringEqual: () => constantTimeStringEqual,
   currencyExponent: () => currencyExponent,
@@ -52,10 +56,12 @@ __export(index_exports, {
   normalizeMsisdn: () => normalizeMsisdn,
   resolveProviderCode: () => resolveProviderCode,
   sanitizeBaseUrl: () => sanitizeBaseUrl,
+  sleepMs: () => sleepMs,
   toDeterministicUuid: () => toDeterministicUuid,
   toMinorUnits: () => toMinorUnits,
   validateDisburseInputs: () => validateDisburseInputs,
-  validateSafeIdentifier: () => validateSafeIdentifier
+  validateSafeIdentifier: () => validateSafeIdentifier,
+  withRetry: () => withRetry
 });
 module.exports = __toCommonJS(index_exports);
 
@@ -83,22 +89,60 @@ var THREE_DECIMAL_CURRENCIES = /* @__PURE__ */ new Set(["BHD", "JOD", "KWD", "OM
 var UUID_REGEX = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 var CURRENCY_REGEX = /^[A-Za-z]{3}$/;
 var CONTROL_CHAR_REGEX = /[\x00-\x1f\x7f]/;
+function classifyProviderError(statusCode, message, isAmbiguous) {
+  if (isAmbiguous) {
+    return { code: "AMBIGUOUS_TIMEOUT", retryable: false };
+  }
+  const lower = (message || "").toLowerCase();
+  if (statusCode === 401 || statusCode === 403 || /invalid.*key|unauthorized|authentication|forbidden/.test(lower)) {
+    return { code: "AUTH_FAILED", retryable: false };
+  }
+  if (statusCode === 429 || /rate\s*limit|too\s*many\s*requests/.test(lower)) {
+    return { code: "RATE_LIMITED", retryable: true };
+  }
+  if (statusCode === 409 || /duplicate|already\s*exists/.test(lower)) {
+    return { code: "DUPLICATE_REFERENCE", retryable: false };
+  }
+  if (/insufficient\s*(funds|balance|float)|low\s*balance/.test(lower)) {
+    return { code: "INSUFFICIENT_FLOAT", retryable: false };
+  }
+  if (/limit\s*exceeded|maximum.*amount|minimum.*amount|amount.*exceeds/.test(lower)) {
+    return { code: "LIMIT_EXCEEDED", retryable: false };
+  }
+  if (/invalid.*(account|recipient|iban|msisdn|phone|bank)|account.*not.*found|resolve.*failed/.test(lower)) {
+    return { code: "INVALID_ACCOUNT", retryable: false };
+  }
+  if (statusCode === 503 || statusCode === 501 || /service\s*unavailable|maintenance|gateway\s*down/.test(lower)) {
+    return { code: "PROVIDER_DOWN", retryable: true };
+  }
+  if (statusCode && statusCode >= 400 && statusCode < 500) {
+    return { code: "VALIDATION_ERROR", retryable: false };
+  }
+  return { code: "PROVIDER_ERROR", retryable: false };
+}
 var PayoutProviderError = class extends Error {
   rail;
+  code;
   statusCode;
   isAmbiguous;
+  retryable;
   constructor(opts) {
     super(opts.message);
     this.name = "PayoutProviderError";
     this.rail = opts.rail;
     this.statusCode = opts.statusCode;
     this.isAmbiguous = opts.isAmbiguous;
+    const classified = classifyProviderError(opts.statusCode, opts.message, opts.isAmbiguous);
+    this.code = opts.code ?? classified.code;
+    this.retryable = opts.retryable ?? classified.retryable;
   }
 };
 var PayoutAmbiguousError = class extends Error {
   rail;
   reference;
+  code = "AMBIGUOUS_TIMEOUT";
   isAmbiguous = true;
+  retryable = false;
   constructor(rail, reference, causeMessage) {
     super(
       `Ambiguous payout state on ${rail} for reference "${reference}" (${causeMessage}). Failover halted to prevent double payout; verify status with getPayoutStatus() before retrying on another rail.`
@@ -116,13 +160,28 @@ function currencyExponent(currency) {
 }
 function toMinorUnits(amount, currency) {
   const exp = currencyExponent(currency);
-  const factor = Math.pow(10, exp);
-  return Math.round(Number((amount * factor).toPrecision(15)));
+  const str = typeof amount === "number" ? amount.toFixed(exp + 4) : String(amount).trim();
+  const negative = str.startsWith("-");
+  const unsigned = negative ? str.slice(1) : str;
+  const [wholePart = "0", fracPart = ""] = unsigned.split(".");
+  if (exp === 0) {
+    const rounded = Math.round(Number(unsigned));
+    return negative ? -rounded : rounded;
+  }
+  const paddedFrac = (fracPart + "0".repeat(exp + 1)).slice(0, exp + 1);
+  const mainDigits = paddedFrac.slice(0, exp);
+  const guardDigit = Number(paddedFrac[exp] || "0");
+  let minor = Number(wholePart) * Math.pow(10, exp) + Number(mainDigits);
+  if (guardDigit >= 5) {
+    minor += 1;
+  }
+  return negative ? -minor : minor;
 }
 function fromMinorUnits(minorAmount, currency) {
   const exp = currencyExponent(currency);
+  if (exp === 0) return minorAmount;
   const factor = Math.pow(10, exp);
-  return minorAmount / factor;
+  return Number((minorAmount / factor).toFixed(exp));
 }
 function validateDisburseInputs(amount, currency, reference) {
   if (typeof amount !== "number" || !Number.isFinite(amount) || amount <= 0) {
@@ -181,6 +240,87 @@ function isHttpStatusAmbiguous(statusCode) {
   if (statusCode === 501 || statusCode === 503) return false;
   return statusCode >= 500;
 }
+async function sleepMs(ms) {
+  if (ms <= 0) return;
+  await new Promise((resolve) => setTimeout(resolve, ms));
+}
+async function withRetry(fn, retryConfig, onRetry) {
+  const maxRetries = retryConfig?.maxRetries ?? 0;
+  if (maxRetries <= 0) {
+    return fn();
+  }
+  const baseDelayMs = retryConfig?.baseDelayMs ?? 250;
+  const maxDelayMs = retryConfig?.maxDelayMs ?? 5e3;
+  const useJitter = retryConfig?.jitter ?? true;
+  let attempt = 0;
+  while (true) {
+    try {
+      return await fn();
+    } catch (err) {
+      const canRetry = attempt < maxRetries && err instanceof PayoutProviderError && err.retryable && !err.isAmbiguous;
+      if (!canRetry) {
+        throw err;
+      }
+      const expDelay = Math.min(maxDelayMs, baseDelayMs * Math.pow(2, attempt));
+      const delay = useJitter ? Math.floor(Math.random() * expDelay) : expDelay;
+      attempt += 1;
+      onRetry?.(err, attempt);
+      await sleepMs(delay);
+    }
+  }
+}
+var InMemoryIdempotencyStore = class {
+  constructor(maxEntries = 5e3) {
+    this.maxEntries = maxEntries;
+  }
+  maxEntries;
+  entries = /* @__PURE__ */ new Map();
+  get(reference) {
+    const entry = this.entries.get(reference);
+    if (!entry) return null;
+    if (entry.expiresAt > 0 && Date.now() > entry.expiresAt) {
+      this.entries.delete(reference);
+      return null;
+    }
+    return entry.record;
+  }
+  set(reference, record, ttlMs = 864e5) {
+    if (this.entries.size >= this.maxEntries && !this.entries.has(reference)) {
+      const oldestKey = this.entries.keys().next().value;
+      if (oldestKey !== void 0) this.entries.delete(oldestKey);
+    }
+    this.entries.set(reference, {
+      record,
+      expiresAt: ttlMs > 0 ? Date.now() + ttlMs : 0
+    });
+  }
+  delete(reference) {
+    this.entries.delete(reference);
+  }
+};
+var InMemoryWebhookStore = class {
+  constructor(maxEntries = 5e3) {
+    this.maxEntries = maxEntries;
+  }
+  maxEntries;
+  seen = /* @__PURE__ */ new Map();
+  hasSeen(eventKey) {
+    const exp = this.seen.get(eventKey);
+    if (exp === void 0) return false;
+    if (exp > 0 && Date.now() > exp) {
+      this.seen.delete(eventKey);
+      return false;
+    }
+    return true;
+  }
+  markSeen(eventKey, ttlMs = 864e5) {
+    if (this.seen.size >= this.maxEntries && !this.seen.has(eventKey)) {
+      const oldestKey = this.seen.keys().next().value;
+      if (oldestKey !== void 0) this.seen.delete(oldestKey);
+    }
+    this.seen.set(eventKey, ttlMs > 0 ? Date.now() + ttlMs : 0);
+  }
+};
 async function fetchWithTimeout(url, options, timeoutMs, rail, isMutatingPost = false) {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
@@ -193,7 +333,8 @@ async function fetchWithTimeout(url, options, timeoutMs, rail, isMutatingPost = 
     throw new PayoutProviderError({
       message,
       rail,
-      isAmbiguous: isMutatingPost
+      isAmbiguous: isMutatingPost,
+      retryable: !isMutatingPost
     });
   } finally {
     clearTimeout(timer);
@@ -225,6 +366,18 @@ var CURRENCY_DIAL_CODES = {
   XAF: "237",
   XOF: "225"
 };
+var CURRENCY_COUNTRIES = {
+  NGN: "NG",
+  KES: "KE",
+  GHS: "GH",
+  UGX: "UG",
+  TZS: "TZ",
+  RWF: "RW",
+  ZAR: "ZA",
+  ZMW: "ZM",
+  USD: "US",
+  GBP: "GB"
+};
 function normalizeMsisdn(phone, currency) {
   if (!phone || typeof phone !== "string") {
     throw new Error("Mobile money phone number is required");
@@ -247,7 +400,9 @@ function normalizeMsisdn(phone, currency) {
 }
 function encryptMpesaInitiatorPassword(initiatorPassword, certificatePem) {
   if (!initiatorPassword || !certificatePem) {
-    throw new Error("Both initiatorPassword and certificatePem are required to generate SecurityCredential");
+    throw new Error(
+      "Both initiatorPassword and certificatePem are required to generate SecurityCredential"
+    );
   }
   const encrypted = import_crypto.default.publicEncrypt(
     {
@@ -324,18 +479,15 @@ var PAYSTACK_MOMO_BANK_CODES = {
   WAVE: "WAVE"
 };
 var CROSS_RAIL_BANK_CODES = {
-  // Ghana (GHS) canonical aliases
   GCB_GHS: { FLUTTERWAVE: "GH040100", PAYSTACK: "040100", YELLOW_CARD: "GCB" },
   ECOBANK_GHS: { FLUTTERWAVE: "GH130100", PAYSTACK: "130100", YELLOW_CARD: "ECOBANK" },
   ABSA_GHS: { FLUTTERWAVE: "GH030100", PAYSTACK: "030100", YELLOW_CARD: "ABSA" },
   STANBIC_GHS: { FLUTTERWAVE: "GH190100", PAYSTACK: "190100", YELLOW_CARD: "STANBIC" },
   FIDELITY_GHS: { FLUTTERWAVE: "GH240100", PAYSTACK: "240100", YELLOW_CARD: "FIDELITY" },
-  // Kenya (KES) canonical aliases
   EQUITY_KES: { FLUTTERWAVE: "68", PAYSTACK: "68", YELLOW_CARD: "EQUITY" },
   KCB_KES: { FLUTTERWAVE: "01", PAYSTACK: "01", YELLOW_CARD: "KCB" },
   COOP_KES: { FLUTTERWAVE: "11", PAYSTACK: "11", YELLOW_CARD: "COOP" },
   ABSA_KES: { FLUTTERWAVE: "03", PAYSTACK: "03", YELLOW_CARD: "ABSA" },
-  // South Africa (ZAR) canonical aliases
   FNB_ZAR: { FLUTTERWAVE: "250655", PAYSTACK: "250655", YELLOW_CARD: "FNB" },
   ABSA_ZAR: { FLUTTERWAVE: "632005", PAYSTACK: "632005", YELLOW_CARD: "ABSA" },
   STANDARD_BANK_ZAR: { FLUTTERWAVE: "051001", PAYSTACK: "051001", YELLOW_CARD: "SBSA" },
@@ -371,9 +523,11 @@ var RailHealthTracker = class {
     this.maxLatencyMs = config?.maxLatencyMs ?? 1e4;
   }
   getOrCreate(rail) {
-    let state = this.stats.get(rail);
-    if (!state) {
-      state = {
+    let st = this.stats.get(rail);
+    if (!st) {
+      st = {
+        state: "CLOSED",
+        probeInFlight: false,
         consecutiveFailures: 0,
         totalRequests: 0,
         totalFailures: 0,
@@ -381,48 +535,79 @@ var RailHealthTracker = class {
         lastLatencyMs: 0,
         circuitOpenUntil: 0
       };
-      this.stats.set(rail, state);
+      this.stats.set(rail, st);
     }
-    return state;
+    return st;
+  }
+  /**
+   * Checks whether a rail can accept a request, transitioning OPEN -> HALF_OPEN
+   * after cooldown and allowing a single recovery probe through.
+   */
+  tryAcquire(rail) {
+    const st = this.stats.get(rail);
+    if (!st || st.state === "CLOSED") return true;
+    const now = Date.now();
+    if (st.state === "OPEN") {
+      if (now >= st.circuitOpenUntil) {
+        st.state = "HALF_OPEN";
+        st.probeInFlight = true;
+        return true;
+      }
+      return false;
+    }
+    if (!st.probeInFlight) {
+      st.probeInFlight = true;
+      return true;
+    }
+    return false;
   }
   isAvailable(rail) {
-    const state = this.stats.get(rail);
-    if (!state) return true;
-    return Date.now() >= state.circuitOpenUntil;
+    const st = this.stats.get(rail);
+    if (!st || st.state === "CLOSED") return true;
+    if (st.state === "OPEN") {
+      return Date.now() >= st.circuitOpenUntil;
+    }
+    return !st.probeInFlight;
   }
   recordSuccess(rail, latencyMs) {
-    const state = this.getOrCreate(rail);
-    state.totalRequests += 1;
-    state.lastLatencyMs = latencyMs;
-    state.totalLatencyMs += latencyMs;
+    const st = this.getOrCreate(rail);
+    st.totalRequests += 1;
+    st.lastLatencyMs = latencyMs;
+    st.totalLatencyMs += latencyMs;
+    st.probeInFlight = false;
     if (latencyMs > this.maxLatencyMs) {
-      state.consecutiveFailures += 1;
-      state.lastError = `Latency ${latencyMs}ms exceeded threshold ${this.maxLatencyMs}ms`;
-      if (state.consecutiveFailures >= this.failureThreshold) {
-        state.circuitOpenUntil = Date.now() + this.cooldownMs;
+      st.consecutiveFailures += 1;
+      st.lastError = `Latency ${latencyMs}ms exceeded threshold ${this.maxLatencyMs}ms`;
+      if (st.state === "HALF_OPEN" || st.consecutiveFailures >= this.failureThreshold) {
+        st.state = "OPEN";
+        st.circuitOpenUntil = Date.now() + this.cooldownMs;
       }
       return;
     }
-    state.consecutiveFailures = 0;
-    state.circuitOpenUntil = 0;
+    st.state = "CLOSED";
+    st.consecutiveFailures = 0;
+    st.circuitOpenUntil = 0;
   }
   recordFailure(rail, latencyMs, errorMessage) {
-    const state = this.getOrCreate(rail);
-    state.totalRequests += 1;
-    state.totalFailures += 1;
-    state.consecutiveFailures += 1;
-    state.lastLatencyMs = latencyMs;
-    state.totalLatencyMs += latencyMs;
-    state.lastError = errorMessage;
-    if (state.consecutiveFailures >= this.failureThreshold) {
-      state.circuitOpenUntil = Date.now() + this.cooldownMs;
+    const st = this.getOrCreate(rail);
+    st.totalRequests += 1;
+    st.totalFailures += 1;
+    st.consecutiveFailures += 1;
+    st.lastLatencyMs = latencyMs;
+    st.totalLatencyMs += latencyMs;
+    st.lastError = errorMessage;
+    st.probeInFlight = false;
+    if (st.state === "HALF_OPEN" || st.consecutiveFailures >= this.failureThreshold) {
+      st.state = "OPEN";
+      st.circuitOpenUntil = Date.now() + this.cooldownMs;
     }
   }
   getHealth(rail) {
-    const state = this.stats.get(rail);
-    if (!state) {
+    const st = this.stats.get(rail);
+    if (!st) {
       return {
         rail,
+        state: "CLOSED",
         healthy: true,
         circuitOpen: false,
         consecutiveFailures: 0,
@@ -432,18 +617,24 @@ var RailHealthTracker = class {
         avgLatencyMs: 0
       };
     }
-    const circuitOpen = Date.now() < state.circuitOpenUntil;
+    const now = Date.now();
+    let effectiveState = st.state;
+    if (st.state === "OPEN" && now >= st.circuitOpenUntil) {
+      effectiveState = "HALF_OPEN";
+    }
+    const circuitOpen = effectiveState === "OPEN";
     return {
       rail,
-      healthy: !circuitOpen,
+      state: effectiveState,
+      healthy: effectiveState === "CLOSED",
       circuitOpen,
-      consecutiveFailures: state.consecutiveFailures,
-      totalRequests: state.totalRequests,
-      totalFailures: state.totalFailures,
-      lastLatencyMs: state.lastLatencyMs,
-      avgLatencyMs: state.totalRequests > 0 ? Math.round(state.totalLatencyMs / state.totalRequests) : 0,
-      lastError: state.lastError,
-      circuitOpenUntil: circuitOpen ? new Date(state.circuitOpenUntil) : void 0
+      consecutiveFailures: st.consecutiveFailures,
+      totalRequests: st.totalRequests,
+      totalFailures: st.totalFailures,
+      lastLatencyMs: st.lastLatencyMs,
+      avgLatencyMs: st.totalRequests > 0 ? Math.round(st.totalLatencyMs / st.totalRequests) : 0,
+      lastError: st.lastError,
+      circuitOpenUntil: circuitOpen ? new Date(st.circuitOpenUntil) : void 0
     };
   }
 };
@@ -1616,6 +1807,12 @@ var MpesaDarajaAdapter = class {
 // src/engine.ts
 var AFRICAN_CURRENCIES = /* @__PURE__ */ new Set(["NGN", "KES", "GHS", "UGX", "TZS", "RWF", "XOF", "XAF", "ZAR"]);
 var REFERENCE_LOOKUP_RAILS = /* @__PURE__ */ new Set(["PAYSTACK", "PAWAPAY", "YELLOW_CARD"]);
+function computeDisburseFingerprint(params) {
+  const currency = params.currency.toUpperCase();
+  const minor = toMinorUnits(params.amount, currency);
+  const dest = params.stripeAccountId ? `stripe:${params.stripeAccountId}` : params.bankDetails ? `bank:${params.bankDetails.bankCode}:${params.bankDetails.accountNumber}` : params.mobileMoneyDetails ? `momo:${params.mobileMoneyDetails.network}:${params.mobileMoneyDetails.phone}` : "default";
+  return `${currency}:${minor}:${dest}`;
+}
 var OmniPayoutEngine = class {
   #stripe;
   #flutterwave;
@@ -1624,13 +1821,24 @@ var OmniPayoutEngine = class {
   #yellowCard;
   #mpesaDaraja;
   #health;
+  #retryConfig;
+  #routingRules;
+  #railLimits;
+  #idempotencyStore;
+  #idempotencyTtlMs;
+  #webhookStore;
+  #webhookDedup;
+  #onTelemetry;
+  #balanceCacheTtlMs;
+  #balanceCache = /* @__PURE__ */ new Map();
+  #inFlight = /* @__PURE__ */ new Map();
   constructor(config) {
-    const timeoutMs = config.timeoutMs && config.timeoutMs > 0 ? config.timeoutMs : 3e4;
+    const defaultTimeoutMs = config.timeoutMs && config.timeoutMs > 0 ? config.timeoutMs : 3e4;
     if (config.stripe?.secretKey) {
       this.#stripe = new StripeConnectAdapter(
         config.stripe.secretKey,
         config.stripe.webhookSecret,
-        timeoutMs,
+        config.stripe.timeoutMs ?? defaultTimeoutMs,
         config.stripe.webhookToleranceSec
       );
     }
@@ -1638,14 +1846,14 @@ var OmniPayoutEngine = class {
       this.#flutterwave = new FlutterwaveAdapter(
         config.flutterwave.secretKey,
         config.flutterwave.webhookSecret,
-        timeoutMs
+        config.flutterwave.timeoutMs ?? defaultTimeoutMs
       );
     }
     if (config.paystack?.secretKey) {
       this.#paystack = new PaystackAdapter(
         config.paystack.secretKey,
         config.paystack.webhookSecret,
-        timeoutMs
+        config.paystack.timeoutMs ?? defaultTimeoutMs
       );
     }
     if (config.pawapay?.apiToken) {
@@ -1653,7 +1861,7 @@ var OmniPayoutEngine = class {
         config.pawapay.apiToken,
         config.pawapay.baseUrl,
         config.pawapay.webhookSecret,
-        timeoutMs
+        config.pawapay.timeoutMs ?? defaultTimeoutMs
       );
     }
     if (config.yellowCard?.apiKey && config.yellowCard?.secretKey) {
@@ -1662,13 +1870,31 @@ var OmniPayoutEngine = class {
         config.yellowCard.secretKey,
         config.yellowCard.baseUrl,
         config.yellowCard.webhookSecret,
-        timeoutMs
+        config.yellowCard.timeoutMs ?? defaultTimeoutMs
       );
     }
     if (config.mpesaDaraja?.consumerKey && config.mpesaDaraja?.consumerSecret) {
-      this.#mpesaDaraja = new MpesaDarajaAdapter(config.mpesaDaraja, timeoutMs);
+      this.#mpesaDaraja = new MpesaDarajaAdapter(
+        config.mpesaDaraja,
+        config.mpesaDaraja.timeoutMs ?? defaultTimeoutMs
+      );
     }
     this.#health = new RailHealthTracker(config.health);
+    this.#retryConfig = config.retry;
+    this.#routingRules = config.routingRules ? [...config.routingRules] : [];
+    this.#railLimits = config.railLimits ? { ...config.railLimits } : {};
+    this.#idempotencyStore = config.idempotencyStore;
+    this.#idempotencyTtlMs = config.idempotencyTtlMs ?? 864e5;
+    this.#webhookStore = config.webhookStore;
+    this.#webhookDedup = config.webhookDeduplication;
+    this.#onTelemetry = config.onTelemetry;
+    this.#balanceCacheTtlMs = config.balanceCacheTtlMs ?? 0;
+  }
+  emit(event) {
+    try {
+      this.#onTelemetry?.(event);
+    } catch {
+    }
   }
   getConfiguredRails() {
     const rails = [];
@@ -1681,29 +1907,79 @@ var OmniPayoutEngine = class {
     return rails;
   }
   /**
-   * Automatically resolves the best primary payout rail based on explicit parameters or currency.
+   * Evaluates smart routing rules (by country, currency, amount limits, and provider fees)
+   * and returns the ordered candidate rail chain `[primary, ...fallbacks]`.
+   */
+  resolveRoute(params) {
+    const currency = params.currency.toUpperCase();
+    const country = (params.country || CURRENCY_COUNTRIES[currency] || "").toUpperCase();
+    if (!params.rail && this.#routingRules.length > 0) {
+      for (const rule of this.#routingRules) {
+        if (rule.currencies && rule.currencies.length > 0 && !rule.currencies.some((c) => c.toUpperCase() === currency)) {
+          continue;
+        }
+        if (rule.countries && rule.countries.length > 0 && (!country || !rule.countries.some((c) => c.toUpperCase() === country))) {
+          continue;
+        }
+        if (rule.minAmount !== void 0 && params.amount < rule.minAmount) {
+          continue;
+        }
+        if (rule.maxAmount !== void 0 && params.amount > rule.maxAmount) {
+          continue;
+        }
+        if (rule.rails.length > 0) {
+          let ordered = [...rule.rails];
+          if (rule.fees) {
+            const fees = rule.fees;
+            ordered.sort((a, b) => {
+              const fa = fees[a];
+              const fb = fees[b];
+              const costA = fa ? (fa.flat ?? 0) + params.amount * (fa.percent ?? 0) / 100 : Number.MAX_SAFE_INTEGER;
+              const costB = fb ? (fb.flat ?? 0) + params.amount * (fb.percent ?? 0) / 100 : Number.MAX_SAFE_INTEGER;
+              return costA - costB;
+            });
+          }
+          for (const fb of params.fallbackRails || []) {
+            if (!ordered.includes(fb)) ordered.push(fb);
+          }
+          return ordered;
+        }
+      }
+    }
+    let primary;
+    if (params.rail) {
+      primary = params.rail;
+    } else if (params.stripeAccountId) {
+      primary = "STRIPE_CONNECT";
+    } else if (params.mobileMoneyDetails) {
+      if (this.#flutterwave) primary = "FLUTTERWAVE";
+      else if (currency === "KES" && params.mobileMoneyDetails.network === "MPESA" && this.#mpesaDaraja) {
+        primary = "MPESA_DARAJA";
+      } else if (this.#pawapay) primary = "PAWAPAY";
+      else if (this.#yellowCard) primary = "YELLOW_CARD";
+      else if (this.#paystack) primary = "PAYSTACK";
+      else primary = "FLUTTERWAVE";
+    } else if (params.bankDetails || AFRICAN_CURRENCIES.has(currency)) {
+      if (this.#flutterwave) primary = "FLUTTERWAVE";
+      else if (this.#paystack) primary = "PAYSTACK";
+      else if (this.#yellowCard) primary = "YELLOW_CARD";
+      else primary = "FLUTTERWAVE";
+    } else {
+      primary = "STRIPE_CONNECT";
+    }
+    const candidates = [primary];
+    for (const fb of params.fallbackRails || []) {
+      if (!candidates.includes(fb)) {
+        candidates.push(fb);
+      }
+    }
+    return candidates;
+  }
+  /**
+   * Resolves the primary payout rail for the given disbursement parameters.
    */
   resolveRail(params) {
-    if (params.rail) return params.rail;
-    if (params.stripeAccountId) return "STRIPE_CONNECT";
-    const currency = params.currency.toUpperCase();
-    if (params.mobileMoneyDetails) {
-      if (this.#flutterwave) return "FLUTTERWAVE";
-      if (currency === "KES" && params.mobileMoneyDetails.network === "MPESA" && this.#mpesaDaraja) {
-        return "MPESA_DARAJA";
-      }
-      if (this.#pawapay) return "PAWAPAY";
-      if (this.#yellowCard) return "YELLOW_CARD";
-      if (this.#paystack) return "PAYSTACK";
-      return "FLUTTERWAVE";
-    }
-    if (params.bankDetails || AFRICAN_CURRENCIES.has(currency)) {
-      if (this.#flutterwave) return "FLUTTERWAVE";
-      if (this.#paystack) return "PAYSTACK";
-      if (this.#yellowCard) return "YELLOW_CARD";
-      return "FLUTTERWAVE";
-    }
-    return "STRIPE_CONNECT";
+    return this.resolveRoute(params)[0];
   }
   async disburseOnRail(rail, params) {
     if (rail === "STRIPE_CONNECT") {
@@ -1745,18 +2021,54 @@ var OmniPayoutEngine = class {
     throw new Error(`Unsupported payout rail: ${rail}`);
   }
   /**
-   * Unified disbursement method with input sanitization, circuit-breaker health checks,
-   * pre-flight float balance checks, and timeout-safe failover (preventing double payouts).
+   * Unified disbursement method with concurrent singleflight deduplication, optional pluggable
+   * `IdempotencyStore`, smart routing, half-open circuit breakers, retry backoff, and timeout-safe failover.
    */
   async disburse(params) {
     validateDisburseInputs(params.amount, params.currency, params.reference);
-    const primaryRail = this.resolveRail(params);
-    const candidateRails = [primaryRail];
-    for (const fallback of params.fallbackRails || []) {
-      if (!candidateRails.includes(fallback)) {
-        candidateRails.push(fallback);
+    const refKey = params.reference.trim();
+    const fingerprint = computeDisburseFingerprint(params);
+    const active = this.#inFlight.get(refKey);
+    if (active) {
+      if (active.fingerprint !== fingerprint) {
+        throw new PayoutProviderError({
+          message: `Idempotency conflict: reference "${refKey}" is already in flight with different parameters`,
+          rail: this.resolveRail(params),
+          code: "IDEMPOTENCY_CONFLICT",
+          isAmbiguous: false,
+          retryable: false
+        });
+      }
+      return active.promise;
+    }
+    const promise = this.executeDisbursePipeline(params, refKey, fingerprint);
+    this.#inFlight.set(refKey, { fingerprint, promise });
+    try {
+      return await promise;
+    } finally {
+      this.#inFlight.delete(refKey);
+    }
+  }
+  async executeDisbursePipeline(params, refKey, fingerprint) {
+    if (this.#idempotencyStore) {
+      const existing = await this.#idempotencyStore.get(refKey);
+      if (existing) {
+        if (existing.fingerprint !== fingerprint) {
+          throw new PayoutProviderError({
+            message: `Idempotency conflict: reference "${refKey}" was previously used with different parameters`,
+            rail: this.resolveRail(params),
+            code: "IDEMPOTENCY_CONFLICT",
+            isAmbiguous: false,
+            retryable: false
+          });
+        }
+        if (existing.result) {
+          return existing.result;
+        }
       }
     }
+    const candidateRails = this.resolveRoute(params);
+    const primaryRail = candidateRails[0];
     const attemptedRails = [];
     let lastError;
     let lastFailedResult;
@@ -1764,8 +2076,30 @@ var OmniPayoutEngine = class {
     for (let i = 0; i < candidateRails.length; i++) {
       const rail = candidateRails[i];
       const hasFallback = i < candidateRails.length - 1;
-      if (!this.#health.isAvailable(rail) && hasFallback) {
-        lastError = new Error(`Rail ${rail} circuit breaker is open (unhealthy)`);
+      const limit = this.#railLimits[rail];
+      if (limit) {
+        if (limit.minAmount !== void 0 && params.amount < limit.minAmount || limit.maxAmount !== void 0 && params.amount > limit.maxAmount) {
+          const limitErr = new PayoutProviderError({
+            message: `Amount ${params.amount} ${currency} is outside configured limits for ${rail}`,
+            rail,
+            code: "LIMIT_EXCEEDED",
+            isAmbiguous: false,
+            retryable: false
+          });
+          lastError = limitErr;
+          if (hasFallback) continue;
+          throw limitErr;
+        }
+      }
+      const prevState = this.#health.getHealth(rail).state;
+      if (!this.#health.tryAcquire(rail) && hasFallback) {
+        lastError = new PayoutProviderError({
+          message: `Rail ${rail} circuit breaker is open (unhealthy)`,
+          rail,
+          code: "PROVIDER_DOWN",
+          isAmbiguous: false,
+          retryable: false
+        });
         continue;
       }
       attemptedRails.push(rail);
@@ -1774,29 +2108,46 @@ var OmniPayoutEngine = class {
           const balances = await this.getBalances(rail);
           const match = balances.find((b) => b.currency === currency);
           if (match && match.available < params.amount) {
-            const insufficientErr = new Error(
-              `Insufficient ${currency} balance on ${rail}: available ${match.available}, required ${params.amount}`
-            );
+            const insufficientErr = new PayoutProviderError({
+              message: `Insufficient ${currency} balance on ${rail}: available ${match.available}, required ${params.amount}`,
+              rail,
+              code: "INSUFFICIENT_FLOAT",
+              isAmbiguous: false,
+              retryable: false
+            });
             lastError = insufficientErr;
-            if (hasFallback) {
-              continue;
-            }
+            if (hasFallback) continue;
             throw insufficientErr;
           }
         } catch (err) {
           lastError = err instanceof Error ? err : new Error(String(err));
-          if (hasFallback) {
-            continue;
-          }
+          if (hasFallback) continue;
           throw lastError;
         }
       }
       const startMs = Date.now();
       try {
-        const result = await this.disburseOnRail(rail, params);
+        const result = await withRetry(
+          () => this.disburseOnRail(rail, params),
+          this.#retryConfig,
+          (retryErr, attempt) => {
+            this.emit({
+              type: "disburse.retry",
+              rail,
+              reference: refKey,
+              errorCode: retryErr.code,
+              message: `Retry attempt ${attempt}: ${retryErr.message}`
+            });
+          }
+        );
         const latencyMs = Date.now() - startMs;
         if (result.status === "FAILED") {
           this.#health.recordFailure(rail, latencyMs, result.error || `${rail} disbursement failed`);
+          const nextState = this.#health.getHealth(rail).state;
+          if (nextState !== prevState) {
+            this.emit({ type: "circuit.state_change", rail, circuitState: nextState });
+          }
+          this.emit({ type: "disburse.failed", rail, reference: refKey, latencyMs, message: result.error });
           if (hasFallback) {
             lastFailedResult = result;
             lastError = new Error(result.error || `${rail} disbursement returned FAILED`);
@@ -1804,16 +2155,50 @@ var OmniPayoutEngine = class {
           }
         } else {
           this.#health.recordSuccess(rail, latencyMs);
+          const nextState = this.#health.getHealth(rail).state;
+          if (nextState !== prevState) {
+            this.emit({ type: "circuit.state_change", rail, circuitState: nextState });
+          }
         }
-        return {
+        const finalResult = {
           ...result,
           attemptedRails,
           failoverFrom: rail !== primaryRail ? primaryRail : void 0
         };
+        if (rail !== primaryRail) {
+          this.emit({
+            type: "disburse.failover",
+            rail,
+            failoverFrom: primaryRail,
+            reference: refKey,
+            latencyMs
+          });
+        }
+        this.emit({ type: "disburse.success", rail, reference: refKey, latencyMs });
+        if (this.#idempotencyStore && finalResult.status !== "FAILED") {
+          await this.#idempotencyStore.set(
+            refKey,
+            { fingerprint, result: finalResult },
+            this.#idempotencyTtlMs
+          );
+        }
+        return finalResult;
       } catch (err) {
         const latencyMs = Date.now() - startMs;
         lastError = err instanceof Error ? err : new Error(String(err));
         this.#health.recordFailure(rail, latencyMs, lastError.message);
+        const nextState = this.#health.getHealth(rail).state;
+        if (nextState !== prevState) {
+          this.emit({ type: "circuit.state_change", rail, circuitState: nextState });
+        }
+        this.emit({
+          type: "disburse.failed",
+          rail,
+          reference: refKey,
+          latencyMs,
+          errorCode: err instanceof PayoutProviderError ? err.code : "PROVIDER_ERROR",
+          message: lastError.message
+        });
         const isAmbiguous = err instanceof PayoutProviderError && err.isAmbiguous;
         if (isAmbiguous && !params.allowUnsafeTimeoutFailover) {
           if (REFERENCE_LOOKUP_RAILS.has(rail)) {
@@ -1829,16 +2214,22 @@ var OmniPayoutEngine = class {
                   continue;
                 }
               }
-              return {
+              const recovered = {
                 ...reconciled,
                 attemptedRails,
                 failoverFrom: rail !== primaryRail ? primaryRail : void 0
               };
+              if (this.#idempotencyStore && recovered.status !== "FAILED") {
+                await this.#idempotencyStore.set(
+                  refKey,
+                  { fingerprint, result: recovered },
+                  this.#idempotencyTtlMs
+                );
+              }
+              return recovered;
             } catch (statusErr) {
               if (statusErr instanceof PayoutProviderError && statusErr.statusCode === 404) {
-                if (hasFallback) {
-                  continue;
-                }
+                if (hasFallback) continue;
                 throw lastError;
               }
             }
@@ -1860,7 +2251,36 @@ var OmniPayoutEngine = class {
     throw lastError || new Error("All configured payout rails failed");
   }
   /**
-   * Returns live uptime/latency health and circuit-breaker state for one or all configured rails.
+   * Polls `getPayoutStatus` with configurable exponential backoff until the payout reaches
+   * a terminal state (`SUCCESSFUL` or `FAILED`), or throws `RECONCILIATION_TIMEOUT`.
+   */
+  async waitForSettlement(params, options) {
+    const maxAttempts = options?.maxAttempts ?? 10;
+    const initialInterval = options?.intervalMs ?? 2e3;
+    const multiplier = options?.backoffMultiplier ?? 1.5;
+    const maxInterval = options?.maxIntervalMs ?? 15e3;
+    let delay = initialInterval;
+    let latest;
+    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+      latest = await this.getPayoutStatus(params);
+      if (latest.status === "SUCCESSFUL" || latest.status === "FAILED") {
+        return latest;
+      }
+      if (attempt < maxAttempts) {
+        await sleepMs(delay);
+        delay = Math.min(maxInterval, Math.round(delay * multiplier));
+      }
+    }
+    throw new PayoutProviderError({
+      message: `Payout "${params.reference || params.transactionId}" on ${params.rail} remained PENDING after ${maxAttempts} reconciliation attempts`,
+      rail: params.rail,
+      code: "RECONCILIATION_TIMEOUT",
+      isAmbiguous: false,
+      retryable: true
+    });
+  }
+  /**
+   * Returns live uptime/latency health and circuit-breaker state (`CLOSED` / `OPEN` / `HALF_OPEN`).
    */
   getRailHealth(rail) {
     if (rail) {
@@ -1869,80 +2289,104 @@ var OmniPayoutEngine = class {
     return this.getConfiguredRails().map((r) => this.#health.getHealth(r));
   }
   /**
+   * Invalidates cached float balances (when `balanceCacheTtlMs > 0`).
+   */
+  invalidateBalanceCache(rail) {
+    if (rail) {
+      this.#balanceCache.delete(rail);
+    } else {
+      this.#balanceCache.clear();
+    }
+  }
+  /**
    * Fetches the latest settlement status for a previously initiated payout.
    */
   async getPayoutStatus(params) {
     if (!params.transactionId) {
       throw new Error("transactionId is required to check payout status");
     }
-    if (params.rail === "STRIPE_CONNECT") {
-      if (!this.#stripe) throw new Error("Stripe Connect provider is not configured (missing secretKey)");
-      return this.#stripe.getPayoutStatus(params.transactionId, params.stripeAccountId, params.reference);
+    return withRetry(async () => {
+      if (params.rail === "STRIPE_CONNECT") {
+        if (!this.#stripe) throw new Error("Stripe Connect provider is not configured (missing secretKey)");
+        return this.#stripe.getPayoutStatus(params.transactionId, params.stripeAccountId, params.reference);
+      }
+      if (params.rail === "FLUTTERWAVE") {
+        if (!this.#flutterwave) throw new Error("Flutterwave provider is not configured (missing secretKey)");
+        return this.#flutterwave.getPayoutStatus(params.transactionId, params.reference);
+      }
+      if (params.rail === "PAYSTACK") {
+        if (!this.#paystack) throw new Error("Paystack provider is not configured (missing secretKey)");
+        return this.#paystack.getPayoutStatus(params.transactionId, params.reference);
+      }
+      if (params.rail === "PAWAPAY") {
+        if (!this.#pawapay) throw new Error("PawaPay provider is not configured (missing apiToken)");
+        return this.#pawapay.getPayoutStatus(params.transactionId, params.reference);
+      }
+      if (params.rail === "YELLOW_CARD") {
+        if (!this.#yellowCard) throw new Error("Yellow Card provider is not configured");
+        return this.#yellowCard.getPayoutStatus(params.transactionId, params.reference);
+      }
+      if (params.rail === "MPESA_DARAJA") {
+        if (!this.#mpesaDaraja) throw new Error("M-Pesa Daraja provider is not configured");
+        return this.#mpesaDaraja.getPayoutStatus(params.transactionId, params.reference);
+      }
+      throw new Error(`Unsupported payout rail: ${params.rail}`);
+    }, this.#retryConfig);
+  }
+  async fetchSingleRailBalance(rail) {
+    if (this.#balanceCacheTtlMs > 0) {
+      const cached = this.#balanceCache.get(rail);
+      if (cached && Date.now() < cached.expiresAt) {
+        return cached.balances;
+      }
     }
-    if (params.rail === "FLUTTERWAVE") {
-      if (!this.#flutterwave) throw new Error("Flutterwave provider is not configured (missing secretKey)");
-      return this.#flutterwave.getPayoutStatus(params.transactionId, params.reference);
+    const balances = await withRetry(async () => {
+      if (rail === "STRIPE_CONNECT") {
+        if (!this.#stripe) throw new Error("Stripe Connect provider is not configured (missing secretKey)");
+        return this.#stripe.getBalances();
+      }
+      if (rail === "FLUTTERWAVE") {
+        if (!this.#flutterwave) throw new Error("Flutterwave provider is not configured (missing secretKey)");
+        return this.#flutterwave.getBalances();
+      }
+      if (rail === "PAYSTACK") {
+        if (!this.#paystack) throw new Error("Paystack provider is not configured (missing secretKey)");
+        return this.#paystack.getBalances();
+      }
+      if (rail === "PAWAPAY") {
+        if (!this.#pawapay) throw new Error("PawaPay provider is not configured (missing apiToken)");
+        return this.#pawapay.getBalances();
+      }
+      if (rail === "YELLOW_CARD") {
+        if (!this.#yellowCard) throw new Error("Yellow Card provider is not configured");
+        return this.#yellowCard.getBalances();
+      }
+      if (rail === "MPESA_DARAJA") {
+        if (!this.#mpesaDaraja) throw new Error("M-Pesa Daraja provider is not configured");
+        return this.#mpesaDaraja.getBalances();
+      }
+      throw new Error(`Unsupported payout rail: ${rail}`);
+    }, this.#retryConfig);
+    if (this.#balanceCacheTtlMs > 0) {
+      this.#balanceCache.set(rail, {
+        balances,
+        expiresAt: Date.now() + this.#balanceCacheTtlMs
+      });
     }
-    if (params.rail === "PAYSTACK") {
-      if (!this.#paystack) throw new Error("Paystack provider is not configured (missing secretKey)");
-      return this.#paystack.getPayoutStatus(params.transactionId, params.reference);
-    }
-    if (params.rail === "PAWAPAY") {
-      if (!this.#pawapay) throw new Error("PawaPay provider is not configured (missing apiToken)");
-      return this.#pawapay.getPayoutStatus(params.transactionId, params.reference);
-    }
-    if (params.rail === "YELLOW_CARD") {
-      if (!this.#yellowCard) throw new Error("Yellow Card provider is not configured");
-      return this.#yellowCard.getPayoutStatus(params.transactionId, params.reference);
-    }
-    if (params.rail === "MPESA_DARAJA") {
-      if (!this.#mpesaDaraja) throw new Error("M-Pesa Daraja provider is not configured");
-      return this.#mpesaDaraja.getPayoutStatus(params.transactionId, params.reference);
-    }
-    throw new Error(`Unsupported payout rail: ${params.rail}`);
+    return balances;
   }
   /**
    * Queries available float balances for a specific rail or across all configured rails.
    */
   async getBalances(rail) {
-    if (rail === "STRIPE_CONNECT") {
-      if (!this.#stripe) throw new Error("Stripe Connect provider is not configured (missing secretKey)");
-      return this.#stripe.getBalances();
+    if (rail) {
+      return this.fetchSingleRailBalance(rail);
     }
-    if (rail === "FLUTTERWAVE") {
-      if (!this.#flutterwave) throw new Error("Flutterwave provider is not configured (missing secretKey)");
-      return this.#flutterwave.getBalances();
-    }
-    if (rail === "PAYSTACK") {
-      if (!this.#paystack) throw new Error("Paystack provider is not configured (missing secretKey)");
-      return this.#paystack.getBalances();
-    }
-    if (rail === "PAWAPAY") {
-      if (!this.#pawapay) throw new Error("PawaPay provider is not configured (missing apiToken)");
-      return this.#pawapay.getBalances();
-    }
-    if (rail === "YELLOW_CARD") {
-      if (!this.#yellowCard) throw new Error("Yellow Card provider is not configured");
-      return this.#yellowCard.getBalances();
-    }
-    if (rail === "MPESA_DARAJA") {
-      if (!this.#mpesaDaraja) throw new Error("M-Pesa Daraja provider is not configured");
-      return this.#mpesaDaraja.getBalances();
-    }
-    const tasks = [];
-    if (this.#stripe) tasks.push(this.#stripe.getBalances());
-    if (this.#flutterwave) tasks.push(this.#flutterwave.getBalances());
-    if (this.#paystack) tasks.push(this.#paystack.getBalances());
-    if (this.#pawapay) tasks.push(this.#pawapay.getBalances());
-    if (this.#yellowCard) tasks.push(this.#yellowCard.getBalances());
-    if (this.#mpesaDaraja) tasks.push(this.#mpesaDaraja.getBalances());
-    const results = await Promise.all(tasks);
+    const configured = this.getConfiguredRails();
+    const results = await Promise.all(configured.map((r) => this.fetchSingleRailBalance(r)));
     return results.flat();
   }
-  /**
-   * Verifies a provider webhook signature and normalizes the event into a unified WebhookEvent.
-   */
-  verifyWebhook(rail, rawBody, signature) {
+  verifyWebhookRaw(rail, rawBody, signature) {
     if (rail === "STRIPE_CONNECT") {
       if (!this.#stripe) throw new Error("Stripe Connect provider is not configured");
       return this.#stripe.verifyWebhook(rawBody, signature);
@@ -1970,11 +2414,69 @@ var OmniPayoutEngine = class {
     throw new Error(`Unsupported payout rail: ${rail}`);
   }
   /**
-   * Verifies a webhook signature, guards against out-of-order status regressions,
+   * Verifies a provider webhook signature synchronously and normalizes the event.
+   * When a synchronous `webhookStore` (like `InMemoryWebhookStore`) is configured, also flags duplicates.
+   */
+  verifyWebhook(rail, rawBody, signature) {
+    const event = this.verifyWebhookRaw(rail, rawBody, signature);
+    if (this.#webhookStore) {
+      const eventKey = `${rail}:${event.eventType}:${event.transactionId || event.reference}:${event.status}`;
+      const seen = this.#webhookStore.hasSeen(eventKey);
+      if (typeof seen === "boolean") {
+        if (seen) {
+          this.emit({ type: "webhook.duplicate", rail, reference: event.reference });
+          if (this.#webhookDedup?.rejectDuplicates) {
+            throw new PayoutProviderError({
+              message: `Duplicate webhook event detected on ${rail} for "${event.reference}"`,
+              rail,
+              code: "DUPLICATE_WEBHOOK",
+              isAmbiguous: false,
+              retryable: false
+            });
+          }
+          return { ...event, duplicate: true };
+        }
+        void this.#webhookStore.markSeen(eventKey, this.#webhookDedup?.ttlMs ?? 864e5);
+      }
+    }
+    this.emit({ type: "webhook.verified", rail, reference: event.reference });
+    return event;
+  }
+  /**
+   * Async variant of `verifyWebhook` supporting asynchronous `WebhookStore` backends (e.g. Redis / Postgres).
+   */
+  async verifyWebhookAsync(rail, rawBody, signature) {
+    const event = this.verifyWebhookRaw(rail, rawBody, signature);
+    if (this.#webhookStore) {
+      const eventKey = `${rail}:${event.eventType}:${event.transactionId || event.reference}:${event.status}`;
+      const seen = await this.#webhookStore.hasSeen(eventKey);
+      if (seen) {
+        this.emit({ type: "webhook.duplicate", rail, reference: event.reference });
+        if (this.#webhookDedup?.rejectDuplicates) {
+          throw new PayoutProviderError({
+            message: `Duplicate webhook event detected on ${rail} for "${event.reference}"`,
+            rail,
+            code: "DUPLICATE_WEBHOOK",
+            isAmbiguous: false,
+            retryable: false
+          });
+        }
+        return { ...event, duplicate: true };
+      }
+      await this.#webhookStore.markSeen(eventKey, this.#webhookDedup?.ttlMs ?? 864e5);
+    }
+    this.emit({ type: "webhook.verified", rail, reference: event.reference });
+    return event;
+  }
+  /**
+   * Verifies a webhook signature, checks duplicate/out-of-order state guards,
    * and confirms the authoritative payout state & amount directly against the provider API.
    */
   async verifyAndConfirmWebhook(rail, rawBody, signature, options) {
-    const event = this.verifyWebhook(rail, rawBody, signature);
+    const event = await this.verifyWebhookAsync(rail, rawBody, signature);
+    if (event.duplicate) {
+      return event;
+    }
     const isReversal = /reversed/i.test(event.eventType);
     if (options?.currentStatus && !canTransitionStatus(options.currentStatus, event.status, isReversal)) {
       return {
@@ -2009,23 +2511,12 @@ var OmniPayoutEngine = class {
       error: confirmed.error || event.error
     };
   }
-  /**
-   * Compares an expected beneficiary name against a resolved bank account name,
-   * tolerating word-order differences and honorifics.
-   */
   matchAccountNames(expectedName, resolvedName, threshold = 0.66) {
     return matchAccountNames(expectedName, resolvedName, threshold);
   }
-  /**
-   * Checks whether a payout status transition is valid (preventing out-of-order regressions).
-   */
   canTransitionStatus(currentStatus, nextStatus, allowReversal = false) {
     return canTransitionStatus(currentStatus, nextStatus, allowReversal);
   }
-  /**
-   * Resolves an African bank account name using Flutterwave or Paystack,
-   * with automatic failover between configured providers when `rail` is omitted.
-   */
   async resolveBankAccount(bankCode, accountNumber, rail, currency = "NGN") {
     if (rail === "PAYSTACK") {
       if (!this.#paystack) {
@@ -2069,9 +2560,6 @@ var OmniPayoutEngine = class {
     }
     throw new Error("Neither Flutterwave nor Paystack is configured for bank resolution");
   }
-  /**
-   * Generates a Stripe Connect Express onboarding URL for US/European merchants and couriers.
-   */
   async createConnectOnboardingLink(params) {
     if (!this.#stripe) {
       throw new Error("Stripe Connect provider is not configured for onboarding links");
@@ -2081,7 +2569,10 @@ var OmniPayoutEngine = class {
 };
 // Annotate the CommonJS export names for ESM import in node:
 0 && (module.exports = {
+  CURRENCY_COUNTRIES,
   FlutterwaveAdapter,
+  InMemoryIdempotencyStore,
+  InMemoryWebhookStore,
   MpesaDarajaAdapter,
   OmniPayoutEngine,
   PawaPayAdapter,
@@ -2092,6 +2583,7 @@ var OmniPayoutEngine = class {
   StripeConnectAdapter,
   YellowCardAdapter,
   canTransitionStatus,
+  classifyProviderError,
   constantTimeHexEqual,
   constantTimeStringEqual,
   currencyExponent,
@@ -2103,9 +2595,11 @@ var OmniPayoutEngine = class {
   normalizeMsisdn,
   resolveProviderCode,
   sanitizeBaseUrl,
+  sleepMs,
   toDeterministicUuid,
   toMinorUnits,
   validateDisburseInputs,
-  validateSafeIdentifier
+  validateSafeIdentifier,
+  withRetry
 });
 //# sourceMappingURL=index.js.map

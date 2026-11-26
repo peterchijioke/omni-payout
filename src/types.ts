@@ -10,6 +10,24 @@ export type PayoutSpeed = 'standard' | 'instant';
 
 export type PayoutStatus = 'PENDING' | 'SUCCESSFUL' | 'FAILED';
 
+export type CircuitState = 'CLOSED' | 'OPEN' | 'HALF_OPEN';
+
+export type PayoutErrorCode =
+  | 'VALIDATION_ERROR'
+  | 'IDEMPOTENCY_CONFLICT'
+  | 'AUTH_FAILED'
+  | 'INVALID_ACCOUNT'
+  | 'INSUFFICIENT_FLOAT'
+  | 'LIMIT_EXCEEDED'
+  | 'RATE_LIMITED'
+  | 'PROVIDER_DOWN'
+  | 'AMBIGUOUS_TIMEOUT'
+  | 'DUPLICATE_REFERENCE'
+  | 'DUPLICATE_WEBHOOK'
+  | 'WEBHOOK_SIGNATURE_INVALID'
+  | 'RECONCILIATION_TIMEOUT'
+  | 'PROVIDER_ERROR';
+
 export interface BankAccountDetails {
   bankCode: string;
   accountNumber: string;
@@ -25,6 +43,7 @@ export interface DisburseParams {
   amount: number;
   currency: string;
   reference: string;
+  country?: string;
   narration?: string;
   rail?: PayoutRail;
   fallbackRails?: PayoutRail[];
@@ -39,7 +58,7 @@ export interface DisburseParams {
   speed?: PayoutSpeed;
   bankDetails?: BankAccountDetails;
   mobileMoneyDetails?: MobileMoneyDetails;
-  metadata?: Record<string, any>;
+  metadata?: Record<string, string>;
 }
 
 export interface DisburseResult {
@@ -55,7 +74,7 @@ export interface DisburseResult {
   currency: string;
   fee?: number;
   error?: string;
-  rawResponse?: any;
+  rawResponse?: unknown;
 }
 
 export interface PayoutStatusParams {
@@ -63,6 +82,17 @@ export interface PayoutStatusParams {
   rail: PayoutRail;
   stripeAccountId?: string;
   reference?: string;
+}
+
+export interface ReconcileOptions {
+  /** Initial polling delay in milliseconds (default: 2000ms). */
+  intervalMs?: number;
+  /** Maximum polling attempts before throwing RECONCILIATION_TIMEOUT (default: 10). */
+  maxAttempts?: number;
+  /** Exponential backoff multiplier between polls (default: 1.5). */
+  backoffMultiplier?: number;
+  /** Maximum interval cap between polls in milliseconds (default: 15000ms). */
+  maxIntervalMs?: number;
 }
 
 export interface RailBalance {
@@ -74,6 +104,7 @@ export interface RailBalance {
 
 export interface RailHealth {
   rail: PayoutRail;
+  state: CircuitState;
   healthy: boolean;
   circuitOpen: boolean;
   consecutiveFailures: number;
@@ -91,6 +122,91 @@ export interface HealthConfig {
   maxLatencyMs?: number;
 }
 
+export interface RetryConfig {
+  /** Maximum retry attempts for retryable transient errors (default: 0). */
+  maxRetries?: number;
+  /** Base backoff delay in milliseconds (default: 250ms). */
+  baseDelayMs?: number;
+  /** Maximum backoff delay cap in milliseconds (default: 5000ms). */
+  maxDelayMs?: number;
+  /** Apply random full jitter to backoff delays (default: true). */
+  jitter?: boolean;
+}
+
+export interface ProviderFeeRule {
+  /** Flat fee in the payout currency (e.g. 10 NGN). */
+  flat?: number;
+  /** Percentage fee (e.g. 1.5 for 1.5%). */
+  percent?: number;
+}
+
+export interface RailLimit {
+  minAmount?: number;
+  maxAmount?: number;
+}
+
+export interface RoutingRule {
+  currencies?: string[];
+  countries?: string[];
+  minAmount?: number;
+  maxAmount?: number;
+  /** Ordered candidate rails when this rule matches. */
+  rails: PayoutRail[];
+  /** Optional fee schedule: when set, candidate rails are sorted lowest-cost first. */
+  fees?: Partial<Record<PayoutRail, ProviderFeeRule>>;
+}
+
+export interface WebhookDeduplicationConfig {
+  /** Time-to-live for seen webhook event keys in milliseconds (default: 86400000ms / 24h). */
+  ttlMs?: number;
+  /** Throw DUPLICATE_WEBHOOK error instead of returning `duplicate: true` (default: false). */
+  rejectDuplicates?: boolean;
+}
+
+export interface IdempotencyRecord {
+  fingerprint: string;
+  result?: DisburseResult;
+}
+
+/**
+ * Storage-agnostic idempotency adapter (plug in Redis, Postgres, DynamoDB, or InMemoryIdempotencyStore).
+ * Omitted by default so `omni-payout` stays 100% stateless out of the box.
+ */
+export interface IdempotencyStore {
+  get(reference: string): Promise<IdempotencyRecord | null | undefined> | IdempotencyRecord | null | undefined;
+  set(reference: string, record: IdempotencyRecord, ttlMs?: number): Promise<void> | void;
+  delete?(reference: string): Promise<void> | void;
+}
+
+/**
+ * Storage-agnostic webhook deduplication adapter (plug in Redis, Postgres, or InMemoryWebhookStore).
+ */
+export interface WebhookStore {
+  hasSeen(eventKey: string): Promise<boolean> | boolean;
+  markSeen(eventKey: string, ttlMs?: number): Promise<void> | void;
+}
+
+/**
+ * Monitoring-agnostic telemetry event emitted to plug into OpenTelemetry, Prometheus, Datadog, or logs.
+ */
+export interface PayoutTelemetryEvent {
+  type:
+    | 'disburse.success'
+    | 'disburse.failed'
+    | 'disburse.failover'
+    | 'disburse.retry'
+    | 'circuit.state_change'
+    | 'webhook.verified'
+    | 'webhook.duplicate';
+  rail: PayoutRail;
+  reference?: string;
+  latencyMs?: number;
+  errorCode?: PayoutErrorCode;
+  circuitState?: CircuitState;
+  failoverFrom?: PayoutRail;
+  message?: string;
+}
+
 export interface WebhookEvent {
   rail: PayoutRail;
   eventType: string;
@@ -101,8 +217,9 @@ export interface WebhookEvent {
   amount: number;
   currency: string;
   fee?: number;
+  duplicate?: boolean;
   error?: string;
-  rawPayload?: any;
+  rawPayload?: unknown;
 }
 
 export interface NameMatchResult {
@@ -131,40 +248,61 @@ export interface OnboardingLinkResult {
 }
 
 export interface OmniPayoutConfig {
-  /** Per-request HTTP timeout in milliseconds (defaults to 30000ms). */
+  /** Default HTTP request timeout in milliseconds across providers (default: 30000ms). */
   timeoutMs?: number;
+  /** Optional TTL in milliseconds to cache `getBalances()` results for fast float checks (default: 0 / stateless). */
+  balanceCacheTtlMs?: number;
+  /** Optional TTL in milliseconds passed to `idempotencyStore.set()` (default: 86400000ms / 24h). */
+  idempotencyTtlMs?: number;
+  /** Optional storage-agnostic persistence adapter (Redis/Postgres/DynamoDB) for distributed idempotency. */
+  idempotencyStore?: IdempotencyStore;
+  /** Optional storage-agnostic adapter for duplicate webhook event detection. */
+  webhookStore?: WebhookStore;
+  /** Duplicate webhook handling options when `webhookStore` is provided. */
+  webhookDeduplication?: WebhookDeduplicationConfig;
+  /** Optional monitoring-agnostic hook for OpenTelemetry, Prometheus, Datadog, or structured logging. */
+  onTelemetry?: (event: PayoutTelemetryEvent) => void;
+  /** Configurable retry policy with exponential backoff and jitter. */
+  retry?: RetryConfig;
+  /** Configurable smart routing rules by country, currency, amount limits, and fees. */
+  routingRules?: RoutingRule[];
+  /** Per-rail transaction amount min/max limits. */
+  railLimits?: Partial<Record<PayoutRail, RailLimit>>;
   stripe?: {
     secretKey: string;
     webhookSecret?: string;
-    /** Maximum allowed webhook timestamp age in seconds (defaults to 300s). */
     webhookToleranceSec?: number;
+    timeoutMs?: number;
   };
   flutterwave?: {
     secretKey: string;
     publicKey?: string;
     webhookSecret?: string;
+    timeoutMs?: number;
   };
   paystack?: {
     secretKey: string;
     webhookSecret?: string;
+    timeoutMs?: number;
   };
   pawapay?: {
     apiToken: string;
     baseUrl?: string;
     webhookSecret?: string;
+    timeoutMs?: number;
   };
   yellowCard?: {
     apiKey: string;
     secretKey: string;
     baseUrl?: string;
     webhookSecret?: string;
+    timeoutMs?: number;
   };
   mpesaDaraja?: {
     consumerKey: string;
     consumerSecret: string;
     shortCode: string;
     initiatorName: string;
-    /** Pre-encrypted Base64 credential, OR omit and provide initiatorPassword + certificatePem. */
     securityCredential?: string;
     initiatorPassword?: string;
     certificatePem?: string;
@@ -172,6 +310,7 @@ export interface OmniPayoutConfig {
     queueTimeoutUrl: string;
     baseUrl?: string;
     webhookSecret?: string;
+    timeoutMs?: number;
   };
   health?: HealthConfig;
 }

@@ -1,6 +1,8 @@
-import { HealthConfig, PayoutRail, RailHealth } from './types';
+import { CircuitState, HealthConfig, PayoutRail, RailHealth } from './types';
 
 interface InternalHealthState {
+  state: CircuitState;
+  probeInFlight: boolean;
   consecutiveFailures: number;
   totalRequests: number;
   totalFailures: number;
@@ -23,9 +25,11 @@ export class RailHealthTracker {
   }
 
   private getOrCreate(rail: PayoutRail): InternalHealthState {
-    let state = this.stats.get(rail);
-    if (!state) {
-      state = {
+    let st = this.stats.get(rail);
+    if (!st) {
+      st = {
+        state: 'CLOSED',
+        probeInFlight: false,
         consecutiveFailures: 0,
         totalRequests: 0,
         totalFailures: 0,
@@ -33,55 +37,92 @@ export class RailHealthTracker {
         lastLatencyMs: 0,
         circuitOpenUntil: 0,
       };
-      this.stats.set(rail, state);
+      this.stats.set(rail, st);
     }
-    return state;
+    return st;
+  }
+
+  /**
+   * Checks whether a rail can accept a request, transitioning OPEN -> HALF_OPEN
+   * after cooldown and allowing a single recovery probe through.
+   */
+  tryAcquire(rail: PayoutRail): boolean {
+    const st = this.stats.get(rail);
+    if (!st || st.state === 'CLOSED') return true;
+
+    const now = Date.now();
+    if (st.state === 'OPEN') {
+      if (now >= st.circuitOpenUntil) {
+        st.state = 'HALF_OPEN';
+        st.probeInFlight = true;
+        return true;
+      }
+      return false;
+    }
+
+    // HALF_OPEN: allow only one recovery probe at a time
+    if (!st.probeInFlight) {
+      st.probeInFlight = true;
+      return true;
+    }
+    return false;
   }
 
   isAvailable(rail: PayoutRail): boolean {
-    const state = this.stats.get(rail);
-    if (!state) return true;
-    return Date.now() >= state.circuitOpenUntil;
+    const st = this.stats.get(rail);
+    if (!st || st.state === 'CLOSED') return true;
+    if (st.state === 'OPEN') {
+      return Date.now() >= st.circuitOpenUntil;
+    }
+    return !st.probeInFlight;
   }
 
   recordSuccess(rail: PayoutRail, latencyMs: number): void {
-    const state = this.getOrCreate(rail);
-    state.totalRequests += 1;
-    state.lastLatencyMs = latencyMs;
-    state.totalLatencyMs += latencyMs;
+    const st = this.getOrCreate(rail);
+    st.totalRequests += 1;
+    st.lastLatencyMs = latencyMs;
+    st.totalLatencyMs += latencyMs;
+    st.probeInFlight = false;
 
     if (latencyMs > this.maxLatencyMs) {
-      state.consecutiveFailures += 1;
-      state.lastError = `Latency ${latencyMs}ms exceeded threshold ${this.maxLatencyMs}ms`;
-      if (state.consecutiveFailures >= this.failureThreshold) {
-        state.circuitOpenUntil = Date.now() + this.cooldownMs;
+      st.consecutiveFailures += 1;
+      st.lastError = `Latency ${latencyMs}ms exceeded threshold ${this.maxLatencyMs}ms`;
+      if (st.state === 'HALF_OPEN' || st.consecutiveFailures >= this.failureThreshold) {
+        st.state = 'OPEN';
+        st.circuitOpenUntil = Date.now() + this.cooldownMs;
       }
       return;
     }
 
-    state.consecutiveFailures = 0;
-    state.circuitOpenUntil = 0;
+    // Probe succeeded or normal request succeeded -> close circuit
+    st.state = 'CLOSED';
+    st.consecutiveFailures = 0;
+    st.circuitOpenUntil = 0;
   }
 
   recordFailure(rail: PayoutRail, latencyMs: number, errorMessage: string): void {
-    const state = this.getOrCreate(rail);
-    state.totalRequests += 1;
-    state.totalFailures += 1;
-    state.consecutiveFailures += 1;
-    state.lastLatencyMs = latencyMs;
-    state.totalLatencyMs += latencyMs;
-    state.lastError = errorMessage;
+    const st = this.getOrCreate(rail);
+    st.totalRequests += 1;
+    st.totalFailures += 1;
+    st.consecutiveFailures += 1;
+    st.lastLatencyMs = latencyMs;
+    st.totalLatencyMs += latencyMs;
+    st.lastError = errorMessage;
+    st.probeInFlight = false;
 
-    if (state.consecutiveFailures >= this.failureThreshold) {
-      state.circuitOpenUntil = Date.now() + this.cooldownMs;
+    // If HALF_OPEN probe fails, re-open immediately; otherwise open at threshold
+    if (st.state === 'HALF_OPEN' || st.consecutiveFailures >= this.failureThreshold) {
+      st.state = 'OPEN';
+      st.circuitOpenUntil = Date.now() + this.cooldownMs;
     }
   }
 
   getHealth(rail: PayoutRail): RailHealth {
-    const state = this.stats.get(rail);
-    if (!state) {
+    const st = this.stats.get(rail);
+    if (!st) {
       return {
         rail,
+        state: 'CLOSED',
         healthy: true,
         circuitOpen: false,
         consecutiveFailures: 0,
@@ -92,18 +133,25 @@ export class RailHealthTracker {
       };
     }
 
-    const circuitOpen = Date.now() < state.circuitOpenUntil;
+    const now = Date.now();
+    let effectiveState: CircuitState = st.state;
+    if (st.state === 'OPEN' && now >= st.circuitOpenUntil) {
+      effectiveState = 'HALF_OPEN';
+    }
+    const circuitOpen = effectiveState === 'OPEN';
+
     return {
       rail,
-      healthy: !circuitOpen,
+      state: effectiveState,
+      healthy: effectiveState === 'CLOSED',
       circuitOpen,
-      consecutiveFailures: state.consecutiveFailures,
-      totalRequests: state.totalRequests,
-      totalFailures: state.totalFailures,
-      lastLatencyMs: state.lastLatencyMs,
-      avgLatencyMs: state.totalRequests > 0 ? Math.round(state.totalLatencyMs / state.totalRequests) : 0,
-      lastError: state.lastError,
-      circuitOpenUntil: circuitOpen ? new Date(state.circuitOpenUntil) : undefined,
+      consecutiveFailures: st.consecutiveFailures,
+      totalRequests: st.totalRequests,
+      totalFailures: st.totalFailures,
+      lastLatencyMs: st.lastLatencyMs,
+      avgLatencyMs: st.totalRequests > 0 ? Math.round(st.totalLatencyMs / st.totalRequests) : 0,
+      lastError: st.lastError,
+      circuitOpenUntil: circuitOpen ? new Date(st.circuitOpenUntil) : undefined,
     };
   }
 }

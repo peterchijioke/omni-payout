@@ -35,7 +35,8 @@
   - **ISO-4217 Currency Precision**: Handles zero-decimal (`UGX`, `RWF`, `XOF`, `XAF`, `JPY`), two-decimal, and three-decimal currencies accurately without 100x minor-unit bugs.
   - **Webhook Replay & Signature Enforcement**: Constant-time signature verification across all 6 rails, mandatory webhook secrets, and Stripe timestamp tolerance checks.
   - **SSRF, Path-Traversal & Secret Redaction**: Enforces HTTPS `baseUrl`s, escapes/validates path identifiers, and stores credentials in ECMAScript `#private` fields (TS) and redacted structs (Go).
-- **Zero Dependencies**: Pure standard library in both Go and TypeScript.
+- **Zero Dependencies & Stateless by Default**: Pure standard library in both Go and TypeScript. Storage-agnostic `IdempotencyStore` / `WebhookStore` and monitoring-agnostic `onTelemetry` hooks let you plug in Redis, Postgres, OpenTelemetry, or Prometheus without forcing dependencies into the package.
+- **Smart Routing, Retry Policies & Automated Reconciliation**: Route by country, currency, min/max limits, and lowest provider fees (`routingRules` / `railLimits`); retry transient `429`/`503` errors with exponential backoff + jitter (`retry`); recover circuits gracefully via `CLOSED` → `OPEN` → `HALF_OPEN` probes; and poll pending transfers via `waitForSettlement()` / `WaitForSettlement()`.
 
 ---
 

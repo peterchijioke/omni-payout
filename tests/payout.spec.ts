@@ -1,12 +1,16 @@
 import crypto from 'crypto';
 import { OmniPayoutEngine } from '../src/engine';
 import {
+  InMemoryIdempotencyStore,
+  InMemoryWebhookStore,
+  PayoutProviderError,
   canTransitionStatus,
   encryptMpesaInitiatorPassword,
   matchAccountNames,
   normalizeMsisdn,
   resolveProviderCode,
 } from '../src/utils';
+import { PayoutTelemetryEvent } from '../src/types';
 
 describe('OmniPayoutEngine', () => {
   const engine = new OmniPayoutEngine({
@@ -923,6 +927,194 @@ describe('OmniPayoutEngine', () => {
       expect(confirmedEv.status).toBe('SUCCESSFUL');
       expect(confirmedEv.amount).toBe(20000);
       expect(confirmedEv.fee).toBe(26.88);
+    });
+
+    it('deduplicates concurrent requests (singleflight), enforces idempotency conflicts, retries with backoff, supports HALF_OPEN recovery, smart routing, reconciliation, webhook dedup, and balance cache', async () => {
+      const telemetry: PayoutTelemetryEvent[] = [];
+      const idempStore = new InMemoryIdempotencyStore();
+      const webhookStore = new InMemoryWebhookStore();
+
+      const advEngine = new OmniPayoutEngine({
+        flutterwave: { secretKey: 'flw_k', webhookSecret: 'flw_wh', timeoutMs: 5000 },
+        paystack: { secretKey: 'ps_k', webhookSecret: 'ps_wh', timeoutMs: 5000 },
+        idempotencyStore: idempStore,
+        webhookStore,
+        onTelemetry: (ev) => telemetry.push(ev),
+        balanceCacheTtlMs: 30_000,
+        retry: { maxRetries: 2, baseDelayMs: 5, maxDelayMs: 20, jitter: false },
+        health: { failureThreshold: 1, cooldownMs: 25 },
+        routingRules: [
+          {
+            currencies: ['NGN'],
+            countries: ['NG'],
+            rails: ['FLUTTERWAVE', 'PAYSTACK'],
+            fees: {
+              FLUTTERWAVE: { flat: 50, percent: 0.5 },
+              PAYSTACK: { flat: 10, percent: 0.1 }, // cheaper -> sorted first!
+            },
+          },
+        ],
+        railLimits: {
+          PAYSTACK: { maxAmount: 100_000 },
+        },
+      });
+
+      // 1. Smart routing picks cheapest rail (PAYSTACK) for 20,000 NGN
+      expect(
+        advEngine.resolveRoute({
+          amount: 20000,
+          currency: 'NGN',
+          reference: 'R-SORT',
+          bankDetails: { bankCode: '058', accountNumber: '0123456789' },
+        })
+      ).toEqual(['PAYSTACK', 'FLUTTERWAVE']);
+
+      // 2. Concurrent singleflight: 5 simultaneous disburse() calls -> only 1 transfer HTTP call!
+      let transferCalls = 0;
+      global.fetch = jest.fn().mockImplementation(async (url: string) => {
+        if (url.includes('/transferrecipient')) {
+          return { ok: true, status: 200, json: async () => ({ status: true, data: { recipient_code: 'RCP_sf' } }) };
+        }
+        transferCalls++;
+        await new Promise((r) => setTimeout(r, 15));
+        return {
+          ok: true,
+          status: 200,
+          json: async () => ({
+            status: true,
+            data: { transfer_code: 'TRF_sf_1', reference: 'REF-CONCURRENT', status: 'pending' },
+          }),
+        };
+      });
+
+      const concurrentParams = {
+        amount: 15000,
+        currency: 'NGN',
+        reference: 'REF-CONCURRENT',
+        bankDetails: { bankCode: '058', accountNumber: '0123456789' },
+      };
+      const results = await Promise.all([
+        advEngine.disburse(concurrentParams),
+        advEngine.disburse(concurrentParams),
+        advEngine.disburse(concurrentParams),
+        advEngine.disburse(concurrentParams),
+        advEngine.disburse(concurrentParams),
+      ]);
+      expect(transferCalls).toBe(1);
+      expect(results.every((r) => r.transactionId === 'TRF_sf_1')).toBe(true);
+
+      // 3. Reusing same reference with DIFFERENT amount throws IDEMPOTENCY_CONFLICT
+      await expect(
+        advEngine.disburse({ ...concurrentParams, amount: 99999 })
+      ).rejects.toMatchObject({ code: 'IDEMPOTENCY_CONFLICT' });
+
+      // 4. Rail limit exceeded on PAYSTACK (200,000 > 100,000) automatically skips to FLUTTERWAVE
+      global.fetch = jest.fn().mockResolvedValueOnce({
+        ok: true,
+        status: 200,
+        json: async () => ({ status: 'success', data: { id: 444, reference: 'REF-LIM', status: 'NEW' } }),
+      } as any);
+      const limRes = await advEngine.disburse({
+        amount: 200_000,
+        currency: 'NGN',
+        reference: 'REF-LIM',
+        bankDetails: { bankCode: '058', accountNumber: '0123456789' },
+      });
+      expect(limRes.rail).toBe('FLUTTERWAVE');
+
+      // 5. Retry with exponential backoff on 429 RATE_LIMITED -> succeeds on 2nd attempt
+      let rateAttempts = 0;
+      global.fetch = jest.fn().mockImplementation(async () => {
+        rateAttempts++;
+        if (rateAttempts === 1) {
+          return { ok: false, status: 429, json: async () => ({ status: 'error', message: 'Too many requests' }) };
+        }
+        return { ok: true, status: 200, json: async () => ({ status: 'success', data: { id: 555, status: 'SUCCESSFUL' } }) };
+      });
+      const retryRes = await advEngine.disburse({
+        amount: 5000,
+        currency: 'NGN',
+        reference: 'REF-RETRY-429',
+        rail: 'FLUTTERWAVE',
+        bankDetails: { bankCode: '058', accountNumber: '0123456789' },
+      });
+      expect(rateAttempts).toBe(2);
+      expect(retryRes.status).toBe('SUCCESSFUL');
+      expect(telemetry.some((e) => e.type === 'disburse.retry' && e.errorCode === 'RATE_LIMITED')).toBe(true);
+
+      // 6. Circuit breaker HALF_OPEN recovery probe
+      global.fetch = jest.fn().mockResolvedValueOnce({
+        ok: false,
+        status: 400,
+        json: async () => ({ status: 'error', message: 'Invalid account' }),
+      } as any);
+      await expect(
+        advEngine.disburse({
+          amount: 5000,
+          currency: 'NGN',
+          reference: 'REF-CB-TRIP',
+          rail: 'FLUTTERWAVE',
+          bankDetails: { bankCode: '058', accountNumber: '0000000000' },
+        })
+      ).rejects.toBeInstanceOf(PayoutProviderError);
+      expect(advEngine.getRailHealth('FLUTTERWAVE')[0].state).toBe('OPEN');
+
+      await new Promise((r) => setTimeout(r, 35));
+      expect(advEngine.getRailHealth('FLUTTERWAVE')[0].state).toBe('HALF_OPEN');
+
+      global.fetch = jest.fn().mockResolvedValueOnce({
+        ok: true,
+        status: 200,
+        json: async () => ({ status: 'success', data: { id: 666, status: 'SUCCESSFUL' } }),
+      } as any);
+      await advEngine.disburse({
+        amount: 5000,
+        currency: 'NGN',
+        reference: 'REF-CB-RECOVER',
+        rail: 'FLUTTERWAVE',
+        bankDetails: { bankCode: '058', accountNumber: '0123456789' },
+      });
+      expect(advEngine.getRailHealth('FLUTTERWAVE')[0].state).toBe('CLOSED');
+
+      // 7. Automated status reconciliation (waitForSettlement)
+      let pollCalls = 0;
+      global.fetch = jest.fn().mockImplementation(async () => {
+        pollCalls++;
+        return {
+          ok: true,
+          status: 200,
+          json: async () => ({
+            status: 'success',
+            data: { id: 777, reference: 'REF-POLL', status: pollCalls < 3 ? 'PENDING' : 'SUCCESSFUL', amount: 5000, currency: 'NGN' },
+          }),
+        };
+      });
+      const settled = await advEngine.waitForSettlement(
+        { transactionId: '777', reference: 'REF-POLL', rail: 'FLUTTERWAVE' },
+        { intervalMs: 5, maxAttempts: 5, backoffMultiplier: 1 }
+      );
+      expect(pollCalls).toBe(3);
+      expect(settled.status).toBe('SUCCESSFUL');
+
+      // 8. Webhook duplicate detection
+      const whBody = JSON.stringify({ event: 'transfer.completed', data: { id: 888, reference: 'REF-DUP-WH', status: 'SUCCESSFUL', amount: 5000, currency: 'NGN' } });
+      const wh1 = advEngine.verifyWebhook('FLUTTERWAVE', whBody, 'flw_wh');
+      const wh2 = advEngine.verifyWebhook('FLUTTERWAVE', whBody, 'flw_wh');
+      expect(wh1.duplicate).toBeUndefined();
+      expect(wh2.duplicate).toBe(true);
+
+      // 9. Balance cache TTL avoids redundant network calls
+      let balCalls = 0;
+      global.fetch = jest.fn().mockImplementation(async () => {
+        balCalls++;
+        return { ok: true, status: 200, json: async () => ({ status: 'success', data: [{ currency: 'NGN', available_balance: 500000 }] }) };
+      });
+      await advEngine.getBalances('FLUTTERWAVE');
+      await advEngine.getBalances('FLUTTERWAVE');
+      expect(balCalls).toBe(1);
+      advEngine.invalidateBalanceCache('FLUTTERWAVE');
+      await advEngine.getBalances('FLUTTERWAVE');
+      expect(balCalls).toBe(2);
     });
   });
 });

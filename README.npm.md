@@ -34,6 +34,7 @@ Zero external runtime dependencies — uses native `fetch` and Node's built-in `
 - **Zero-Decimal Currency Safety**: Automatically handles zero-decimal (`UGX`, `RWF`, `XOF`, `XAF`, `JPY`), 2-decimal, and 3-decimal currencies without 100x overpay bugs.
 - **Deterministic PawaPay UUIDs**: Automatically hashes human-readable `reference` strings into valid RFC 4122 UUIDs for PawaPay while preserving your original `reference` in responses.
 - **Hardened Webhooks & Secret Isolation**: Constant-time HMAC verification, Stripe replay-window enforcement (`webhookToleranceSec`), HTTPS/SSRF `baseUrl` validation, path-traversal guards, and ECMAScript `#private` secret storage (secrets never leak via `JSON.stringify` or `console.log`).
+- **Stateless by Default & Pluggable**: Zero dependencies; plug in Redis/Postgres via `idempotencyStore` & `webhookStore`, wire Prometheus/OpenTelemetry via `onTelemetry`, configure fee/limit `routingRules`, `retry` backoff with jitter, `HALF_OPEN` circuit breakers, `balanceCacheTtlMs`, and `waitForSettlement()`.
 
 ---
 

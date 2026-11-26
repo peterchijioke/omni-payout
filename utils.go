@@ -1,6 +1,7 @@
 package omnipayout
 
 import (
+	"context"
 	"crypto/rand"
 	"crypto/rsa"
 	"crypto/sha256"
@@ -9,13 +10,17 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/pem"
+	"errors"
 	"fmt"
 	"math"
+	"math/big"
 	"net"
 	"net/url"
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
+	"time"
 )
 
 var zeroDecimalCurrencies = map[string]bool{
@@ -28,15 +33,76 @@ var threeDecimalCurrencies = map[string]bool{
 	"BHD": true, "JOD": true, "KWD": true, "OMR": true, "TND": true,
 }
 
+var currencyCountries = map[string]string{
+	"NGN": "NG",
+	"KES": "KE",
+	"GHS": "GH",
+	"UGX": "UG",
+	"TZS": "TZ",
+	"RWF": "RW",
+	"ZAR": "ZA",
+	"ZMW": "ZM",
+	"USD": "US",
+	"GBP": "GB",
+}
+
 var uuidRegex = regexp.MustCompile(`(?i)^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$`)
 var currencyRegex = regexp.MustCompile(`^[A-Za-z]{3}$`)
+var digitsRegex = regexp.MustCompile(`^\d{7,15}$`)
+var nonAlnumRegex = regexp.MustCompile(`[^a-z0-9\s]+`)
 
-// ProviderError represents a structured error returned from a payout provider.
+func classifyProviderError(statusCode int, message string, isAmbiguous bool) (ErrorCode, bool) {
+	if isAmbiguous {
+		return ErrAmbiguousTimeout, false
+	}
+	lower := strings.ToLower(message)
+	if statusCode == 401 || statusCode == 403 || strings.Contains(lower, "unauthorized") || strings.Contains(lower, "invalid key") || strings.Contains(lower, "forbidden") {
+		return ErrAuthFailed, false
+	}
+	if statusCode == 429 || strings.Contains(lower, "rate limit") || strings.Contains(lower, "too many requests") {
+		return ErrRateLimited, true
+	}
+	if statusCode == 409 || strings.Contains(lower, "duplicate") || strings.Contains(lower, "already exists") {
+		return ErrDuplicateReference, false
+	}
+	if strings.Contains(lower, "insufficient") || strings.Contains(lower, "low balance") {
+		return ErrInsufficientFloat, false
+	}
+	if strings.Contains(lower, "limit exceeded") || strings.Contains(lower, "maximum amount") || strings.Contains(lower, "minimum amount") {
+		return ErrLimitExceeded, false
+	}
+	if strings.Contains(lower, "invalid account") || strings.Contains(lower, "invalid recipient") || strings.Contains(lower, "account not found") || strings.Contains(lower, "resolve failed") {
+		return ErrInvalidAccount, false
+	}
+	if statusCode == 503 || statusCode == 501 || strings.Contains(lower, "service unavailable") || strings.Contains(lower, "maintenance") {
+		return ErrProviderDown, true
+	}
+	if statusCode >= 400 && statusCode < 500 {
+		return ErrValidation, false
+	}
+	return ErrProvider, false
+}
+
+// ProviderError represents a structured, normalized error returned from a payout provider.
 type ProviderError struct {
 	Rail        PayoutRail
+	Code        ErrorCode
 	StatusCode  int
 	Message     string
 	IsAmbiguous bool
+	Retryable   bool
+}
+
+func newProviderError(rail PayoutRail, statusCode int, message string, isAmbiguous bool) *ProviderError {
+	code, retryable := classifyProviderError(statusCode, message, isAmbiguous)
+	return &ProviderError{
+		Rail:        rail,
+		Code:        code,
+		StatusCode:  statusCode,
+		Message:     message,
+		IsAmbiguous: isAmbiguous,
+		Retryable:   retryable,
+	}
 }
 
 func (e *ProviderError) Error() string {
@@ -48,6 +114,7 @@ func (e *ProviderError) Error() string {
 type AmbiguousPayoutError struct {
 	Rail      PayoutRail
 	Reference string
+	Code      ErrorCode
 	Cause     string
 }
 
@@ -69,16 +136,99 @@ func currencyExponent(currency string) int {
 	return 2
 }
 
+// toMinorUnits converts a decimal amount into integer minor units using exact string decimal shifting.
 func toMinorUnits(amount float64, currency string) int64 {
 	exp := currencyExponent(currency)
-	factor := math.Pow10(exp)
-	scaled, _ := strconv.ParseFloat(strconv.FormatFloat(amount*factor, 'g', 15, 64), 64)
-	return int64(math.Round(scaled))
+	if exp == 0 {
+		return int64(math.Round(amount))
+	}
+	formatted := strconv.FormatFloat(amount, 'f', exp+4, 64)
+	neg := strings.HasPrefix(formatted, "-")
+	if neg {
+		formatted = formatted[1:]
+	}
+	parts := strings.SplitN(formatted, ".", 2)
+	whole, _ := strconv.ParseInt(parts[0], 10, 64)
+	frac := ""
+	if len(parts) > 1 {
+		frac = parts[1]
+	}
+	for len(frac) < exp+1 {
+		frac += "0"
+	}
+	mainFrac, _ := strconv.ParseInt(frac[:exp], 10, 64)
+	guard := frac[exp] - '0'
+	minor := whole*int64(math.Pow10(exp)) + mainFrac
+	if guard >= 5 {
+		minor++
+	}
+	if neg {
+		return -minor
+	}
+	return minor
 }
 
 func fromMinorUnits(minorAmount int64, currency string) float64 {
 	exp := currencyExponent(currency)
-	return float64(minorAmount) / math.Pow10(exp)
+	if exp == 0 {
+		return float64(minorAmount)
+	}
+	val := float64(minorAmount) / math.Pow10(exp)
+	roundFactor := math.Pow10(exp)
+	return math.Round(val*roundFactor) / roundFactor
+}
+
+func withRetry[T any](ctx context.Context, cfg *RetryConfig, fn func() (T, error), onRetry func(err *ProviderError, attempt int)) (T, error) {
+	if cfg == nil || cfg.MaxRetries <= 0 {
+		return fn()
+	}
+	baseDelay := cfg.BaseDelay
+	if baseDelay <= 0 {
+		baseDelay = 250 * time.Millisecond
+	}
+	maxDelay := cfg.MaxDelay
+	if maxDelay <= 0 {
+		maxDelay = 5 * time.Second
+	}
+
+	attempt := 0
+	for {
+		val, err := fn()
+		if err == nil {
+			return val, nil
+		}
+		var provErr *ProviderError
+		canRetry := attempt < cfg.MaxRetries && errors.As(err, &provErr) && provErr.Retryable && !provErr.IsAmbiguous
+		if !canRetry {
+			var zero T
+			return zero, err
+		}
+
+		expDelay := time.Duration(float64(baseDelay) * math.Pow(2, float64(attempt)))
+		if expDelay > maxDelay {
+			expDelay = maxDelay
+		}
+		delay := expDelay
+		if !cfg.DisableJitter && expDelay > 0 {
+			if n, rErr := rand.Int(rand.Reader, big.NewInt(int64(expDelay))); rErr == nil {
+				delay = time.Duration(n.Int64())
+			}
+		}
+
+		attempt++
+		if onRetry != nil {
+			onRetry(provErr, attempt)
+		}
+
+		timer := time.NewTimer(delay)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			var zero T
+			return zero, ctx.Err()
+		case <-timer.C:
+		}
+	}
 }
 
 func hasControlChars(s string) bool {
@@ -169,9 +319,6 @@ func constantTimeHexEqual(provided, expectedHex string) bool {
 	return subtle.ConstantTimeCompare([]byte(a), []byte(b)) == 1
 }
 
-var digitsRegex = regexp.MustCompile(`^\d{7,15}$`)
-var nonAlnumRegex = regexp.MustCompile(`[^a-z0-9\s]+`)
-
 var currencyDialCodes = map[string]string{
 	"NGN": "234",
 	"KES": "254",
@@ -261,8 +408,7 @@ func tokenizeAccountName(name string) []string {
 	return out
 }
 
-// MatchAccountNames compares an expected beneficiary name against a resolved bank name,
-// tolerating word-order differences (e.g. "Peter Chukwu" vs "CHUKWU CHIJIOKE PETER") and honorifics.
+// MatchAccountNames compares an expected beneficiary name against a resolved bank name.
 func MatchAccountNames(expectedName, resolvedName string, threshold float64) NameMatchResult {
 	if threshold <= 0 {
 		threshold = 0.66
@@ -313,7 +459,7 @@ func MatchAccountNames(expectedName, resolvedName string, threshold float64) Nam
 	}
 }
 
-// CanTransitionStatus guards payout state machines against out-of-order regressions (e.g. SUCCESSFUL -> PENDING).
+// CanTransitionStatus guards payout state machines against out-of-order regressions.
 func CanTransitionStatus(currentStatus, nextStatus string, allowReversal bool) bool {
 	if currentStatus == "" || currentStatus == string(StatusPending) {
 		return true
@@ -383,4 +529,123 @@ func ResolveProviderCode(code, currency string, rail PayoutRail, isMobileMoney b
 		}
 	}
 	return strings.TrimSpace(code)
+}
+
+// InMemoryIdempotencyStore is an optional bounded thread-safe reference implementation of IdempotencyStore.
+type InMemoryIdempotencyStore struct {
+	mu         sync.Mutex
+	maxEntries int
+	order      []string
+	entries    map[string]struct {
+		record    IdempotencyRecord
+		expiresAt time.Time
+	}
+}
+
+func NewInMemoryIdempotencyStore(maxEntries int) *InMemoryIdempotencyStore {
+	if maxEntries <= 0 {
+		maxEntries = 5000
+	}
+	return &InMemoryIdempotencyStore{
+		maxEntries: maxEntries,
+		entries: make(map[string]struct {
+			record    IdempotencyRecord
+			expiresAt time.Time
+		}),
+	}
+}
+
+func (s *InMemoryIdempotencyStore) Get(_ context.Context, reference string) (*IdempotencyRecord, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	item, ok := s.entries[reference]
+	if !ok {
+		return nil, nil
+	}
+	if !item.expiresAt.IsZero() && time.Now().After(item.expiresAt) {
+		delete(s.entries, reference)
+		return nil, nil
+	}
+	rec := item.record
+	return &rec, nil
+}
+
+func (s *InMemoryIdempotencyStore) Set(_ context.Context, reference string, record IdempotencyRecord, ttl time.Duration) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if _, exists := s.entries[reference]; !exists {
+		if len(s.entries) >= s.maxEntries && len(s.order) > 0 {
+			oldest := s.order[0]
+			s.order = s.order[1:]
+			delete(s.entries, oldest)
+		}
+		s.order = append(s.order, reference)
+	}
+	var exp time.Time
+	if ttl > 0 {
+		exp = time.Now().Add(ttl)
+	}
+	s.entries[reference] = struct {
+		record    IdempotencyRecord
+		expiresAt time.Time
+	}{record: record, expiresAt: exp}
+	return nil
+}
+
+func (s *InMemoryIdempotencyStore) Delete(_ context.Context, reference string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	delete(s.entries, reference)
+	return nil
+}
+
+// InMemoryWebhookStore is an optional bounded thread-safe reference implementation of WebhookStore.
+type InMemoryWebhookStore struct {
+	mu         sync.Mutex
+	maxEntries int
+	order      []string
+	seen       map[string]time.Time
+}
+
+func NewInMemoryWebhookStore(maxEntries int) *InMemoryWebhookStore {
+	if maxEntries <= 0 {
+		maxEntries = 5000
+	}
+	return &InMemoryWebhookStore{
+		maxEntries: maxEntries,
+		seen:       make(map[string]time.Time),
+	}
+}
+
+func (s *InMemoryWebhookStore) HasSeen(_ context.Context, eventKey string) (bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	exp, ok := s.seen[eventKey]
+	if !ok {
+		return false, nil
+	}
+	if !exp.IsZero() && time.Now().After(exp) {
+		delete(s.seen, eventKey)
+		return false, nil
+	}
+	return true, nil
+}
+
+func (s *InMemoryWebhookStore) MarkSeen(_ context.Context, eventKey string, ttl time.Duration) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if _, exists := s.seen[eventKey]; !exists {
+		if len(s.seen) >= s.maxEntries && len(s.order) > 0 {
+			oldest := s.order[0]
+			s.order = s.order[1:]
+			delete(s.seen, oldest)
+		}
+		s.order = append(s.order, eventKey)
+	}
+	var exp time.Time
+	if ttl > 0 {
+		exp = time.Now().Add(ttl)
+	}
+	s.seen[eventKey] = exp
+	return nil
 }

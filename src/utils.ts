@@ -1,5 +1,14 @@
 import crypto from 'crypto';
-import { NameMatchResult, PayoutRail, PayoutStatus } from './types';
+import {
+  IdempotencyRecord,
+  IdempotencyStore,
+  NameMatchResult,
+  PayoutErrorCode,
+  PayoutRail,
+  PayoutStatus,
+  RetryConfig,
+  WebhookStore,
+} from './types';
 
 const ZERO_DECIMAL_CURRENCIES = new Set([
   'BIF', 'CLP', 'DJF', 'GNF', 'JPY', 'KMF', 'KRW', 'MGA',
@@ -12,29 +21,78 @@ const UUID_REGEX = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-
 const CURRENCY_REGEX = /^[A-Za-z]{3}$/;
 const CONTROL_CHAR_REGEX = /[\x00-\x1f\x7f]/;
 
+/**
+ * Classifies provider HTTP status codes and error messages into consistent, actionable PayoutErrorCodes.
+ */
+export function classifyProviderError(
+  statusCode: number | undefined,
+  message: string,
+  isAmbiguous: boolean
+): { code: PayoutErrorCode; retryable: boolean } {
+  if (isAmbiguous) {
+    return { code: 'AMBIGUOUS_TIMEOUT', retryable: false };
+  }
+  const lower = (message || '').toLowerCase();
+
+  if (statusCode === 401 || statusCode === 403 || /invalid.*key|unauthorized|authentication|forbidden/.test(lower)) {
+    return { code: 'AUTH_FAILED', retryable: false };
+  }
+  if (statusCode === 429 || /rate\s*limit|too\s*many\s*requests/.test(lower)) {
+    return { code: 'RATE_LIMITED', retryable: true };
+  }
+  if (statusCode === 409 || /duplicate|already\s*exists/.test(lower)) {
+    return { code: 'DUPLICATE_REFERENCE', retryable: false };
+  }
+  if (/insufficient\s*(funds|balance|float)|low\s*balance/.test(lower)) {
+    return { code: 'INSUFFICIENT_FLOAT', retryable: false };
+  }
+  if (/limit\s*exceeded|maximum.*amount|minimum.*amount|amount.*exceeds/.test(lower)) {
+    return { code: 'LIMIT_EXCEEDED', retryable: false };
+  }
+  if (/invalid.*(account|recipient|iban|msisdn|phone|bank)|account.*not.*found|resolve.*failed/.test(lower)) {
+    return { code: 'INVALID_ACCOUNT', retryable: false };
+  }
+  if (statusCode === 503 || statusCode === 501 || /service\s*unavailable|maintenance|gateway\s*down/.test(lower)) {
+    return { code: 'PROVIDER_DOWN', retryable: true };
+  }
+  if (statusCode && statusCode >= 400 && statusCode < 500) {
+    return { code: 'VALIDATION_ERROR', retryable: false };
+  }
+  return { code: 'PROVIDER_ERROR', retryable: false };
+}
+
 export class PayoutProviderError extends Error {
   public readonly rail: PayoutRail;
+  public readonly code: PayoutErrorCode;
   public readonly statusCode?: number;
   public readonly isAmbiguous: boolean;
+  public readonly retryable: boolean;
 
   constructor(opts: {
     message: string;
     rail: PayoutRail;
     statusCode?: number;
     isAmbiguous: boolean;
+    code?: PayoutErrorCode;
+    retryable?: boolean;
   }) {
     super(opts.message);
     this.name = 'PayoutProviderError';
     this.rail = opts.rail;
     this.statusCode = opts.statusCode;
     this.isAmbiguous = opts.isAmbiguous;
+    const classified = classifyProviderError(opts.statusCode, opts.message, opts.isAmbiguous);
+    this.code = opts.code ?? classified.code;
+    this.retryable = opts.retryable ?? classified.retryable;
   }
 }
 
 export class PayoutAmbiguousError extends Error {
   public readonly rail: PayoutRail;
   public readonly reference: string;
+  public readonly code: PayoutErrorCode = 'AMBIGUOUS_TIMEOUT';
   public readonly isAmbiguous = true;
+  public readonly retryable = false;
 
   constructor(rail: PayoutRail, reference: string, causeMessage: string) {
     super(
@@ -54,16 +112,37 @@ export function currencyExponent(currency: string): number {
   return 2;
 }
 
-export function toMinorUnits(amount: number, currency: string): number {
+/**
+ * Converts a major-unit decimal amount into exact integer minor units using string-based
+ * decimal shifting (avoiding IEEE-754 floating-point drift on fractional currencies).
+ */
+export function toMinorUnits(amount: number | string, currency: string): number {
   const exp = currencyExponent(currency);
-  const factor = Math.pow(10, exp);
-  return Math.round(Number((amount * factor).toPrecision(15)));
+  const str = typeof amount === 'number' ? amount.toFixed(exp + 4) : String(amount).trim();
+  const negative = str.startsWith('-');
+  const unsigned = negative ? str.slice(1) : str;
+  const [wholePart = '0', fracPart = ''] = unsigned.split('.');
+
+  if (exp === 0) {
+    const rounded = Math.round(Number(unsigned));
+    return negative ? -rounded : rounded;
+  }
+
+  const paddedFrac = (fracPart + '0'.repeat(exp + 1)).slice(0, exp + 1);
+  const mainDigits = paddedFrac.slice(0, exp);
+  const guardDigit = Number(paddedFrac[exp] || '0');
+  let minor = Number(wholePart) * Math.pow(10, exp) + Number(mainDigits);
+  if (guardDigit >= 5) {
+    minor += 1;
+  }
+  return negative ? -minor : minor;
 }
 
 export function fromMinorUnits(minorAmount: number, currency: string): number {
   const exp = currencyExponent(currency);
+  if (exp === 0) return minorAmount;
   const factor = Math.pow(10, exp);
-  return minorAmount / factor;
+  return Number((minorAmount / factor).toFixed(exp));
 }
 
 export function validateDisburseInputs(amount: number, currency: string, reference: string): void {
@@ -118,10 +197,6 @@ export function sanitizeBaseUrl(baseUrl: string | undefined, defaultUrl: string)
   return `${parsed.origin}${parsed.pathname}`.replace(/\/$/, '');
 }
 
-/**
- * Deterministically converts any reference string into a valid RFC 4122 UUID
- * so PawaPay accepts human-readable references while preserving retry idempotency.
- */
 export function toDeterministicUuid(reference: string): string {
   const trimmed = reference.trim();
   if (UUID_REGEX.test(trimmed)) {
@@ -129,22 +204,121 @@ export function toDeterministicUuid(reference: string): string {
   }
   const hash = crypto.createHash('sha256').update(`omni-payout:pawapay:${trimmed}`).digest();
   const bytes = Buffer.from(hash.subarray(0, 16));
-  // Set version 4 (0100) and RFC 4122 variant (10xx)
   bytes[6] = (bytes[6] & 0x0f) | 0x40;
   bytes[8] = (bytes[8] & 0x3f) | 0x80;
   const hex = bytes.toString('hex');
   return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20, 32)}`;
 }
 
-/**
- * Determines whether an HTTP status code from a POST disbursement is ambiguous
- * (i.e. the upstream bank/MNO may still have received and processed it).
- * 4xx and 501/503 are pre-execution rejections; 500/502/504 and network timeouts are ambiguous.
- */
 export function isHttpStatusAmbiguous(statusCode: number): boolean {
   if (statusCode >= 400 && statusCode < 500) return false;
   if (statusCode === 501 || statusCode === 503) return false;
   return statusCode >= 500;
+}
+
+export async function sleepMs(ms: number): Promise<void> {
+  if (ms <= 0) return;
+  await new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/**
+ * Executes an operation with configurable exponential backoff and optional full jitter,
+ * retrying ONLY errors explicitly marked `retryable: true` and `isAmbiguous: false`.
+ */
+export async function withRetry<T>(
+  fn: () => Promise<T>,
+  retryConfig?: RetryConfig,
+  onRetry?: (err: PayoutProviderError, attempt: number) => void
+): Promise<T> {
+  const maxRetries = retryConfig?.maxRetries ?? 0;
+  if (maxRetries <= 0) {
+    return fn();
+  }
+  const baseDelayMs = retryConfig?.baseDelayMs ?? 250;
+  const maxDelayMs = retryConfig?.maxDelayMs ?? 5_000;
+  const useJitter = retryConfig?.jitter ?? true;
+
+  let attempt = 0;
+  while (true) {
+    try {
+      return await fn();
+    } catch (err: any) {
+      const canRetry =
+        attempt < maxRetries &&
+        err instanceof PayoutProviderError &&
+        err.retryable &&
+        !err.isAmbiguous;
+      if (!canRetry) {
+        throw err;
+      }
+      const expDelay = Math.min(maxDelayMs, baseDelayMs * Math.pow(2, attempt));
+      const delay = useJitter ? Math.floor(Math.random() * expDelay) : expDelay;
+      attempt += 1;
+      onRetry?.(err, attempt);
+      await sleepMs(delay);
+    }
+  }
+}
+
+/**
+ * Optional bounded in-memory reference implementation of `IdempotencyStore` for single-node setups or testing.
+ */
+export class InMemoryIdempotencyStore implements IdempotencyStore {
+  private readonly entries = new Map<string, { record: IdempotencyRecord; expiresAt: number }>();
+
+  constructor(private readonly maxEntries = 5_000) {}
+
+  get(reference: string): IdempotencyRecord | null {
+    const entry = this.entries.get(reference);
+    if (!entry) return null;
+    if (entry.expiresAt > 0 && Date.now() > entry.expiresAt) {
+      this.entries.delete(reference);
+      return null;
+    }
+    return entry.record;
+  }
+
+  set(reference: string, record: IdempotencyRecord, ttlMs = 86_400_000): void {
+    if (this.entries.size >= this.maxEntries && !this.entries.has(reference)) {
+      const oldestKey = this.entries.keys().next().value;
+      if (oldestKey !== undefined) this.entries.delete(oldestKey);
+    }
+    this.entries.set(reference, {
+      record,
+      expiresAt: ttlMs > 0 ? Date.now() + ttlMs : 0,
+    });
+  }
+
+  delete(reference: string): void {
+    this.entries.delete(reference);
+  }
+}
+
+/**
+ * Optional bounded in-memory reference implementation of `WebhookStore` for single-node setups or testing.
+ */
+export class InMemoryWebhookStore implements WebhookStore {
+  private readonly seen = new Map<string, number>();
+
+  constructor(private readonly maxEntries = 5_000) {}
+
+  hasSeen(eventKey: string): boolean {
+    const exp = this.seen.get(eventKey);
+    if (exp === undefined) return false;
+    if (exp > 0 && Date.now() > exp) {
+      this.seen.delete(eventKey);
+      return false;
+    }
+    return true;
+  }
+
+  markSeen(eventKey: string, ttlMs = 86_400_000): void {
+    if (this.seen.size >= this.maxEntries && !this.seen.has(eventKey)) {
+      const oldestKey = this.seen.keys().next().value;
+      if (oldestKey !== undefined) this.seen.delete(oldestKey);
+    }
+    this.seen.set(eventKey, ttlMs > 0 ? Date.now() + ttlMs : 0);
+  }
 }
 
 export async function fetchWithTimeout(
@@ -171,6 +345,7 @@ export async function fetchWithTimeout(
       message,
       rail,
       isAmbiguous: isMutatingPost,
+      retryable: !isMutatingPost,
     });
   } finally {
     clearTimeout(timer);
@@ -206,10 +381,19 @@ const CURRENCY_DIAL_CODES: Record<string, string> = {
   XOF: '225',
 };
 
-/**
- * Normalizes phone numbers (`+254 712-345-678`, `0712345678`, `00254712345678`)
- * into bare ITU-T E.164 MSISDN digits (`254712345678`) required by M-Pesa Daraja & PawaPay.
- */
+export const CURRENCY_COUNTRIES: Record<string, string> = {
+  NGN: 'NG',
+  KES: 'KE',
+  GHS: 'GH',
+  UGX: 'UG',
+  TZS: 'TZ',
+  RWF: 'RW',
+  ZAR: 'ZA',
+  ZMW: 'ZM',
+  USD: 'US',
+  GBP: 'GB',
+};
+
 export function normalizeMsisdn(phone: string, currency?: string): string {
   if (!phone || typeof phone !== 'string') {
     throw new Error('Mobile money phone number is required');
@@ -232,16 +416,14 @@ export function normalizeMsisdn(phone: string, currency?: string): string {
   return cleaned;
 }
 
-/**
- * Encrypts a plaintext Safaricom M-Pesa initiator password using the Daraja X.509 certificate
- * (RSA PKCS#1 v1.5 padding, Base64-encoded) to produce `SecurityCredential`.
- */
 export function encryptMpesaInitiatorPassword(
   initiatorPassword: string,
   certificatePem: string
 ): string {
   if (!initiatorPassword || !certificatePem) {
-    throw new Error('Both initiatorPassword and certificatePem are required to generate SecurityCredential');
+    throw new Error(
+      'Both initiatorPassword and certificatePem are required to generate SecurityCredential'
+    );
   }
   const encrypted = crypto.publicEncrypt(
     {
@@ -265,10 +447,6 @@ function tokenizeAccountName(name: string): string[] {
     .filter((tok) => tok.length > 0 && !HONORIFIC_TOKENS.has(tok));
 }
 
-/**
- * Compares an expected beneficiary name against a resolved bank account name,
- * handling word-order differences (e.g. "Peter Chukwu" vs "CHUKWU CHIJIOKE PETER") and honorifics.
- */
 export function matchAccountNames(
   expectedName: string,
   resolvedName: string,
@@ -290,7 +468,6 @@ export function matchAccountNames(
     if (actualSet.has(tok)) intersection++;
   }
 
-  // Containment score relative to the shorter name handles middle-name presence cleanly
   const minSize = Math.min(expectedSet.size, actualSet.size);
   const unionSize = new Set([...expectedSet, ...actualSet]).size;
   const containment = intersection / minSize;
@@ -305,10 +482,6 @@ export function matchAccountNames(
   };
 }
 
-/**
- * Guards payout state machines against out-of-order webhooks
- * (e.g. a delayed PENDING webhook arriving after SUCCESSFUL or FAILED).
- */
 export function canTransitionStatus(
   currentStatus: PayoutStatus | undefined | null,
   nextStatus: PayoutStatus,
@@ -338,18 +511,15 @@ const PAYSTACK_MOMO_BANK_CODES: Record<string, string> = {
 };
 
 const CROSS_RAIL_BANK_CODES: Record<string, Partial<Record<PayoutRail, string>>> = {
-  // Ghana (GHS) canonical aliases
   GCB_GHS: { FLUTTERWAVE: 'GH040100', PAYSTACK: '040100', YELLOW_CARD: 'GCB' },
   ECOBANK_GHS: { FLUTTERWAVE: 'GH130100', PAYSTACK: '130100', YELLOW_CARD: 'ECOBANK' },
   ABSA_GHS: { FLUTTERWAVE: 'GH030100', PAYSTACK: '030100', YELLOW_CARD: 'ABSA' },
   STANBIC_GHS: { FLUTTERWAVE: 'GH190100', PAYSTACK: '190100', YELLOW_CARD: 'STANBIC' },
   FIDELITY_GHS: { FLUTTERWAVE: 'GH240100', PAYSTACK: '240100', YELLOW_CARD: 'FIDELITY' },
-  // Kenya (KES) canonical aliases
   EQUITY_KES: { FLUTTERWAVE: '68', PAYSTACK: '68', YELLOW_CARD: 'EQUITY' },
   KCB_KES: { FLUTTERWAVE: '01', PAYSTACK: '01', YELLOW_CARD: 'KCB' },
   COOP_KES: { FLUTTERWAVE: '11', PAYSTACK: '11', YELLOW_CARD: 'COOP' },
   ABSA_KES: { FLUTTERWAVE: '03', PAYSTACK: '03', YELLOW_CARD: 'ABSA' },
-  // South Africa (ZAR) canonical aliases
   FNB_ZAR: { FLUTTERWAVE: '250655', PAYSTACK: '250655', YELLOW_CARD: 'FNB' },
   ABSA_ZAR: { FLUTTERWAVE: '632005', PAYSTACK: '632005', YELLOW_CARD: 'ABSA' },
   STANDARD_BANK_ZAR: { FLUTTERWAVE: '051001', PAYSTACK: '051001', YELLOW_CARD: 'SBSA' },
@@ -357,10 +527,6 @@ const CROSS_RAIL_BANK_CODES: Record<string, Partial<Record<PayoutRail, string>>>
   NEDBANK_ZAR: { FLUTTERWAVE: '198765', PAYSTACK: '198765', YELLOW_CARD: 'NEDBANK' },
 };
 
-/**
- * Resolves canonical mobile-money network codes or cross-corridor bank aliases
- * to the target provider's expected code during multi-rail failover.
- */
 export function resolveProviderCode(
   code: string,
   currency: string,
@@ -386,4 +552,3 @@ export function resolveProviderCode(
   const mapped = CROSS_RAIL_BANK_CODES[compositeKey]?.[rail];
   return mapped || code.trim();
 }
-

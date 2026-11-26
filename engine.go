@@ -13,8 +13,10 @@ import (
 	"fmt"
 	"io"
 	"math"
+	"net"
 	"net/http"
 	"net/url"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -30,6 +32,32 @@ var referenceLookupRails = map[PayoutRail]bool{
 	RailPaystack:   true,
 	RailPawaPay:    true,
 	RailYellowCard: true,
+}
+
+type inFlightCall struct {
+	fingerprint string
+	done        chan struct{}
+	res         *DisburseResult
+	err         error
+}
+
+type cachedBalances struct {
+	balances  []RailBalance
+	expiresAt time.Time
+}
+
+func computeDisburseFingerprint(params DisburseParams) string {
+	cur := strings.ToUpper(params.Currency)
+	minor := toMinorUnits(params.Amount, cur)
+	dest := "default"
+	if params.StripeAccountID != "" {
+		dest = "stripe:" + params.StripeAccountID
+	} else if params.BankDetails != nil {
+		dest = "bank:" + params.BankDetails.BankCode + ":" + params.BankDetails.AccountNumber
+	} else if params.MobileMoneyDetails != nil {
+		dest = "momo:" + params.MobileMoneyDetails.Network + ":" + params.MobileMoneyDetails.Phone
+	}
+	return fmt.Sprintf("%s:%d:%s", cur, minor, dest)
 }
 
 func normalizeStripeStatus(rawStatus string, defaultStatus PayoutStatus) string {
@@ -74,7 +102,7 @@ func normalizePaystackStatus(rawStatus string) string {
 	}
 }
 
-// Engine is the central multi-rail payout client.
+// Engine is the central, lightweight, stateless-by-default multi-rail payout client.
 type Engine struct {
 	config           Config
 	httpClient       *http.Client
@@ -82,24 +110,79 @@ type Engine struct {
 	mpesaMu          sync.Mutex
 	mpesaToken       string
 	mpesaTokenExpiry time.Time
+	inFlightMu       sync.Mutex
+	inFlight         map[string]*inFlightCall
+	balCacheMu       sync.RWMutex
+	balCache         map[PayoutRail]cachedBalances
 }
 
-// NewEngine initializes a new multi-rail payout engine.
+// NewEngine initializes a new multi-rail payout engine with pooled keep-alive transport.
 func NewEngine(cfg Config) *Engine {
 	timeout := cfg.Timeout
 	if timeout <= 0 {
 		timeout = 30 * time.Second
 	}
+	connectTimeout := cfg.ConnectTimeout
+	if connectTimeout <= 0 {
+		connectTimeout = 10 * time.Second
+	}
+
+	transport := &http.Transport{
+		DialContext: (&net.Dialer{
+			Timeout:   connectTimeout,
+			KeepAlive: 30 * time.Second,
+		}).DialContext,
+		TLSHandshakeTimeout: 10 * time.Second,
+		MaxIdleConns:        100,
+		MaxIdleConnsPerHost: 20,
+		IdleConnTimeout:     90 * time.Second,
+	}
+
 	return &Engine{
 		config:     cfg,
-		httpClient: &http.Client{Timeout: timeout},
+		httpClient: &http.Client{Timeout: timeout, Transport: transport},
 		health:     newRailHealthTracker(cfg.Health),
+		inFlight:   make(map[string]*inFlightCall),
+		balCache:   make(map[PayoutRail]cachedBalances),
 	}
 }
 
 // String prevents Engine from leaking embedded Config secrets in fmt/log output.
 func (e *Engine) String() string {
 	return "omnipayout.Engine{Secrets:[REDACTED]}"
+}
+
+func (e *Engine) emit(ev TelemetryEvent) {
+	if e.config.OnTelemetry != nil {
+		func() {
+			defer func() { _ = recover() }()
+			e.config.OnTelemetry(ev)
+		}()
+	}
+}
+
+func (e *Engine) providerContext(ctx context.Context, rail PayoutRail) (context.Context, context.CancelFunc) {
+	var d time.Duration
+	switch rail {
+	case RailStripeConnect:
+		d = e.config.StripeTimeout
+	case RailFlutterwave:
+		d = e.config.FlutterwaveTimeout
+	case RailPaystack:
+		d = e.config.PaystackTimeout
+	case RailPawaPay:
+		d = e.config.PawaPayTimeout
+	case RailYellowCard:
+		d = e.config.YellowCardTimeout
+	case RailMpesaDaraja:
+		if e.config.MpesaDaraja != nil {
+			d = e.config.MpesaDaraja.Timeout
+		}
+	}
+	if d > 0 {
+		return context.WithTimeout(ctx, d)
+	}
+	return ctx, func() {}
 }
 
 func (e *Engine) getConfiguredRails() []PayoutRail {
@@ -138,62 +221,157 @@ func (e *Engine) GetRailHealth(rail PayoutRail) []RailHealth {
 	return out
 }
 
-// ResolveRail determines the optimal primary payment rail based on parameters or currency.
-func (e *Engine) ResolveRail(params DisburseParams) PayoutRail {
-	if params.Rail != "" {
-		return params.Rail
+// InvalidateBalanceCache clears cached float balances for a rail or all rails.
+func (e *Engine) InvalidateBalanceCache(rail PayoutRail) {
+	e.balCacheMu.Lock()
+	defer e.balCacheMu.Unlock()
+	if rail != "" {
+		delete(e.balCache, rail)
+	} else {
+		e.balCache = make(map[PayoutRail]cachedBalances)
 	}
-	if params.StripeAccountID != "" {
-		return RailStripeConnect
-	}
+}
+
+// ResolveRoute evaluates configurable routing rules (country, currency, min/max limits, and lowest fees)
+// and returns the ordered candidate rail slice `[primary, ...fallbacks]`.
+func (e *Engine) ResolveRoute(params DisburseParams) []PayoutRail {
 	cur := strings.ToUpper(params.Currency)
-	if params.MobileMoneyDetails != nil {
-		if e.config.FlutterwaveSecretKey != "" {
-			return RailFlutterwave
-		}
-		if cur == "KES" && strings.EqualFold(params.MobileMoneyDetails.Network, "MPESA") && e.config.MpesaDaraja != nil {
-			return RailMpesaDaraja
-		}
-		if e.config.PawaPayAPIToken != "" {
-			return RailPawaPay
-		}
-		if e.config.YellowCardAPIKey != "" {
-			return RailYellowCard
-		}
-		if e.config.PaystackSecretKey != "" {
-			return RailPaystack
-		}
-		return RailFlutterwave
+	country := strings.ToUpper(params.Country)
+	if country == "" {
+		country = currencyCountries[cur]
 	}
-	if params.BankDetails != nil || africanCurrencies[cur] {
-		if e.config.FlutterwaveSecretKey != "" {
-			return RailFlutterwave
+
+	if params.Rail == "" && len(e.config.RoutingRules) > 0 {
+		for _, rule := range e.config.RoutingRules {
+			if len(rule.Currencies) > 0 {
+				matchedCur := false
+				for _, rc := range rule.Currencies {
+					if strings.EqualFold(rc, cur) {
+						matchedCur = true
+						break
+					}
+				}
+				if !matchedCur {
+					continue
+				}
+			}
+			if len(rule.Countries) > 0 {
+				matchedCountry := false
+				for _, rct := range rule.Countries {
+					if country != "" && strings.EqualFold(rct, country) {
+						matchedCountry = true
+						break
+					}
+				}
+				if !matchedCountry {
+					continue
+				}
+			}
+			if rule.MinAmount > 0 && params.Amount < rule.MinAmount {
+				continue
+			}
+			if rule.MaxAmount > 0 && params.Amount > rule.MaxAmount {
+				continue
+			}
+			if len(rule.Rails) > 0 {
+				ordered := make([]PayoutRail, len(rule.Rails))
+				copy(ordered, rule.Rails)
+				if len(rule.Fees) > 0 {
+					sort.SliceStable(ordered, func(i, j int) bool {
+						fi, okI := rule.Fees[ordered[i]]
+						fj, okJ := rule.Fees[ordered[j]]
+						costI := math.MaxFloat64
+						if okI {
+							costI = fi.Flat + (params.Amount*fi.Percent)/100.0
+						}
+						costJ := math.MaxFloat64
+						if okJ {
+							costJ = fj.Flat + (params.Amount*fj.Percent)/100.0
+						}
+						return costI < costJ
+					})
+				}
+				seen := map[PayoutRail]bool{}
+				for _, r := range ordered {
+					seen[r] = true
+				}
+				for _, fb := range params.FallbackRails {
+					if fb != "" && !seen[fb] {
+						ordered = append(ordered, fb)
+						seen[fb] = true
+					}
+				}
+				return ordered
+			}
 		}
-		if e.config.PaystackSecretKey != "" {
-			return RailPaystack
-		}
-		if e.config.YellowCardAPIKey != "" {
-			return RailYellowCard
-		}
-		return RailFlutterwave
 	}
-	return RailStripeConnect
+
+	var primary PayoutRail
+	if params.Rail != "" {
+		primary = params.Rail
+	} else if params.StripeAccountID != "" {
+		primary = RailStripeConnect
+	} else if params.MobileMoneyDetails != nil {
+		if e.config.FlutterwaveSecretKey != "" {
+			primary = RailFlutterwave
+		} else if cur == "KES" && strings.EqualFold(params.MobileMoneyDetails.Network, "MPESA") && e.config.MpesaDaraja != nil {
+			primary = RailMpesaDaraja
+		} else if e.config.PawaPayAPIToken != "" {
+			primary = RailPawaPay
+		} else if e.config.YellowCardAPIKey != "" {
+			primary = RailYellowCard
+		} else if e.config.PaystackSecretKey != "" {
+			primary = RailPaystack
+		} else {
+			primary = RailFlutterwave
+		}
+	} else if params.BankDetails != nil || africanCurrencies[cur] {
+		if e.config.FlutterwaveSecretKey != "" {
+			primary = RailFlutterwave
+		} else if e.config.PaystackSecretKey != "" {
+			primary = RailPaystack
+		} else if e.config.YellowCardAPIKey != "" {
+			primary = RailYellowCard
+		} else {
+			primary = RailFlutterwave
+		}
+	} else {
+		primary = RailStripeConnect
+	}
+
+	candidates := []PayoutRail{primary}
+	seen := map[PayoutRail]bool{primary: true}
+	for _, fb := range params.FallbackRails {
+		if fb != "" && !seen[fb] {
+			candidates = append(candidates, fb)
+			seen[fb] = true
+		}
+	}
+	return candidates
+}
+
+// ResolveRail determines the primary payment rail based on routing rules, parameters, or currency.
+func (e *Engine) ResolveRail(params DisburseParams) PayoutRail {
+	return e.ResolveRoute(params)[0]
 }
 
 func (e *Engine) disburseOnRail(ctx context.Context, rail PayoutRail, params DisburseParams) (*DisburseResult, error) {
+	pCtx, cancel := e.providerContext(ctx, rail)
+	defer cancel()
+
 	switch rail {
 	case RailStripeConnect:
-		return e.disburseStripe(ctx, params)
+		return e.disburseStripe(pCtx, params)
 	case RailFlutterwave:
-		return e.disburseFlutterwave(ctx, params)
+		return e.disburseFlutterwave(pCtx, params)
 	case RailPaystack:
-		return e.disbursePaystack(ctx, params)
+		return e.disbursePaystack(pCtx, params)
 	case RailPawaPay:
-		return e.disbursePawaPay(ctx, params)
+		return e.disbursePawaPay(pCtx, params)
 	case RailYellowCard:
-		return e.disburseYellowCard(ctx, params)
+		return e.disburseYellowCard(pCtx, params)
 	case RailMpesaDaraja:
-		return e.disburseMpesaDaraja(ctx, params)
+		return e.disburseMpesaDaraja(pCtx, params)
 	default:
 		return nil, fmt.Errorf("unsupported rail: %s", rail)
 	}
@@ -204,33 +382,118 @@ func (e *Engine) Disburse(params DisburseParams) (*DisburseResult, error) {
 	return e.DisburseContext(context.Background(), params)
 }
 
-// DisburseContext executes a disbursement with input validation, circuit-breaker skipping,
-// pre-flight float checks, and timeout-safe failover (preventing double payouts).
+// DisburseContext executes a disbursement with concurrent singleflight deduplication,
+// optional IdempotencyStore, smart routing, half-open circuit breakers, retry backoff, and safe failover.
 func (e *Engine) DisburseContext(ctx context.Context, params DisburseParams) (*DisburseResult, error) {
 	if err := validateDisburseInputs(params.Amount, params.Currency, params.Reference); err != nil {
 		return nil, err
 	}
+	refKey := strings.TrimSpace(params.Reference)
+	fingerprint := computeDisburseFingerprint(params)
 
-	primaryRail := e.ResolveRail(params)
-	candidates := []PayoutRail{primaryRail}
-	seen := map[PayoutRail]bool{primaryRail: true}
-	for _, fb := range params.FallbackRails {
-		if fb != "" && !seen[fb] {
-			candidates = append(candidates, fb)
-			seen[fb] = true
+	// 1. In-flight concurrent singleflight protection (stateless once settled)
+	e.inFlightMu.Lock()
+	if existingCall, ok := e.inFlight[refKey]; ok {
+		if existingCall.fingerprint != fingerprint {
+			e.inFlightMu.Unlock()
+			return nil, &ProviderError{
+				Rail:    e.ResolveRail(params),
+				Code:    ErrIdempotencyConflict,
+				Message: fmt.Sprintf("idempotency conflict: reference %q is already in flight with different parameters", refKey),
+			}
+		}
+		e.inFlightMu.Unlock()
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-existingCall.done:
+			return existingCall.res, existingCall.err
 		}
 	}
 
+	call := &inFlightCall{
+		fingerprint: fingerprint,
+		done:        make(chan struct{}),
+	}
+	e.inFlight[refKey] = call
+	e.inFlightMu.Unlock()
+
+	defer func() {
+		e.inFlightMu.Lock()
+		delete(e.inFlight, refKey)
+		close(call.done)
+		e.inFlightMu.Unlock()
+	}()
+
+	// 2. Optional pluggable persistence check (Redis / Postgres / InMemoryIdempotencyStore)
+	if e.config.IdempotencyStore != nil {
+		existing, err := e.config.IdempotencyStore.Get(ctx, refKey)
+		if err != nil {
+			call.err = err
+			return nil, err
+		}
+		if existing != nil {
+			if existing.Fingerprint != fingerprint {
+				cErr := &ProviderError{
+					Rail:    e.ResolveRail(params),
+					Code:    ErrIdempotencyConflict,
+					Message: fmt.Sprintf("idempotency conflict: reference %q was previously used with different parameters", refKey),
+				}
+				call.err = cErr
+				return nil, cErr
+			}
+			if existing.Result != nil {
+				call.res = existing.Result
+				return existing.Result, nil
+			}
+		}
+	}
+
+	res, err := e.executeDisbursePipeline(ctx, params, refKey, fingerprint)
+	call.res = res
+	call.err = err
+	return res, err
+}
+
+func (e *Engine) executeDisbursePipeline(ctx context.Context, params DisburseParams, refKey, fingerprint string) (*DisburseResult, error) {
+	candidates := e.ResolveRoute(params)
+	primaryRail := candidates[0]
 	var attempted []PayoutRail
 	var lastErr error
 	var lastFailed *DisburseResult
 	currency := strings.ToUpper(params.Currency)
+	idempTTL := e.config.IdempotencyTTL
+	if idempTTL <= 0 {
+		idempTTL = 24 * time.Hour
+	}
 
 	for i, rail := range candidates {
 		hasFallback := i < len(candidates)-1
 
-		if !e.health.isAvailable(rail) && hasFallback {
-			lastErr = fmt.Errorf("rail %s circuit breaker is open (unhealthy)", rail)
+		// Per-rail min/max transaction limit check
+		if lim, ok := e.config.RailLimits[rail]; ok {
+			if (lim.MinAmount > 0 && params.Amount < lim.MinAmount) || (lim.MaxAmount > 0 && params.Amount > lim.MaxAmount) {
+				limErr := &ProviderError{
+					Rail:    rail,
+					Code:    ErrLimitExceeded,
+					Message: fmt.Sprintf("amount %.2f %s is outside configured limits for %s", params.Amount, currency, rail),
+				}
+				lastErr = limErr
+				if hasFallback {
+					continue
+				}
+				return nil, limErr
+			}
+		}
+
+		// Circuit breaker check (CLOSED -> OPEN -> HALF_OPEN single recovery probe)
+		prevState := e.health.getHealth(rail).State
+		if !e.health.tryAcquire(rail) && hasFallback {
+			lastErr = &ProviderError{
+				Rail:    rail,
+				Code:    ErrProviderDown,
+				Message: fmt.Sprintf("rail %s circuit breaker is open (unhealthy)", rail),
+			}
 			continue
 		}
 
@@ -248,7 +511,11 @@ func (e *Engine) DisburseContext(ctx context.Context, params DisburseParams) (*D
 			insufficient := false
 			for _, b := range balances {
 				if b.Currency == currency && b.Available < params.Amount {
-					lastErr = fmt.Errorf("insufficient %s balance on %s: available %.2f, required %.2f", currency, rail, b.Available, params.Amount)
+					lastErr = &ProviderError{
+						Rail:    rail,
+						Code:    ErrInsufficientFloat,
+						Message: fmt.Sprintf("insufficient %s balance on %s: available %.2f, required %.2f", currency, rail, b.Available, params.Amount),
+					}
 					insufficient = true
 					break
 				}
@@ -262,13 +529,32 @@ func (e *Engine) DisburseContext(ctx context.Context, params DisburseParams) (*D
 		}
 
 		start := time.Now()
-		res, err := e.disburseOnRail(ctx, rail, params)
+		res, err := withRetry(ctx, e.config.Retry, func() (*DisburseResult, error) {
+			return e.disburseOnRail(ctx, rail, params)
+		}, func(retryErr *ProviderError, attempt int) {
+			e.emit(TelemetryEvent{
+				Type:      "disburse.retry",
+				Rail:      rail,
+				Reference: refKey,
+				ErrorCode: retryErr.Code,
+				Message:   fmt.Sprintf("retry attempt %d: %s", attempt, retryErr.Message),
+			})
+		})
 		latency := time.Since(start)
+
 		if err != nil {
 			e.health.recordFailure(rail, latency, err.Error())
+			if nextState := e.health.getHealth(rail).State; nextState != prevState {
+				e.emit(TelemetryEvent{Type: "circuit.state_change", Rail: rail, CircuitState: nextState})
+			}
+			errCode := ErrProvider
+			var provErr *ProviderError
+			if errors.As(err, &provErr) {
+				errCode = provErr.Code
+			}
+			e.emit(TelemetryEvent{Type: "disburse.failed", Rail: rail, Reference: refKey, LatencyMs: latency.Milliseconds(), ErrorCode: errCode, Message: err.Error()})
 			lastErr = err
 
-			var provErr *ProviderError
 			if errors.As(err, &provErr) && provErr.IsAmbiguous && !params.AllowUnsafeTimeoutFailover {
 				if referenceLookupRails[rail] {
 					reconciled, statusErr := e.GetPayoutStatusContext(ctx, PayoutStatusParams{
@@ -285,6 +571,9 @@ func (e *Engine) DisburseContext(ctx context.Context, params DisburseParams) (*D
 						if rail != primaryRail {
 							reconciled.FailoverFrom = primaryRail
 						}
+						if e.config.IdempotencyStore != nil && reconciled.Status != string(StatusFailed) {
+							_ = e.config.IdempotencyStore.Set(ctx, refKey, IdempotencyRecord{Fingerprint: fingerprint, Result: reconciled}, idempTTL)
+						}
 						return reconciled, nil
 					}
 					var lookupErr *ProviderError
@@ -298,6 +587,7 @@ func (e *Engine) DisburseContext(ctx context.Context, params DisburseParams) (*D
 				return nil, &AmbiguousPayoutError{
 					Rail:      rail,
 					Reference: params.Reference,
+					Code:      ErrAmbiguousTimeout,
 					Cause:     err.Error(),
 				}
 			}
@@ -310,6 +600,10 @@ func (e *Engine) DisburseContext(ctx context.Context, params DisburseParams) (*D
 
 		if res.Status == string(StatusFailed) {
 			e.health.recordFailure(rail, latency, res.Error)
+			if nextState := e.health.getHealth(rail).State; nextState != prevState {
+				e.emit(TelemetryEvent{Type: "circuit.state_change", Rail: rail, CircuitState: nextState})
+			}
+			e.emit(TelemetryEvent{Type: "disburse.failed", Rail: rail, Reference: refKey, LatencyMs: latency.Milliseconds(), Message: res.Error})
 			if hasFallback {
 				lastFailed = res
 				lastErr = fmt.Errorf("%s disbursement returned FAILED: %s", rail, res.Error)
@@ -317,11 +611,20 @@ func (e *Engine) DisburseContext(ctx context.Context, params DisburseParams) (*D
 			}
 		} else {
 			e.health.recordSuccess(rail, latency)
+			if nextState := e.health.getHealth(rail).State; nextState != prevState {
+				e.emit(TelemetryEvent{Type: "circuit.state_change", Rail: rail, CircuitState: nextState})
+			}
 		}
 
 		res.AttemptedRails = attempted
 		if rail != primaryRail {
 			res.FailoverFrom = primaryRail
+			e.emit(TelemetryEvent{Type: "disburse.failover", Rail: rail, FailoverFrom: primaryRail, Reference: refKey, LatencyMs: latency.Milliseconds()})
+		}
+		e.emit(TelemetryEvent{Type: "disburse.success", Rail: rail, Reference: refKey, LatencyMs: latency.Milliseconds()})
+
+		if e.config.IdempotencyStore != nil && res.Status != string(StatusFailed) {
+			_ = e.config.IdempotencyStore.Set(ctx, refKey, IdempotencyRecord{Fingerprint: fingerprint, Result: res}, idempTTL)
 		}
 		return res, nil
 	}
@@ -331,6 +634,122 @@ func (e *Engine) DisburseContext(ctx context.Context, params DisburseParams) (*D
 		return lastFailed, nil
 	}
 	return nil, lastErr
+}
+
+// WaitForSettlement polls GetPayoutStatusContext with configurable exponential backoff
+// until the payout reaches SUCCESSFUL or FAILED, or returns ErrReconciliationTimeout.
+func (e *Engine) WaitForSettlement(ctx context.Context, params PayoutStatusParams, opts *ReconcileOptions) (*DisburseResult, error) {
+	maxAttempts := 10
+	interval := 2 * time.Second
+	multiplier := 1.5
+	maxInterval := 15 * time.Second
+	if opts != nil {
+		if opts.MaxAttempts > 0 {
+			maxAttempts = opts.MaxAttempts
+		}
+		if opts.Interval > 0 {
+			interval = opts.Interval
+		}
+		if opts.BackoffMultiplier > 0 {
+			multiplier = opts.BackoffMultiplier
+		}
+		if opts.MaxInterval > 0 {
+			maxInterval = opts.MaxInterval
+		}
+	}
+
+	delay := interval
+	for attempt := 1; attempt <= maxAttempts; attempt++ {
+		res, err := e.GetPayoutStatusContext(ctx, params)
+		if err != nil {
+			return nil, err
+		}
+		if res.Status == string(StatusSuccessful) || res.Status == string(StatusFailed) {
+			return res, nil
+		}
+		if attempt < maxAttempts {
+			timer := time.NewTimer(delay)
+			select {
+			case <-ctx.Done():
+				timer.Stop()
+				return nil, ctx.Err()
+			case <-timer.C:
+			}
+			next := time.Duration(float64(delay) * multiplier)
+			if next > maxInterval {
+				next = maxInterval
+			}
+			delay = next
+		}
+	}
+
+	return nil, &ProviderError{
+		Rail:      params.Rail,
+		Code:      ErrReconciliationTimeout,
+		Message:   fmt.Sprintf("payout %q on %s remained PENDING after %d reconciliation attempts", params.TransactionID, params.Rail, maxAttempts),
+		Retryable: true,
+	}
+}
+
+// CreateConnectOnboardingLink generates a hosted Stripe Connect Express onboarding URL using context.Background().
+func (e *Engine) CreateConnectOnboardingLink(params OnboardingLinkParams) (*OnboardingLinkResult, error) {
+	return e.CreateConnectOnboardingLinkContext(context.Background(), params)
+}
+
+// CreateConnectOnboardingLinkContext generates a hosted Stripe Connect Express onboarding URL.
+func (e *Engine) CreateConnectOnboardingLinkContext(ctx context.Context, params OnboardingLinkParams) (*OnboardingLinkResult, error) {
+	if e.config.StripeSecretKey == "" {
+		return nil, fmt.Errorf("stripe secret key is not configured")
+	}
+	pCtx, cancel := e.providerContext(ctx, RailStripeConnect)
+	defer cancel()
+
+	linkType := params.Type
+	if linkType == "" {
+		linkType = "account_onboarding"
+	}
+	form := url.Values{}
+	form.Set("account", params.AccountID)
+	form.Set("refresh_url", params.RefreshURL)
+	form.Set("return_url", params.ReturnURL)
+	form.Set("type", linkType)
+
+	req, err := http.NewRequestWithContext(pCtx, "POST", "https://api.stripe.com/v1/account_links", strings.NewReader(form.Encode()))
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Authorization", "Bearer "+e.config.StripeSecretKey)
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+
+	resp, err := e.httpClient.Do(req)
+	if err != nil {
+		return nil, newProviderError(RailStripeConnect, 0, err.Error(), false)
+	}
+	defer resp.Body.Close()
+
+	bodyBytes, _ := io.ReadAll(resp.Body)
+	var data struct {
+		URL       string `json:"url"`
+		ExpiresAt int64  `json:"expires_at"`
+		Error     *struct {
+			Message string `json:"message"`
+		} `json:"error"`
+	}
+	_ = json.Unmarshal(bodyBytes, &data)
+	if resp.StatusCode >= 400 || data.Error != nil {
+		msg := "stripe onboarding link failed"
+		if data.Error != nil && data.Error.Message != "" {
+			msg = data.Error.Message
+		}
+		return nil, newProviderError(RailStripeConnect, resp.StatusCode, msg, false)
+	}
+
+	var exp *time.Time
+	if data.ExpiresAt > 0 {
+		t := time.Unix(data.ExpiresAt, 0).UTC()
+		exp = &t
+	}
+	return &OnboardingLinkResult{URL: data.URL, ExpiresAt: exp}, nil
 }
 
 func (e *Engine) disburseStripe(ctx context.Context, params DisburseParams) (*DisburseResult, error) {
@@ -363,7 +782,7 @@ func (e *Engine) disburseStripe(ctx context.Context, params DisburseParams) (*Di
 
 	resp, err := e.httpClient.Do(req)
 	if err != nil {
-		return nil, &ProviderError{Rail: RailStripeConnect, Message: err.Error(), IsAmbiguous: true}
+		return nil, newProviderError(RailStripeConnect, 0, err.Error(), true)
 	}
 	defer resp.Body.Close()
 
@@ -383,12 +802,7 @@ func (e *Engine) disburseStripe(ctx context.Context, params DisburseParams) (*Di
 		if stripeResp.Error != nil && stripeResp.Error.Message != "" {
 			msg = stripeResp.Error.Message
 		}
-		return nil, &ProviderError{
-			Rail:        RailStripeConnect,
-			StatusCode:  resp.StatusCode,
-			Message:     msg,
-			IsAmbiguous: isHTTPStatusAmbiguous(resp.StatusCode),
-		}
+		return nil, newProviderError(RailStripeConnect, resp.StatusCode, msg, isHTTPStatusAmbiguous(resp.StatusCode))
 	}
 
 	txID := stripeResp.ID
@@ -414,7 +828,7 @@ func (e *Engine) disburseStripe(ctx context.Context, params DisburseParams) (*Di
 
 		pResp, pErr := e.httpClient.Do(payoutReq)
 		if pErr != nil {
-			return nil, &ProviderError{Rail: RailStripeConnect, Message: pErr.Error(), IsAmbiguous: true}
+			return nil, newProviderError(RailStripeConnect, 0, pErr.Error(), true)
 		}
 		defer pResp.Body.Close()
 
@@ -434,12 +848,7 @@ func (e *Engine) disburseStripe(ctx context.Context, params DisburseParams) (*Di
 			if pData.Error != nil && pData.Error.Message != "" {
 				msg = pData.Error.Message
 			}
-			return nil, &ProviderError{
-				Rail:        RailStripeConnect,
-				StatusCode:  pResp.StatusCode,
-				Message:     msg,
-				IsAmbiguous: isHTTPStatusAmbiguous(pResp.StatusCode),
-			}
+			return nil, newProviderError(RailStripeConnect, pResp.StatusCode, msg, isHTTPStatusAmbiguous(pResp.StatusCode))
 		}
 
 		if pData.ID != "" {
@@ -510,7 +919,7 @@ func (e *Engine) disburseFlutterwave(ctx context.Context, params DisburseParams)
 
 	resp, err := e.httpClient.Do(req)
 	if err != nil {
-		return nil, &ProviderError{Rail: RailFlutterwave, Message: err.Error(), IsAmbiguous: true}
+		return nil, newProviderError(RailFlutterwave, 0, err.Error(), true)
 	}
 	defer resp.Body.Close()
 
@@ -533,12 +942,7 @@ func (e *Engine) disburseFlutterwave(ctx context.Context, params DisburseParams)
 		if status < 400 {
 			status = 400
 		}
-		return nil, &ProviderError{
-			Rail:        RailFlutterwave,
-			StatusCode:  status,
-			Message:     "flutterwave transfer error: " + flwResp.Message,
-			IsAmbiguous: resp.StatusCode >= 500 && isHTTPStatusAmbiguous(resp.StatusCode),
-		}
+		return nil, newProviderError(RailFlutterwave, status, "flutterwave transfer error: "+flwResp.Message, resp.StatusCode >= 500 && isHTTPStatusAmbiguous(resp.StatusCode))
 	}
 
 	txID := params.Reference
@@ -574,7 +978,7 @@ func (e *Engine) disburseFlutterwave(ctx context.Context, params DisburseParams)
 		ProviderStatus: providerStatus,
 		Rail:           RailFlutterwave,
 		Amount:         params.Amount,
-		Currency:       strings.ToUpper(params.Currency),
+		Currency:       currency,
 		Fee:            fee,
 		Error:          errMsg,
 	}, nil
@@ -591,22 +995,27 @@ func (e *Engine) GetPayoutStatusContext(ctx context.Context, params PayoutStatus
 		return nil, fmt.Errorf("transactionId is required to check payout status")
 	}
 
-	switch params.Rail {
-	case RailStripeConnect:
-		return e.getStripePayoutStatus(ctx, params)
-	case RailFlutterwave:
-		return e.getFlutterwavePayoutStatus(ctx, params)
-	case RailPaystack:
-		return e.getPaystackPayoutStatus(ctx, params)
-	case RailPawaPay:
-		return e.getPawaPayPayoutStatus(ctx, params)
-	case RailYellowCard:
-		return e.getYellowCardPayoutStatus(ctx, params)
-	case RailMpesaDaraja:
-		return e.getMpesaDarajaPayoutStatus(ctx, params)
-	default:
-		return nil, fmt.Errorf("unsupported rail: %s", params.Rail)
-	}
+	return withRetry(ctx, e.config.Retry, func() (*DisburseResult, error) {
+		pCtx, cancel := e.providerContext(ctx, params.Rail)
+		defer cancel()
+
+		switch params.Rail {
+		case RailStripeConnect:
+			return e.getStripePayoutStatus(pCtx, params)
+		case RailFlutterwave:
+			return e.getFlutterwavePayoutStatus(pCtx, params)
+		case RailPaystack:
+			return e.getPaystackPayoutStatus(pCtx, params)
+		case RailPawaPay:
+			return e.getPawaPayPayoutStatus(pCtx, params)
+		case RailYellowCard:
+			return e.getYellowCardPayoutStatus(pCtx, params)
+		case RailMpesaDaraja:
+			return e.getMpesaDarajaPayoutStatus(pCtx, params)
+		default:
+			return nil, fmt.Errorf("unsupported rail: %s", params.Rail)
+		}
+	}, nil)
 }
 
 func (e *Engine) getStripePayoutStatus(ctx context.Context, params PayoutStatusParams) (*DisburseResult, error) {
@@ -637,7 +1046,9 @@ func (e *Engine) getStripePayoutStatus(ctx context.Context, params PayoutStatusP
 
 	resp, err := e.httpClient.Do(req)
 	if err != nil {
-		return nil, err
+		pErr := newProviderError(RailStripeConnect, 0, err.Error(), false)
+		pErr.Retryable = true
+		return nil, pErr
 	}
 	defer resp.Body.Close()
 
@@ -660,7 +1071,7 @@ func (e *Engine) getStripePayoutStatus(ctx context.Context, params PayoutStatusP
 		if data.Error != nil && data.Error.Message != "" {
 			msg = data.Error.Message
 		}
-		return nil, &ProviderError{Rail: RailStripeConnect, StatusCode: resp.StatusCode, Message: msg}
+		return nil, newProviderError(RailStripeConnect, resp.StatusCode, msg, false)
 	}
 
 	status := normalizeStripeStatus(data.Status, defaultStatus)
@@ -720,7 +1131,9 @@ func (e *Engine) getFlutterwavePayoutStatus(ctx context.Context, params PayoutSt
 
 	resp, err := e.httpClient.Do(req)
 	if err != nil {
-		return nil, err
+		pErr := newProviderError(RailFlutterwave, 0, err.Error(), false)
+		pErr.Retryable = true
+		return nil, pErr
 	}
 	defer resp.Body.Close()
 
@@ -741,11 +1154,7 @@ func (e *Engine) getFlutterwavePayoutStatus(ctx context.Context, params PayoutSt
 	_ = json.Unmarshal(bodyBytes, &flwResp)
 
 	if resp.StatusCode >= 400 || flwResp.Status == "error" {
-		return nil, &ProviderError{
-			Rail:       RailFlutterwave,
-			StatusCode: resp.StatusCode,
-			Message:    "flutterwave status lookup error: " + flwResp.Message,
-		}
+		return nil, newProviderError(RailFlutterwave, resp.StatusCode, "flutterwave status lookup error: "+flwResp.Message, false)
 	}
 
 	txID := params.TransactionID
@@ -849,7 +1258,7 @@ func (e *Engine) resolveFlutterwaveBankAccount(ctx context.Context, bankCode, ac
 	_ = json.Unmarshal(bodyBytes, &res)
 
 	if resp.StatusCode >= 400 || res.Status == "error" {
-		return nil, fmt.Errorf("account resolution failed: %s", res.Message)
+		return nil, newProviderError(RailFlutterwave, resp.StatusCode, "account resolution failed: "+res.Message, false)
 	}
 
 	return &BankResolutionResult{
@@ -887,7 +1296,7 @@ func (e *Engine) resolvePaystackBankAccount(ctx context.Context, bankCode, accou
 	}
 	_ = json.Unmarshal(bodyBytes, &res)
 	if resp.StatusCode >= 400 || !res.Status {
-		return nil, fmt.Errorf("paystack account resolution failed: %s", res.Message)
+		return nil, newProviderError(RailPaystack, resp.StatusCode, "paystack account resolution failed: "+res.Message, false)
 	}
 	accNum := res.Data.AccountNumber
 	if accNum == "" {
@@ -954,7 +1363,9 @@ func (e *Engine) disbursePaystack(ctx context.Context, params DisburseParams) (*
 
 	recResp, err := e.httpClient.Do(recReq)
 	if err != nil {
-		return nil, &ProviderError{Rail: RailPaystack, Message: err.Error(), IsAmbiguous: false}
+		pErr := newProviderError(RailPaystack, 0, err.Error(), false)
+		pErr.Retryable = true
+		return nil, pErr
 	}
 	defer recResp.Body.Close()
 
@@ -968,12 +1379,11 @@ func (e *Engine) disbursePaystack(ctx context.Context, params DisburseParams) (*
 	}
 	_ = json.Unmarshal(recBody, &recData)
 	if recResp.StatusCode >= 400 || !recData.Status || recData.Data == nil || recData.Data.RecipientCode == "" {
-		return nil, &ProviderError{
-			Rail:        RailPaystack,
-			StatusCode:  recResp.StatusCode,
-			Message:     "paystack recipient error: " + recData.Message,
-			IsAmbiguous: false,
+		st := recResp.StatusCode
+		if st < 400 {
+			st = 400
 		}
+		return nil, newProviderError(RailPaystack, st, "paystack recipient error: "+recData.Message, false)
 	}
 
 	reason := params.Narration
@@ -998,7 +1408,7 @@ func (e *Engine) disbursePaystack(ctx context.Context, params DisburseParams) (*
 
 	txResp, err := e.httpClient.Do(txReq)
 	if err != nil {
-		return nil, &ProviderError{Rail: RailPaystack, Message: err.Error(), IsAmbiguous: true}
+		return nil, newProviderError(RailPaystack, 0, err.Error(), true)
 	}
 	defer txResp.Body.Close()
 
@@ -1020,12 +1430,7 @@ func (e *Engine) disbursePaystack(ctx context.Context, params DisburseParams) (*
 		if st < 400 {
 			st = 400
 		}
-		return nil, &ProviderError{
-			Rail:        RailPaystack,
-			StatusCode:  st,
-			Message:     "paystack transfer error: " + psResp.Message,
-			IsAmbiguous: txResp.StatusCode >= 500 && isHTTPStatusAmbiguous(txResp.StatusCode),
-		}
+		return nil, newProviderError(RailPaystack, st, "paystack transfer error: "+psResp.Message, txResp.StatusCode >= 500 && isHTTPStatusAmbiguous(txResp.StatusCode))
 	}
 
 	txID := params.Reference
@@ -1094,7 +1499,9 @@ func (e *Engine) getPaystackPayoutStatus(ctx context.Context, params PayoutStatu
 
 	resp, err := e.httpClient.Do(req)
 	if err != nil {
-		return nil, err
+		pErr := newProviderError(RailPaystack, 0, err.Error(), false)
+		pErr.Retryable = true
+		return nil, pErr
 	}
 	defer resp.Body.Close()
 
@@ -1108,17 +1515,14 @@ func (e *Engine) getPaystackPayoutStatus(ctx context.Context, params PayoutStatu
 			Reference    string `json:"reference"`
 			Status       string `json:"status"`
 			Amount       int64  `json:"amount"`
+			Fee          int64  `json:"fee"`
 			Currency     string `json:"currency"`
 			Failures     string `json:"failures"`
 		} `json:"data"`
 	}
 	_ = json.Unmarshal(bodyBytes, &psResp)
 	if resp.StatusCode >= 400 || !psResp.Status {
-		return nil, &ProviderError{
-			Rail:       RailPaystack,
-			StatusCode: resp.StatusCode,
-			Message:    "paystack status lookup error: " + psResp.Message,
-		}
+		return nil, newProviderError(RailPaystack, resp.StatusCode, "paystack status lookup error: "+psResp.Message, false)
 	}
 
 	txID := params.TransactionID
@@ -1127,6 +1531,7 @@ func (e *Engine) getPaystackPayoutStatus(ctx context.Context, params PayoutStatu
 		ref = params.TransactionID
 	}
 	amount := 0.0
+	fee := 0.0
 	currency := "NGN"
 	providerStatus := ""
 	status := string(StatusPending)
@@ -1144,6 +1549,7 @@ func (e *Engine) getPaystackPayoutStatus(ctx context.Context, params PayoutStatu
 			currency = strings.ToUpper(psResp.Data.Currency)
 		}
 		amount = fromMinorUnits(psResp.Data.Amount, currency)
+		fee = fromMinorUnits(psResp.Data.Fee, currency)
 		providerStatus = psResp.Data.Status
 		status = normalizePaystackStatus(psResp.Data.Status)
 		if status == string(StatusFailed) {
@@ -1164,8 +1570,55 @@ func (e *Engine) getPaystackPayoutStatus(ctx context.Context, params PayoutStatu
 		Rail:           RailPaystack,
 		Amount:         amount,
 		Currency:       currency,
+		Fee:            fee,
 		Error:          errMsg,
 	}, nil
+}
+
+func (e *Engine) fetchSingleRailBalance(ctx context.Context, rail PayoutRail) ([]RailBalance, error) {
+	if e.config.BalanceCacheTTL > 0 {
+		e.balCacheMu.RLock()
+		if cached, ok := e.balCache[rail]; ok && time.Now().Before(cached.expiresAt) {
+			e.balCacheMu.RUnlock()
+			return cached.balances, nil
+		}
+		e.balCacheMu.RUnlock()
+	}
+
+	balances, err := withRetry(ctx, e.config.Retry, func() ([]RailBalance, error) {
+		pCtx, cancel := e.providerContext(ctx, rail)
+		defer cancel()
+
+		switch rail {
+		case RailStripeConnect:
+			return e.getStripeBalances(pCtx)
+		case RailFlutterwave:
+			return e.getFlutterwaveBalances(pCtx)
+		case RailPaystack:
+			return e.getPaystackBalances(pCtx)
+		case RailPawaPay:
+			return e.getPawaPayBalances(pCtx)
+		case RailYellowCard:
+			return e.getYellowCardBalances(pCtx)
+		case RailMpesaDaraja:
+			return e.getMpesaDarajaBalances(pCtx)
+		default:
+			return nil, fmt.Errorf("unsupported rail: %s", rail)
+		}
+	}, nil)
+	if err != nil {
+		return nil, err
+	}
+
+	if e.config.BalanceCacheTTL > 0 {
+		e.balCacheMu.Lock()
+		e.balCache[rail] = cachedBalances{
+			balances:  balances,
+			expiresAt: time.Now().Add(e.config.BalanceCacheTTL),
+		}
+		e.balCacheMu.Unlock()
+	}
+	return balances, nil
 }
 
 // GetBalances queries available float balances using context.Background().
@@ -1173,69 +1626,39 @@ func (e *Engine) GetBalances(rail PayoutRail) ([]RailBalance, error) {
 	return e.GetBalancesContext(context.Background(), rail)
 }
 
-// GetBalancesContext queries available float balances for a specific rail, or all configured rails when rail is empty.
+// GetBalancesContext queries available float balances for a specific rail, or concurrently across all configured rails when rail is empty.
 func (e *Engine) GetBalancesContext(ctx context.Context, rail PayoutRail) ([]RailBalance, error) {
 	if rail != "" {
-		switch rail {
-		case RailStripeConnect:
-			return e.getStripeBalances(ctx)
-		case RailFlutterwave:
-			return e.getFlutterwaveBalances(ctx)
-		case RailPaystack:
-			return e.getPaystackBalances(ctx)
-		case RailPawaPay:
-			return e.getPawaPayBalances(ctx)
-		case RailYellowCard:
-			return e.getYellowCardBalances(ctx)
-		case RailMpesaDaraja:
-			return e.getMpesaDarajaBalances(ctx)
-		default:
-			return nil, fmt.Errorf("unsupported rail: %s", rail)
-		}
+		return e.fetchSingleRailBalance(ctx, rail)
 	}
 
+	configured := e.getConfiguredRails()
+	if len(configured) == 0 {
+		return nil, nil
+	}
+
+	type railRes struct {
+		balances []RailBalance
+		err      error
+	}
+	results := make([]railRes, len(configured))
+	var wg sync.WaitGroup
+	for i, r := range configured {
+		wg.Add(1)
+		go func(idx int, target PayoutRail) {
+			defer wg.Done()
+			b, err := e.fetchSingleRailBalance(ctx, target)
+			results[idx] = railRes{balances: b, err: err}
+		}(i, r)
+	}
+	wg.Wait()
+
 	var all []RailBalance
-	if e.config.StripeSecretKey != "" {
-		b, err := e.getStripeBalances(ctx)
-		if err != nil {
-			return nil, err
+	for _, r := range results {
+		if r.err != nil {
+			return nil, r.err
 		}
-		all = append(all, b...)
-	}
-	if e.config.FlutterwaveSecretKey != "" {
-		b, err := e.getFlutterwaveBalances(ctx)
-		if err != nil {
-			return nil, err
-		}
-		all = append(all, b...)
-	}
-	if e.config.PaystackSecretKey != "" {
-		b, err := e.getPaystackBalances(ctx)
-		if err != nil {
-			return nil, err
-		}
-		all = append(all, b...)
-	}
-	if e.config.PawaPayAPIToken != "" {
-		b, err := e.getPawaPayBalances(ctx)
-		if err != nil {
-			return nil, err
-		}
-		all = append(all, b...)
-	}
-	if e.config.YellowCardAPIKey != "" && e.config.YellowCardSecretKey != "" {
-		b, err := e.getYellowCardBalances(ctx)
-		if err != nil {
-			return nil, err
-		}
-		all = append(all, b...)
-	}
-	if e.config.MpesaDaraja != nil && e.config.MpesaDaraja.ConsumerKey != "" {
-		b, err := e.getMpesaDarajaBalances(ctx)
-		if err != nil {
-			return nil, err
-		}
-		all = append(all, b...)
+		all = append(all, r.balances...)
 	}
 	return all, nil
 }
@@ -1252,7 +1675,9 @@ func (e *Engine) getStripeBalances(ctx context.Context) ([]RailBalance, error) {
 
 	resp, err := e.httpClient.Do(req)
 	if err != nil {
-		return nil, err
+		pErr := newProviderError(RailStripeConnect, 0, err.Error(), false)
+		pErr.Retryable = true
+		return nil, pErr
 	}
 	defer resp.Body.Close()
 
@@ -1276,7 +1701,7 @@ func (e *Engine) getStripeBalances(ctx context.Context) ([]RailBalance, error) {
 		if data.Error != nil && data.Error.Message != "" {
 			msg = data.Error.Message
 		}
-		return nil, fmt.Errorf("%s", msg)
+		return nil, newProviderError(RailStripeConnect, resp.StatusCode, msg, false)
 	}
 
 	byCurrency := map[string]*RailBalance{}
@@ -1323,7 +1748,9 @@ func (e *Engine) getFlutterwaveBalances(ctx context.Context) ([]RailBalance, err
 
 	resp, err := e.httpClient.Do(req)
 	if err != nil {
-		return nil, err
+		pErr := newProviderError(RailFlutterwave, 0, err.Error(), false)
+		pErr.Retryable = true
+		return nil, pErr
 	}
 	defer resp.Body.Close()
 
@@ -1339,7 +1766,7 @@ func (e *Engine) getFlutterwaveBalances(ctx context.Context) ([]RailBalance, err
 	}
 	_ = json.Unmarshal(bodyBytes, &flwResp)
 	if resp.StatusCode >= 400 || flwResp.Status == "error" {
-		return nil, fmt.Errorf("flutterwave balance error: %s", flwResp.Message)
+		return nil, newProviderError(RailFlutterwave, resp.StatusCode, "flutterwave balance error: "+flwResp.Message, false)
 	}
 
 	out := make([]RailBalance, 0, len(flwResp.Data))
@@ -1370,7 +1797,9 @@ func (e *Engine) getPaystackBalances(ctx context.Context) ([]RailBalance, error)
 
 	resp, err := e.httpClient.Do(req)
 	if err != nil {
-		return nil, err
+		pErr := newProviderError(RailPaystack, 0, err.Error(), false)
+		pErr.Retryable = true
+		return nil, pErr
 	}
 	defer resp.Body.Close()
 
@@ -1385,7 +1814,7 @@ func (e *Engine) getPaystackBalances(ctx context.Context) ([]RailBalance, error)
 	}
 	_ = json.Unmarshal(bodyBytes, &psResp)
 	if resp.StatusCode >= 400 || !psResp.Status {
-		return nil, fmt.Errorf("paystack balance error: %s", psResp.Message)
+		return nil, newProviderError(RailPaystack, resp.StatusCode, "paystack balance error: "+psResp.Message, false)
 	}
 
 	out := make([]RailBalance, 0, len(psResp.Data))
@@ -1400,8 +1829,7 @@ func (e *Engine) getPaystackBalances(ctx context.Context) ([]RailBalance, error)
 	return out, nil
 }
 
-// VerifyWebhook validates a provider webhook signature and normalizes the event.
-func (e *Engine) VerifyWebhook(rail PayoutRail, rawBody []byte, signature string) (*WebhookEvent, error) {
+func (e *Engine) verifyWebhookRaw(rail PayoutRail, rawBody []byte, signature string) (*WebhookEvent, error) {
 	switch rail {
 	case RailStripeConnect:
 		return e.verifyStripeWebhook(rawBody, signature)
@@ -1420,13 +1848,62 @@ func (e *Engine) VerifyWebhook(rail PayoutRail, rawBody []byte, signature string
 	}
 }
 
-// VerifyAndConfirmWebhook verifies a webhook signature, guards against out-of-order regressions,
-// and confirms the authoritative payout state & amount directly against the provider API.
-func (e *Engine) VerifyAndConfirmWebhook(ctx context.Context, rail PayoutRail, rawBody []byte, signature, currentStatus, stripeAccountID string) (*WebhookEvent, error) {
-	ev, err := e.VerifyWebhook(rail, rawBody, signature)
+// VerifyWebhook validates a provider webhook signature and checks optional duplicate detection using context.Background().
+func (e *Engine) VerifyWebhook(rail PayoutRail, rawBody []byte, signature string) (*WebhookEvent, error) {
+	return e.VerifyWebhookContext(context.Background(), rail, rawBody, signature)
+}
+
+// VerifyWebhookContext validates a provider webhook signature, normalizes the event, and checks WebhookStore if configured.
+func (e *Engine) VerifyWebhookContext(ctx context.Context, rail PayoutRail, rawBody []byte, signature string) (*WebhookEvent, error) {
+	ev, err := e.verifyWebhookRaw(rail, rawBody, signature)
 	if err != nil {
 		return nil, err
 	}
+
+	if e.config.WebhookStore != nil {
+		keyID := ev.TransactionID
+		if keyID == "" {
+			keyID = ev.Reference
+		}
+		eventKey := fmt.Sprintf("%s:%s:%s:%s", rail, ev.EventType, keyID, ev.Status)
+		seen, sErr := e.config.WebhookStore.HasSeen(ctx, eventKey)
+		if sErr != nil {
+			return nil, sErr
+		}
+		if seen {
+			e.emit(TelemetryEvent{Type: "webhook.duplicate", Rail: rail, Reference: ev.Reference})
+			if e.config.WebhookDeduplication != nil && e.config.WebhookDeduplication.RejectDuplicates {
+				return nil, &ProviderError{
+					Rail:    rail,
+					Code:    ErrDuplicateWebhook,
+					Message: fmt.Sprintf("duplicate webhook event detected on %s for %q", rail, ev.Reference),
+				}
+			}
+			ev.Duplicate = true
+			return ev, nil
+		}
+		ttl := 24 * time.Hour
+		if e.config.WebhookDeduplication != nil && e.config.WebhookDeduplication.TTL > 0 {
+			ttl = e.config.WebhookDeduplication.TTL
+		}
+		_ = e.config.WebhookStore.MarkSeen(ctx, eventKey, ttl)
+	}
+
+	e.emit(TelemetryEvent{Type: "webhook.verified", Rail: rail, Reference: ev.Reference})
+	return ev, nil
+}
+
+// VerifyAndConfirmWebhook verifies a webhook signature, guards against duplicates and out-of-order regressions,
+// and confirms the authoritative payout state & amount directly against the provider API.
+func (e *Engine) VerifyAndConfirmWebhook(ctx context.Context, rail PayoutRail, rawBody []byte, signature, currentStatus, stripeAccountID string) (*WebhookEvent, error) {
+	ev, err := e.VerifyWebhookContext(ctx, rail, rawBody, signature)
+	if err != nil {
+		return nil, err
+	}
+	if ev.Duplicate {
+		return ev, nil
+	}
+
 	isReversal := strings.Contains(strings.ToLower(ev.EventType), "reversed")
 	if currentStatus != "" && !CanTransitionStatus(currentStatus, ev.Status, isReversal) {
 		ev.Status = currentStatus
@@ -1505,12 +1982,12 @@ func (e *Engine) verifyStripeWebhook(rawBody []byte, signatureHeader string) (*W
 		}
 	}
 	if timestamp == "" || v1 == "" {
-		return nil, fmt.Errorf("invalid Stripe-Signature header format")
+		return nil, &ProviderError{Rail: RailStripeConnect, Code: ErrWebhookSignature, Message: "invalid Stripe-Signature header format"}
 	}
 
 	tsSec, err := strconv.ParseInt(timestamp, 10, 64)
 	if err != nil || tsSec <= 0 {
-		return nil, fmt.Errorf("invalid stripe webhook timestamp")
+		return nil, &ProviderError{Rail: RailStripeConnect, Code: ErrWebhookSignature, Message: "invalid stripe webhook timestamp"}
 	}
 	tolerance := e.config.StripeWebhookTolerance
 	if tolerance <= 0 {
@@ -1518,7 +1995,7 @@ func (e *Engine) verifyStripeWebhook(rawBody []byte, signatureHeader string) (*W
 	}
 	diff := math.Abs(float64(time.Now().Unix() - tsSec))
 	if diff > tolerance.Seconds() {
-		return nil, fmt.Errorf("stripe webhook timestamp outside tolerance window (possible replay attack)")
+		return nil, &ProviderError{Rail: RailStripeConnect, Code: ErrWebhookSignature, Message: "stripe webhook timestamp outside tolerance window (possible replay attack)"}
 	}
 
 	mac := hmac.New(sha256.New, []byte(e.config.StripeWebhookSecret))
@@ -1526,7 +2003,7 @@ func (e *Engine) verifyStripeWebhook(rawBody []byte, signatureHeader string) (*W
 	mac.Write(rawBody)
 	expected := hex.EncodeToString(mac.Sum(nil))
 	if !constantTimeHexEqual(v1, expected) {
-		return nil, fmt.Errorf("invalid stripe webhook signature")
+		return nil, &ProviderError{Rail: RailStripeConnect, Code: ErrWebhookSignature, Message: "invalid stripe webhook signature"}
 	}
 
 	var payload struct {
@@ -1536,6 +2013,7 @@ func (e *Engine) verifyStripeWebhook(rawBody []byte, signatureHeader string) (*W
 				ID             string            `json:"id"`
 				Status         string            `json:"status"`
 				Amount         int64             `json:"amount"`
+				Fee            int64             `json:"fee"`
 				Currency       string            `json:"currency"`
 				FailureMessage string            `json:"failure_message"`
 				Metadata       map[string]string `json:"metadata"`
@@ -1580,6 +2058,7 @@ func (e *Engine) verifyStripeWebhook(rawBody []byte, signatureHeader string) (*W
 		ProviderStatus: obj.Status,
 		Amount:         fromMinorUnits(obj.Amount, cur),
 		Currency:       cur,
+		Fee:            fromMinorUnits(obj.Fee, cur),
 		Error:          errMsg,
 	}, nil
 }
@@ -1589,7 +2068,7 @@ func (e *Engine) verifyFlutterwaveWebhook(rawBody []byte, verifHash string) (*We
 		return nil, fmt.Errorf("flutterwave webhookSecret is required to verify webhooks")
 	}
 	if verifHash == "" || subtle.ConstantTimeCompare([]byte(verifHash), []byte(e.config.FlutterwaveWebhookSecret)) != 1 {
-		return nil, fmt.Errorf("invalid flutterwave webhook signature")
+		return nil, &ProviderError{Rail: RailFlutterwave, Code: ErrWebhookSignature, Message: "invalid flutterwave webhook signature"}
 	}
 
 	var payload struct {
@@ -1645,7 +2124,7 @@ func (e *Engine) verifyPaystackWebhook(rawBody []byte, signature string) (*Webho
 	mac.Write(rawBody)
 	expected := hex.EncodeToString(mac.Sum(nil))
 	if !constantTimeHexEqual(signature, expected) {
-		return nil, fmt.Errorf("invalid paystack webhook signature")
+		return nil, &ProviderError{Rail: RailPaystack, Code: ErrWebhookSignature, Message: "invalid paystack webhook signature"}
 	}
 
 	var payload struct {
