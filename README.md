@@ -57,8 +57,12 @@ import (
 
 func main() {
 	engine := omnipayout.NewEngine(omnipayout.Config{
-		StripeSecretKey:      "sk_live_...",
-		FlutterwaveSecretKey: "FLWSECK_...",
+		StripeSecretKey:          "sk_live_...",
+		StripeWebhookSecret:      "whsec_...",
+		FlutterwaveSecretKey:     "FLWSECK_...",
+		FlutterwaveWebhookSecret: "flw_verif_hash...",
+		PaystackSecretKey:        "sk_live_paystack_...",
+		PaystackWebhookSecret:    "ps_webhook_secret...",
 	})
 
 	// 1. Disburse to a US Courier (Stripe Connect)
@@ -75,11 +79,14 @@ func main() {
 	}
 	fmt.Printf("US Payout Success: %s (TxID: %s)\n", usResult.Status, usResult.TransactionID)
 
-	// 2. Disburse to a Nigerian Vendor (NIP Bank Transfer)
+	// 2. Disburse to a Nigerian Vendor with float-aware failover (Flutterwave -> Paystack)
 	ngResult, err := engine.Disburse(omnipayout.DisburseParams{
-		Amount:    45000,
-		Currency:  "NGN",
-		Reference: "PAYOUT-NG-002", // Safe to reuse on retry; stays identical in responses
+		Amount:                     45000,
+		Currency:                   "NGN",
+		Reference:                  "PAYOUT-NG-002", // Safe to reuse on retry; stays identical across failover
+		Rail:                       omnipayout.RailFlutterwave,
+		FallbackRails:              []omnipayout.PayoutRail{omnipayout.RailPaystack},
+		CheckBalanceBeforeDisburse: true,
 		BankDetails: &omnipayout.BankAccountDetails{
 			BankCode:      "058", // GTBank
 			AccountNumber: "0123456789",
@@ -87,9 +94,9 @@ func main() {
 		Narration: "Restaurant order settlements",
 	})
 	if err != nil {
-		log.Fatalf("Flutterwave payout error: %v", err)
+		log.Fatalf("African payout error: %v", err)
 	}
-	fmt.Printf("NG Payout: %s (Ref: %s, TxID: %s)\n", ngResult.Status, ngResult.Reference, ngResult.TransactionID)
+	fmt.Printf("NG Payout: %s via %s (Ref: %s, TxID: %s)\n", ngResult.Status, ngResult.Rail, ngResult.Reference, ngResult.TransactionID)
 
 	// 3. Check settlement status if the payout was accepted but not yet received
 	if ngResult.Status == string(omnipayout.StatusPending) {
@@ -102,6 +109,10 @@ func main() {
 		}
 		fmt.Printf("Latest Status: %s (Provider: %s, Ref: %s)\n", latest.Status, latest.ProviderStatus, latest.Reference)
 	}
+
+	// 4. Inspect float balances across all configured rails
+	balances, _ := engine.GetBalances("")
+	fmt.Printf("Balances: %+v\n", balances)
 }
 ```
 
@@ -113,8 +124,9 @@ func main() {
 import { OmniPayoutEngine } from '@peterchijioke/omni-payout';
 
 const payoutEngine = new OmniPayoutEngine({
-  stripe: { secretKey: process.env.STRIPE_SECRET_KEY! },
-  flutterwave: { secretKey: process.env.FLUTTERWAVE_SECRET_KEY! },
+  stripe: { secretKey: process.env.STRIPE_SECRET_KEY!, webhookSecret: process.env.STRIPE_WEBHOOK_SECRET },
+  flutterwave: { secretKey: process.env.FLUTTERWAVE_SECRET_KEY!, webhookSecret: process.env.FLW_WEBHOOK_SECRET },
+  paystack: { secretKey: process.env.PAYSTACK_SECRET_KEY!, webhookSecret: process.env.PAYSTACK_WEBHOOK_SECRET },
 });
 
 // Automatically routes to Stripe Connect
@@ -125,11 +137,14 @@ await payoutEngine.disburse({
   stripeAccountId: 'acct_1N23456789',
 });
 
-// Automatically routes to Flutterwave NIP Bank Transfer
+// Float-aware failover across African rails (Flutterwave -> Paystack)
 const payout = await payoutEngine.disburse({
   amount: 45000,
   currency: 'NGN',
-  reference: 'PAYOUT-NG-002', // Safe to reuse on retry; stays identical in responses
+  reference: 'PAYOUT-NG-002', // Safe to reuse on retry; stays identical across failover
+  rail: 'FLUTTERWAVE',
+  fallbackRails: ['PAYSTACK'],
+  checkBalanceBeforeDisburse: true,
   bankDetails: { bankCode: '058', accountNumber: '0123456789' },
 });
 
@@ -141,6 +156,13 @@ if (payout.status === 'PENDING') {
   });
   console.log(latest.reference, latest.status, latest.providerStatus);
 }
+
+// Check float balances across all configured rails
+const balances = await payoutEngine.getBalances();
+
+// Verify and normalize incoming provider webhooks
+const event = payoutEngine.verifyWebhook('PAYSTACK', rawBody, signatureHeader);
+console.log(event.reference, event.status);
 ```
 
 ---

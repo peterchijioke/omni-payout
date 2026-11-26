@@ -41,8 +41,9 @@ npm install @peterchijioke/omni-payout
 import { OmniPayoutEngine } from '@peterchijioke/omni-payout';
 
 const payoutEngine = new OmniPayoutEngine({
-  stripe: { secretKey: process.env.STRIPE_SECRET_KEY! },
-  flutterwave: { secretKey: process.env.FLUTTERWAVE_SECRET_KEY! },
+  stripe: { secretKey: process.env.STRIPE_SECRET_KEY!, webhookSecret: process.env.STRIPE_WEBHOOK_SECRET },
+  flutterwave: { secretKey: process.env.FLUTTERWAVE_SECRET_KEY!, webhookSecret: process.env.FLW_WEBHOOK_SECRET },
+  paystack: { secretKey: process.env.PAYSTACK_SECRET_KEY!, webhookSecret: process.env.PAYSTACK_WEBHOOK_SECRET },
 });
 
 // 1. Automatically routes to Stripe Connect (US/EU)
@@ -55,11 +56,14 @@ const usPayout = await payoutEngine.disburse({
   narration: 'Weekly courier earnings',
 });
 
-// 2. Automatically routes to Flutterwave NIP Bank Transfer (Africa)
+// 2. Float-aware failover across African rails (Flutterwave -> Paystack)
 const ngPayout = await payoutEngine.disburse({
   amount: 45000,
   currency: 'NGN',
   reference: 'PAYOUT-NG-002',
+  rail: 'FLUTTERWAVE',
+  fallbackRails: ['PAYSTACK'],
+  checkBalanceBeforeDisburse: true,
   bankDetails: { bankCode: '058', accountNumber: '0123456789' },
   narration: 'Restaurant order settlements',
 });
@@ -72,6 +76,21 @@ if (ngPayout.status === 'PENDING') {
   });
   console.log(latest.reference, latest.status, latest.providerStatus);
 }
+```
+
+### Check Float Balances Across Rails
+
+```typescript
+const balances = await payoutEngine.getBalances();
+console.log(balances);
+// [{ rail: 'STRIPE_CONNECT', currency: 'USD', available: 2500, pending: 500 }, ...]
+```
+
+### Verify & Normalize Provider Webhooks
+
+```typescript
+const event = payoutEngine.verifyWebhook('PAYSTACK', rawBody, req.headers['x-paystack-signature']);
+console.log(event.reference, event.status, event.providerStatus);
 ```
 
 ### Verify an African Bank Account (NIP Inquiry)
