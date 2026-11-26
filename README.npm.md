@@ -2,6 +2,7 @@
 
 > **Unified multi-rail payout engine for Node.js & TypeScript with float-aware failover, per-rail circuit breakers, idempotent retries, and normalized webhooks across Stripe Connect, Flutterwave, Paystack, PawaPay, Yellow Card, and M-Pesa Daraja.**
 
+[![CI](https://github.com/peterchijioke/omni-payout/actions/workflows/ci.yml/badge.svg)](https://github.com/peterchijioke/omni-payout/actions/workflows/ci.yml)
 [![npm version](https://img.shields.io/npm/v/@peterchijioke/omni-payout.svg)](https://www.npmjs.com/package/@peterchijioke/omni-payout)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](https://opensource.org/licenses/MIT)
 
@@ -27,6 +28,12 @@ npm install @peterchijioke/omni-payout
 ```
 
 Zero external runtime dependencies — uses native `fetch` and Node's built-in `crypto`.
+
+### Built-In Security & Money-Safety Guarantees
+- **Timeout-Safe Failover (No Double Payouts)**: Pre-execution failures (`4xx`, `503`, low float, open circuit) fail over immediately; ambiguous timeouts/`502`/`504` automatically query `getPayoutStatus()` by `reference` first and throw `PayoutAmbiguousError` if state cannot be confirmed.
+- **Zero-Decimal Currency Safety**: Automatically handles zero-decimal (`UGX`, `RWF`, `XOF`, `XAF`, `JPY`), 2-decimal, and 3-decimal currencies without 100x overpay bugs.
+- **Deterministic PawaPay UUIDs**: Automatically hashes human-readable `reference` strings into valid RFC 4122 UUIDs for PawaPay while preserving your original `reference` in responses.
+- **Hardened Webhooks & Secret Isolation**: Constant-time HMAC verification, Stripe replay-window enforcement (`webhookToleranceSec`), HTTPS/SSRF `baseUrl` validation, path-traversal guards, and ECMAScript `#private` secret storage (secrets never leak via `JSON.stringify` or `console.log`).
 
 ---
 

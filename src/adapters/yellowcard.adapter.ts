@@ -1,5 +1,13 @@
 import crypto from 'crypto';
 import { DisburseParams, DisburseResult, PayoutStatus, RailBalance, WebhookEvent } from '../types';
+import {
+  PayoutProviderError,
+  constantTimeStringEqual,
+  fetchWithTimeout,
+  isHttpStatusAmbiguous,
+  sanitizeBaseUrl,
+  validateSafeIdentifier,
+} from '../utils';
 
 function normalizeYellowCardStatus(rawStatus?: string): PayoutStatus {
   if (!rawStatus) return 'PENDING';
@@ -21,24 +29,33 @@ function normalizeYellowCardStatus(rawStatus?: string): PayoutStatus {
 }
 
 export class YellowCardAdapter {
-  private readonly baseUrl: string;
+  readonly #apiKey: string;
+  readonly #secretKey: string;
+  readonly #baseUrl: string;
+  readonly #webhookSecret?: string;
+  readonly #timeoutMs: number;
 
   constructor(
-    private readonly apiKey: string,
-    private readonly secretKey: string,
+    apiKey: string,
+    secretKey: string,
     baseUrl?: string,
-    private readonly webhookSecret?: string
+    webhookSecret?: string,
+    timeoutMs = 30_000
   ) {
     if (!apiKey || !secretKey) {
       throw new Error('Yellow Card apiKey and secretKey are required');
     }
-    this.baseUrl = (baseUrl || 'https://api.yellowcard.io').replace(/\/$/, '');
+    this.#apiKey = apiKey;
+    this.#secretKey = secretKey;
+    this.#baseUrl = sanitizeBaseUrl(baseUrl, 'https://api.yellowcard.io');
+    this.#webhookSecret = webhookSecret;
+    this.#timeoutMs = timeoutMs;
   }
 
   private buildAuthHeaders(method: string, path: string, body?: string): Record<string, string> {
     const timestamp = new Date().toISOString();
     const upperMethod = method.toUpperCase();
-    const hmac = crypto.createHmac('sha256', this.secretKey);
+    const hmac = crypto.createHmac('sha256', this.#secretKey);
     hmac.update(timestamp);
     hmac.update(path);
     hmac.update(upperMethod);
@@ -50,28 +67,48 @@ export class YellowCardAdapter {
 
     return {
       'X-YC-Timestamp': timestamp,
-      Authorization: `YcHmacV1 ${this.apiKey}:${signature}`,
+      Authorization: `YcHmacV1 ${this.#apiKey}:${signature}`,
     };
   }
 
-  private async request(path: string, method: string, bodyObj?: Record<string, any>): Promise<any> {
+  private async request(
+    path: string,
+    method: string,
+    bodyObj?: Record<string, any>,
+    isMutatingDisburse = false
+  ): Promise<any> {
     const body = bodyObj ? JSON.stringify(bodyObj) : undefined;
     const headers: Record<string, string> = {
       ...this.buildAuthHeaders(method, path, body),
       ...(body ? { 'Content-Type': 'application/json' } : {}),
     };
 
-    const res = await fetch(`${this.baseUrl}${path}`, { method, headers, body });
+    const res = await fetchWithTimeout(
+      `${this.#baseUrl}${path}`,
+      { method, headers, body },
+      this.#timeoutMs,
+      'YELLOW_CARD',
+      isMutatingDisburse
+    );
     const data = await res.json();
     if (!res.ok) {
-      throw new Error(data?.message || data?.error || `Yellow Card request failed with status ${res.status}`);
+      const status = res.status || 500;
+      throw new PayoutProviderError({
+        message:
+          data?.message || data?.error || `Yellow Card request failed with status ${status}`,
+        rail: 'YELLOW_CARD',
+        statusCode: status,
+        isAmbiguous: isMutatingDisburse && isHttpStatusAmbiguous(status),
+      });
     }
     return data;
   }
 
   async disburse(params: DisburseParams): Promise<DisburseResult> {
     if (!params.bankDetails && !params.mobileMoneyDetails) {
-      throw new Error('Either bankDetails or mobileMoneyDetails is required for Yellow Card disbursements');
+      throw new Error(
+        'Either bankDetails or mobileMoneyDetails is required for Yellow Card disbursements'
+      );
     }
 
     const currency = params.currency.toUpperCase();
@@ -99,7 +136,7 @@ export class YellowCardAdapter {
       forceAccept: true,
     };
 
-    const data = await this.request('/business/payments', 'POST', payload);
+    const data = await this.request('/business/payments', 'POST', payload, true);
     const status = normalizeYellowCardStatus(data.status);
 
     return {
@@ -111,15 +148,18 @@ export class YellowCardAdapter {
       rail: 'YELLOW_CARD',
       amount: params.amount,
       currency,
-      error: status === 'FAILED' ? data.failureReason || data.message || 'Yellow Card payout failed' : undefined,
+      error:
+        status === 'FAILED'
+          ? data.failureReason || data.message || 'Yellow Card payout failed'
+          : undefined,
       rawResponse: data,
     };
   }
 
   async getPayoutStatus(transactionId: string, reference?: string): Promise<DisburseResult> {
     const path = reference
-      ? `/business/payments/sequence-id/${encodeURIComponent(reference)}`
-      : `/business/payments/${encodeURIComponent(transactionId)}`;
+      ? `/business/payments/sequence-id/${validateSafeIdentifier(reference, 'reference')}`
+      : `/business/payments/${validateSafeIdentifier(transactionId, 'transactionId')}`;
 
     const data = await this.request(path, 'GET');
     const status = normalizeYellowCardStatus(data.status);
@@ -156,12 +196,10 @@ export class YellowCardAdapter {
   }
 
   verifyWebhook(rawBody: string, signature: string): WebhookEvent {
-    const secret = this.webhookSecret || this.secretKey;
+    const secret = this.#webhookSecret || this.#secretKey;
     const expected = crypto.createHmac('sha256', secret).update(rawBody).digest('base64');
 
-    const sigBuf = Buffer.from(signature || '', 'utf8');
-    const expBuf = Buffer.from(expected, 'utf8');
-    if (sigBuf.length !== expBuf.length || !crypto.timingSafeEqual(sigBuf, expBuf)) {
+    if (!constantTimeStringEqual(signature, expected)) {
       throw new Error('Invalid Yellow Card webhook signature');
     }
 
@@ -170,7 +208,9 @@ export class YellowCardAdapter {
 
     return {
       rail: 'YELLOW_CARD',
-      eventType: String(payload.event || `payment.${String(payload.status || 'updated').toLowerCase()}`),
+      eventType: String(
+        payload.event || `payment.${String(payload.status || 'updated').toLowerCase()}`
+      ),
       transactionId: String(payload.id || ''),
       reference: String(payload.sequenceId || payload.reference || ''),
       status,

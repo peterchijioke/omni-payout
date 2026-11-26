@@ -6,6 +6,11 @@ import { YellowCardAdapter } from './adapters/yellowcard.adapter';
 import { MpesaDarajaAdapter } from './adapters/mpesa.adapter';
 import { RailHealthTracker } from './health';
 import {
+  PayoutAmbiguousError,
+  PayoutProviderError,
+  validateDisburseInputs,
+} from './utils';
+import {
   BankResolutionResult,
   DisburseParams,
   DisburseResult,
@@ -20,58 +25,73 @@ import {
 } from './types';
 
 const AFRICAN_CURRENCIES = new Set(['NGN', 'KES', 'GHS', 'UGX', 'TZS', 'RWF', 'XOF', 'XAF', 'ZAR']);
+const REFERENCE_LOOKUP_RAILS = new Set<PayoutRail>(['PAYSTACK', 'PAWAPAY', 'YELLOW_CARD']);
 
 export class OmniPayoutEngine {
-  private readonly stripe?: StripeConnectAdapter;
-  private readonly flutterwave?: FlutterwaveAdapter;
-  private readonly paystack?: PaystackAdapter;
-  private readonly pawapay?: PawaPayAdapter;
-  private readonly yellowCard?: YellowCardAdapter;
-  private readonly mpesaDaraja?: MpesaDarajaAdapter;
-  private readonly health: RailHealthTracker;
+  readonly #stripe?: StripeConnectAdapter;
+  readonly #flutterwave?: FlutterwaveAdapter;
+  readonly #paystack?: PaystackAdapter;
+  readonly #pawapay?: PawaPayAdapter;
+  readonly #yellowCard?: YellowCardAdapter;
+  readonly #mpesaDaraja?: MpesaDarajaAdapter;
+  readonly #health: RailHealthTracker;
 
   constructor(config: OmniPayoutConfig) {
+    const timeoutMs = config.timeoutMs && config.timeoutMs > 0 ? config.timeoutMs : 30_000;
+
     if (config.stripe?.secretKey) {
-      this.stripe = new StripeConnectAdapter(config.stripe.secretKey, config.stripe.webhookSecret);
+      this.#stripe = new StripeConnectAdapter(
+        config.stripe.secretKey,
+        config.stripe.webhookSecret,
+        timeoutMs,
+        config.stripe.webhookToleranceSec
+      );
     }
     if (config.flutterwave?.secretKey) {
-      this.flutterwave = new FlutterwaveAdapter(
+      this.#flutterwave = new FlutterwaveAdapter(
         config.flutterwave.secretKey,
-        config.flutterwave.webhookSecret
+        config.flutterwave.webhookSecret,
+        timeoutMs
       );
     }
     if (config.paystack?.secretKey) {
-      this.paystack = new PaystackAdapter(config.paystack.secretKey, config.paystack.webhookSecret);
+      this.#paystack = new PaystackAdapter(
+        config.paystack.secretKey,
+        config.paystack.webhookSecret,
+        timeoutMs
+      );
     }
     if (config.pawapay?.apiToken) {
-      this.pawapay = new PawaPayAdapter(
+      this.#pawapay = new PawaPayAdapter(
         config.pawapay.apiToken,
         config.pawapay.baseUrl,
-        config.pawapay.webhookSecret
+        config.pawapay.webhookSecret,
+        timeoutMs
       );
     }
     if (config.yellowCard?.apiKey && config.yellowCard?.secretKey) {
-      this.yellowCard = new YellowCardAdapter(
+      this.#yellowCard = new YellowCardAdapter(
         config.yellowCard.apiKey,
         config.yellowCard.secretKey,
         config.yellowCard.baseUrl,
-        config.yellowCard.webhookSecret
+        config.yellowCard.webhookSecret,
+        timeoutMs
       );
     }
     if (config.mpesaDaraja?.consumerKey && config.mpesaDaraja?.consumerSecret) {
-      this.mpesaDaraja = new MpesaDarajaAdapter(config.mpesaDaraja);
+      this.#mpesaDaraja = new MpesaDarajaAdapter(config.mpesaDaraja, timeoutMs);
     }
-    this.health = new RailHealthTracker(config.health);
+    this.#health = new RailHealthTracker(config.health);
   }
 
   private getConfiguredRails(): PayoutRail[] {
     const rails: PayoutRail[] = [];
-    if (this.stripe) rails.push('STRIPE_CONNECT');
-    if (this.flutterwave) rails.push('FLUTTERWAVE');
-    if (this.paystack) rails.push('PAYSTACK');
-    if (this.pawapay) rails.push('PAWAPAY');
-    if (this.yellowCard) rails.push('YELLOW_CARD');
-    if (this.mpesaDaraja) rails.push('MPESA_DARAJA');
+    if (this.#stripe) rails.push('STRIPE_CONNECT');
+    if (this.#flutterwave) rails.push('FLUTTERWAVE');
+    if (this.#paystack) rails.push('PAYSTACK');
+    if (this.#pawapay) rails.push('PAWAPAY');
+    if (this.#yellowCard) rails.push('YELLOW_CARD');
+    if (this.#mpesaDaraja) rails.push('MPESA_DARAJA');
     return rails;
   }
 
@@ -84,20 +104,20 @@ export class OmniPayoutEngine {
 
     const currency = params.currency.toUpperCase();
     if (params.mobileMoneyDetails) {
-      if (this.flutterwave) return 'FLUTTERWAVE';
-      if (currency === 'KES' && params.mobileMoneyDetails.network === 'MPESA' && this.mpesaDaraja) {
+      if (this.#flutterwave) return 'FLUTTERWAVE';
+      if (currency === 'KES' && params.mobileMoneyDetails.network === 'MPESA' && this.#mpesaDaraja) {
         return 'MPESA_DARAJA';
       }
-      if (this.pawapay) return 'PAWAPAY';
-      if (this.yellowCard) return 'YELLOW_CARD';
-      if (this.paystack) return 'PAYSTACK';
+      if (this.#pawapay) return 'PAWAPAY';
+      if (this.#yellowCard) return 'YELLOW_CARD';
+      if (this.#paystack) return 'PAYSTACK';
       return 'FLUTTERWAVE';
     }
 
     if (params.bankDetails || AFRICAN_CURRENCIES.has(currency)) {
-      if (this.flutterwave) return 'FLUTTERWAVE';
-      if (this.paystack) return 'PAYSTACK';
-      if (this.yellowCard) return 'YELLOW_CARD';
+      if (this.#flutterwave) return 'FLUTTERWAVE';
+      if (this.#paystack) return 'PAYSTACK';
+      if (this.#yellowCard) return 'YELLOW_CARD';
       return 'FLUTTERWAVE';
     }
     return 'STRIPE_CONNECT';
@@ -105,55 +125,51 @@ export class OmniPayoutEngine {
 
   private async disburseOnRail(rail: PayoutRail, params: DisburseParams): Promise<DisburseResult> {
     if (rail === 'STRIPE_CONNECT') {
-      if (!this.stripe) {
+      if (!this.#stripe) {
         throw new Error('Stripe Connect provider is not configured (missing secretKey)');
       }
-      return this.stripe.disburse(params);
+      return this.#stripe.disburse(params);
     }
     if (rail === 'FLUTTERWAVE') {
-      if (!this.flutterwave) {
+      if (!this.#flutterwave) {
         throw new Error('Flutterwave provider is not configured (missing secretKey)');
       }
-      return this.flutterwave.disburse(params);
+      return this.#flutterwave.disburse(params);
     }
     if (rail === 'PAYSTACK') {
-      if (!this.paystack) {
+      if (!this.#paystack) {
         throw new Error('Paystack provider is not configured (missing secretKey)');
       }
-      return this.paystack.disburse(params);
+      return this.#paystack.disburse(params);
     }
     if (rail === 'PAWAPAY') {
-      if (!this.pawapay) {
+      if (!this.#pawapay) {
         throw new Error('PawaPay provider is not configured (missing apiToken)');
       }
-      return this.pawapay.disburse(params);
+      return this.#pawapay.disburse(params);
     }
     if (rail === 'YELLOW_CARD') {
-      if (!this.yellowCard) {
+      if (!this.#yellowCard) {
         throw new Error('Yellow Card provider is not configured (missing apiKey/secretKey)');
       }
-      return this.yellowCard.disburse(params);
+      return this.#yellowCard.disburse(params);
     }
     if (rail === 'MPESA_DARAJA') {
-      if (!this.mpesaDaraja) {
+      if (!this.#mpesaDaraja) {
         throw new Error('M-Pesa Daraja provider is not configured (missing consumerKey/consumerSecret)');
       }
-      return this.mpesaDaraja.disburse(params);
+      return this.#mpesaDaraja.disburse(params);
     }
 
     throw new Error(`Unsupported payout rail: ${rail}`);
   }
 
   /**
-   * Unified disbursement method with circuit-breaker health checks, pre-flight balance checks, and automatic failover.
+   * Unified disbursement method with input sanitization, circuit-breaker health checks,
+   * pre-flight float balance checks, and timeout-safe failover (preventing double payouts).
    */
   async disburse(params: DisburseParams): Promise<DisburseResult> {
-    if (params.amount <= 0) {
-      throw new Error('Disbursement amount must be greater than zero');
-    }
-    if (!params.reference) {
-      throw new Error('Unique reference is required for idempotent disbursement');
-    }
+    validateDisburseInputs(params.amount, params.currency, params.reference);
 
     const primaryRail = this.resolveRail(params);
     const candidateRails: PayoutRail[] = [primaryRail];
@@ -172,8 +188,7 @@ export class OmniPayoutEngine {
       const rail = candidateRails[i];
       const hasFallback = i < candidateRails.length - 1;
 
-      // Proactive circuit-breaker skip when rail is unhealthy and a fallback exists
-      if (!this.health.isAvailable(rail) && hasFallback) {
+      if (!this.#health.isAvailable(rail) && hasFallback) {
         lastError = new Error(`Rail ${rail} circuit breaker is open (unhealthy)`);
         continue;
       }
@@ -209,14 +224,14 @@ export class OmniPayoutEngine {
         const latencyMs = Date.now() - startMs;
 
         if (result.status === 'FAILED') {
-          this.health.recordFailure(rail, latencyMs, result.error || `${rail} disbursement failed`);
+          this.#health.recordFailure(rail, latencyMs, result.error || `${rail} disbursement failed`);
           if (hasFallback) {
             lastFailedResult = result;
             lastError = new Error(result.error || `${rail} disbursement returned FAILED`);
             continue;
           }
         } else {
-          this.health.recordSuccess(rail, latencyMs);
+          this.#health.recordSuccess(rail, latencyMs);
         }
 
         return {
@@ -227,7 +242,42 @@ export class OmniPayoutEngine {
       } catch (err: any) {
         const latencyMs = Date.now() - startMs;
         lastError = err instanceof Error ? err : new Error(String(err));
-        this.health.recordFailure(rail, latencyMs, lastError.message);
+        this.#health.recordFailure(rail, latencyMs, lastError.message);
+
+        const isAmbiguous = err instanceof PayoutProviderError && err.isAmbiguous;
+        if (isAmbiguous && !params.allowUnsafeTimeoutFailover) {
+          // Attempt automatic reconciliation by reference on rails that support it
+          if (REFERENCE_LOOKUP_RAILS.has(rail)) {
+            try {
+              const reconciled = await this.getPayoutStatus({
+                transactionId: params.reference,
+                reference: params.reference,
+                rail,
+              });
+              if (reconciled.status === 'FAILED') {
+                if (hasFallback) {
+                  lastFailedResult = reconciled;
+                  continue;
+                }
+              }
+              return {
+                ...reconciled,
+                attemptedRails,
+                failoverFrom: rail !== primaryRail ? primaryRail : undefined,
+              };
+            } catch (statusErr: any) {
+              if (statusErr instanceof PayoutProviderError && statusErr.statusCode === 404) {
+                // Confirmed never recorded on this rail — safe to fail over!
+                if (hasFallback) {
+                  continue;
+                }
+                throw lastError;
+              }
+            }
+          }
+          throw new PayoutAmbiguousError(rail, params.reference, lastError.message);
+        }
+
         if (hasFallback) {
           continue;
         }
@@ -250,9 +300,9 @@ export class OmniPayoutEngine {
    */
   getRailHealth(rail?: PayoutRail): RailHealth[] {
     if (rail) {
-      return [this.health.getHealth(rail)];
+      return [this.#health.getHealth(rail)];
     }
-    return this.getConfiguredRails().map((r) => this.health.getHealth(r));
+    return this.getConfiguredRails().map((r) => this.#health.getHealth(r));
   }
 
   /**
@@ -264,28 +314,28 @@ export class OmniPayoutEngine {
     }
 
     if (params.rail === 'STRIPE_CONNECT') {
-      if (!this.stripe) throw new Error('Stripe Connect provider is not configured (missing secretKey)');
-      return this.stripe.getPayoutStatus(params.transactionId, params.stripeAccountId, params.reference);
+      if (!this.#stripe) throw new Error('Stripe Connect provider is not configured (missing secretKey)');
+      return this.#stripe.getPayoutStatus(params.transactionId, params.stripeAccountId, params.reference);
     }
     if (params.rail === 'FLUTTERWAVE') {
-      if (!this.flutterwave) throw new Error('Flutterwave provider is not configured (missing secretKey)');
-      return this.flutterwave.getPayoutStatus(params.transactionId, params.reference);
+      if (!this.#flutterwave) throw new Error('Flutterwave provider is not configured (missing secretKey)');
+      return this.#flutterwave.getPayoutStatus(params.transactionId, params.reference);
     }
     if (params.rail === 'PAYSTACK') {
-      if (!this.paystack) throw new Error('Paystack provider is not configured (missing secretKey)');
-      return this.paystack.getPayoutStatus(params.transactionId, params.reference);
+      if (!this.#paystack) throw new Error('Paystack provider is not configured (missing secretKey)');
+      return this.#paystack.getPayoutStatus(params.transactionId, params.reference);
     }
     if (params.rail === 'PAWAPAY') {
-      if (!this.pawapay) throw new Error('PawaPay provider is not configured (missing apiToken)');
-      return this.pawapay.getPayoutStatus(params.transactionId, params.reference);
+      if (!this.#pawapay) throw new Error('PawaPay provider is not configured (missing apiToken)');
+      return this.#pawapay.getPayoutStatus(params.transactionId, params.reference);
     }
     if (params.rail === 'YELLOW_CARD') {
-      if (!this.yellowCard) throw new Error('Yellow Card provider is not configured');
-      return this.yellowCard.getPayoutStatus(params.transactionId, params.reference);
+      if (!this.#yellowCard) throw new Error('Yellow Card provider is not configured');
+      return this.#yellowCard.getPayoutStatus(params.transactionId, params.reference);
     }
     if (params.rail === 'MPESA_DARAJA') {
-      if (!this.mpesaDaraja) throw new Error('M-Pesa Daraja provider is not configured');
-      return this.mpesaDaraja.getPayoutStatus(params.transactionId, params.reference);
+      if (!this.#mpesaDaraja) throw new Error('M-Pesa Daraja provider is not configured');
+      return this.#mpesaDaraja.getPayoutStatus(params.transactionId, params.reference);
     }
 
     throw new Error(`Unsupported payout rail: ${params.rail}`);
@@ -296,37 +346,37 @@ export class OmniPayoutEngine {
    */
   async getBalances(rail?: PayoutRail): Promise<RailBalance[]> {
     if (rail === 'STRIPE_CONNECT') {
-      if (!this.stripe) throw new Error('Stripe Connect provider is not configured (missing secretKey)');
-      return this.stripe.getBalances();
+      if (!this.#stripe) throw new Error('Stripe Connect provider is not configured (missing secretKey)');
+      return this.#stripe.getBalances();
     }
     if (rail === 'FLUTTERWAVE') {
-      if (!this.flutterwave) throw new Error('Flutterwave provider is not configured (missing secretKey)');
-      return this.flutterwave.getBalances();
+      if (!this.#flutterwave) throw new Error('Flutterwave provider is not configured (missing secretKey)');
+      return this.#flutterwave.getBalances();
     }
     if (rail === 'PAYSTACK') {
-      if (!this.paystack) throw new Error('Paystack provider is not configured (missing secretKey)');
-      return this.paystack.getBalances();
+      if (!this.#paystack) throw new Error('Paystack provider is not configured (missing secretKey)');
+      return this.#paystack.getBalances();
     }
     if (rail === 'PAWAPAY') {
-      if (!this.pawapay) throw new Error('PawaPay provider is not configured (missing apiToken)');
-      return this.pawapay.getBalances();
+      if (!this.#pawapay) throw new Error('PawaPay provider is not configured (missing apiToken)');
+      return this.#pawapay.getBalances();
     }
     if (rail === 'YELLOW_CARD') {
-      if (!this.yellowCard) throw new Error('Yellow Card provider is not configured');
-      return this.yellowCard.getBalances();
+      if (!this.#yellowCard) throw new Error('Yellow Card provider is not configured');
+      return this.#yellowCard.getBalances();
     }
     if (rail === 'MPESA_DARAJA') {
-      if (!this.mpesaDaraja) throw new Error('M-Pesa Daraja provider is not configured');
-      return this.mpesaDaraja.getBalances();
+      if (!this.#mpesaDaraja) throw new Error('M-Pesa Daraja provider is not configured');
+      return this.#mpesaDaraja.getBalances();
     }
 
     const tasks: Promise<RailBalance[]>[] = [];
-    if (this.stripe) tasks.push(this.stripe.getBalances());
-    if (this.flutterwave) tasks.push(this.flutterwave.getBalances());
-    if (this.paystack) tasks.push(this.paystack.getBalances());
-    if (this.pawapay) tasks.push(this.pawapay.getBalances());
-    if (this.yellowCard) tasks.push(this.yellowCard.getBalances());
-    if (this.mpesaDaraja) tasks.push(this.mpesaDaraja.getBalances());
+    if (this.#stripe) tasks.push(this.#stripe.getBalances());
+    if (this.#flutterwave) tasks.push(this.#flutterwave.getBalances());
+    if (this.#paystack) tasks.push(this.#paystack.getBalances());
+    if (this.#pawapay) tasks.push(this.#pawapay.getBalances());
+    if (this.#yellowCard) tasks.push(this.#yellowCard.getBalances());
+    if (this.#mpesaDaraja) tasks.push(this.#mpesaDaraja.getBalances());
 
     const results = await Promise.all(tasks);
     return results.flat();
@@ -337,28 +387,28 @@ export class OmniPayoutEngine {
    */
   verifyWebhook(rail: PayoutRail, rawBody: string, signature: string): WebhookEvent {
     if (rail === 'STRIPE_CONNECT') {
-      if (!this.stripe) throw new Error('Stripe Connect provider is not configured');
-      return this.stripe.verifyWebhook(rawBody, signature);
+      if (!this.#stripe) throw new Error('Stripe Connect provider is not configured');
+      return this.#stripe.verifyWebhook(rawBody, signature);
     }
     if (rail === 'FLUTTERWAVE') {
-      if (!this.flutterwave) throw new Error('Flutterwave provider is not configured');
-      return this.flutterwave.verifyWebhook(rawBody, signature);
+      if (!this.#flutterwave) throw new Error('Flutterwave provider is not configured');
+      return this.#flutterwave.verifyWebhook(rawBody, signature);
     }
     if (rail === 'PAYSTACK') {
-      if (!this.paystack) throw new Error('Paystack provider is not configured');
-      return this.paystack.verifyWebhook(rawBody, signature);
+      if (!this.#paystack) throw new Error('Paystack provider is not configured');
+      return this.#paystack.verifyWebhook(rawBody, signature);
     }
     if (rail === 'PAWAPAY') {
-      if (!this.pawapay) throw new Error('PawaPay provider is not configured');
-      return this.pawapay.verifyWebhook(rawBody, signature);
+      if (!this.#pawapay) throw new Error('PawaPay provider is not configured');
+      return this.#pawapay.verifyWebhook(rawBody, signature);
     }
     if (rail === 'YELLOW_CARD') {
-      if (!this.yellowCard) throw new Error('Yellow Card provider is not configured');
-      return this.yellowCard.verifyWebhook(rawBody, signature);
+      if (!this.#yellowCard) throw new Error('Yellow Card provider is not configured');
+      return this.#yellowCard.verifyWebhook(rawBody, signature);
     }
     if (rail === 'MPESA_DARAJA') {
-      if (!this.mpesaDaraja) throw new Error('M-Pesa Daraja provider is not configured');
-      return this.mpesaDaraja.verifyWebhook(rawBody, signature);
+      if (!this.#mpesaDaraja) throw new Error('M-Pesa Daraja provider is not configured');
+      return this.#mpesaDaraja.verifyWebhook(rawBody, signature);
     }
 
     throw new Error(`Unsupported payout rail: ${rail}`);
@@ -372,26 +422,26 @@ export class OmniPayoutEngine {
     accountNumber: string,
     rail?: 'FLUTTERWAVE' | 'PAYSTACK'
   ): Promise<BankResolutionResult> {
-    if (rail === 'PAYSTACK' || (!rail && !this.flutterwave && this.paystack)) {
-      if (!this.paystack) {
+    if (rail === 'PAYSTACK' || (!rail && !this.#flutterwave && this.#paystack)) {
+      if (!this.#paystack) {
         throw new Error('Paystack provider is not configured for bank resolution');
       }
-      return this.paystack.resolveBankAccount(bankCode, accountNumber);
+      return this.#paystack.resolveBankAccount(bankCode, accountNumber);
     }
 
-    if (!this.flutterwave) {
+    if (!this.#flutterwave) {
       throw new Error('Flutterwave provider is not configured for bank resolution');
     }
-    return this.flutterwave.resolveBankAccount(bankCode, accountNumber);
+    return this.#flutterwave.resolveBankAccount(bankCode, accountNumber);
   }
 
   /**
    * Generates a Stripe Connect Express onboarding URL for US/European merchants and couriers.
    */
   async createConnectOnboardingLink(params: OnboardingLinkParams): Promise<OnboardingLinkResult> {
-    if (!this.stripe) {
+    if (!this.#stripe) {
       throw new Error('Stripe Connect provider is not configured for onboarding links');
     }
-    return this.stripe.createOnboardingLink(params);
+    return this.#stripe.createOnboardingLink(params);
   }
 }

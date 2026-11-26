@@ -3,6 +3,7 @@
 > **Unified multi-rail payout engine with float-aware failover, circuit-breaker health routing, idempotent retries, and normalized webhooks across Stripe Connect, Flutterwave, Paystack, PawaPay, Yellow Card, and M-Pesa Daraja.**  
 > *Available in both **Go (Golang)** and **TypeScript / Node.js** — zero external dependencies.*
 
+[![CI](https://github.com/peterchijioke/omni-payout/actions/workflows/ci.yml/badge.svg)](https://github.com/peterchijioke/omni-payout/actions/workflows/ci.yml)
 [![Go Reference](https://pkg.go.dev/badge/github.com/peterchijioke/omni-payout.svg)](https://pkg.go.dev/github.com/peterchijioke/omni-payout)
 [![npm version](https://img.shields.io/npm/v/@peterchijioke/omni-payout.svg)](https://www.npmjs.com/package/@peterchijioke/omni-payout)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](https://opensource.org/licenses/MIT)
@@ -29,6 +30,11 @@
 - **Clear Settlement Statuses**: Distinguishes between *provider accepted* (`PENDING` + raw `providerStatus` like `in_transit`, `NEW`, `ACCEPTED`) and *actually settled* (`SUCCESSFUL`), mapping failures cleanly to `FAILED`.
 - **Safe, Idempotent Retries**: Reusing the same `reference` sends deterministic `Idempotency-Key` headers (Stripe) or provider-native idempotency keys and returns the same `reference` on retry or failover.
 - **Unified Balances & Webhooks**: Fetch float balances across all configured rails in one call, and verify/normalize webhooks from all 6 providers into a single `WebhookEvent` shape.
+- **Hardened Money-Safety & Security**:
+  - **Double-Payout Protection**: Distinguishes pre-execution failures (`4xx`/`503`/low float) from post-dispatch timeouts (`502`/`504`/network drop). Automatically reconciles by `reference` when supported and halts failover (`PayoutAmbiguousError` / `AmbiguousPayoutError`) if state cannot be confirmed.
+  - **ISO-4217 Currency Precision**: Handles zero-decimal (`UGX`, `RWF`, `XOF`, `XAF`, `JPY`), two-decimal, and three-decimal currencies accurately without 100x minor-unit bugs.
+  - **Webhook Replay & Signature Enforcement**: Constant-time signature verification across all 6 rails, mandatory webhook secrets, and Stripe timestamp tolerance checks.
+  - **SSRF, Path-Traversal & Secret Redaction**: Enforces HTTPS `baseUrl`s, escapes/validates path identifiers, and stores credentials in ECMAScript `#private` fields (TS) and redacted structs (Go).
 - **Zero Dependencies**: Pure standard library in both Go and TypeScript.
 
 ---

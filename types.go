@@ -44,6 +44,7 @@ type DisburseParams struct {
 	Rail                       PayoutRail          `json:"rail,omitempty"` // Optional: auto-detected if omitted
 	FallbackRails              []PayoutRail        `json:"fallbackRails,omitempty"`
 	CheckBalanceBeforeDisburse bool                `json:"checkBalanceBeforeDisburse,omitempty"`
+	AllowUnsafeTimeoutFailover bool                `json:"allowUnsafeTimeoutFailover,omitempty"`
 	StripeAccountID            string              `json:"stripeAccountId,omitempty"`
 	Speed                      PayoutSpeed         `json:"speed,omitempty"`
 	BankDetails                *BankAccountDetails `json:"bankDetails,omitempty"`
@@ -149,32 +150,44 @@ type OnboardingLinkResult struct {
 
 // MpesaDarajaConfig provides Safaricom M-Pesa Daraja B2C credentials.
 type MpesaDarajaConfig struct {
-	ConsumerKey        string
-	ConsumerSecret     string
-	ShortCode          string
-	InitiatorName      string
-	SecurityCredential string
-	ResultURL          string
-	QueueTimeoutURL    string
-	BaseURL            string
-	WebhookSecret      string
+	ConsumerKey        string `json:"-"`
+	ConsumerSecret     string `json:"-"`
+	ShortCode          string `json:"shortCode"`
+	InitiatorName      string `json:"initiatorName"`
+	SecurityCredential string `json:"-"`
+	ResultURL          string `json:"resultUrl"`
+	QueueTimeoutURL    string `json:"queueTimeoutUrl"`
+	BaseURL            string `json:"baseUrl,omitempty"`
+	WebhookSecret      string `json:"-"`
 }
 
-// Config provides API credentials, webhook secrets, and health thresholds for all rails.
+// String redacts sensitive M-Pesa credentials when printed or logged.
+func (c MpesaDarajaConfig) String() string {
+	return "MpesaDarajaConfig{ShortCode:" + c.ShortCode + ", Secrets:[REDACTED]}"
+}
+
+// Config provides API credentials, webhook secrets, timeouts, and health thresholds for all rails.
 type Config struct {
-	StripeSecretKey          string
-	StripeWebhookSecret      string
-	FlutterwaveSecretKey     string
-	FlutterwaveWebhookSecret string
-	PaystackSecretKey        string
-	PaystackWebhookSecret    string
-	PawaPayAPIToken          string
-	PawaPayBaseURL           string
-	PawaPayWebhookSecret     string
-	YellowCardAPIKey         string
-	YellowCardSecretKey      string
-	YellowCardBaseURL        string
-	YellowCardWebhookSecret  string
-	MpesaDaraja              *MpesaDarajaConfig
-	Health                   *HealthConfig
+	Timeout                  time.Duration      `json:"timeout,omitempty"`
+	StripeSecretKey          string             `json:"-"`
+	StripeWebhookSecret      string             `json:"-"`
+	StripeWebhookTolerance   time.Duration      `json:"stripeWebhookTolerance,omitempty"`
+	FlutterwaveSecretKey     string             `json:"-"`
+	FlutterwaveWebhookSecret string             `json:"-"`
+	PaystackSecretKey        string             `json:"-"`
+	PaystackWebhookSecret    string             `json:"-"`
+	PawaPayAPIToken          string             `json:"-"`
+	PawaPayBaseURL           string             `json:"pawaPayBaseUrl,omitempty"`
+	PawaPayWebhookSecret     string             `json:"-"`
+	YellowCardAPIKey         string             `json:"-"`
+	YellowCardSecretKey      string             `json:"-"`
+	YellowCardBaseURL        string             `json:"yellowCardBaseUrl,omitempty"`
+	YellowCardWebhookSecret  string             `json:"-"`
+	MpesaDaraja              *MpesaDarajaConfig `json:"mpesaDaraja,omitempty"`
+	Health                   *HealthConfig      `json:"health,omitempty"`
+}
+
+// String redacts all API keys and webhook secrets if Config is formatted into logs.
+func (c Config) String() string {
+	return "omnipayout.Config{Secrets:[REDACTED]}"
 }

@@ -8,6 +8,15 @@ import {
   RailBalance,
   WebhookEvent,
 } from '../types';
+import {
+  PayoutProviderError,
+  constantTimeHexEqual,
+  fetchWithTimeout,
+  fromMinorUnits,
+  isHttpStatusAmbiguous,
+  toMinorUnits,
+  validateSafeIdentifier,
+} from '../utils';
 
 function normalizeStripeStatus(
   rawStatus: string | undefined,
@@ -29,27 +38,54 @@ function normalizeStripeStatus(
 }
 
 export class StripeConnectAdapter {
+  readonly #secretKey: string;
+  readonly #webhookSecret?: string;
+  readonly #webhookToleranceSec: number;
+  readonly #timeoutMs: number;
+
   constructor(
-    private readonly secretKey: string,
-    private readonly webhookSecret?: string
+    secretKey: string,
+    webhookSecret?: string,
+    timeoutMs = 30_000,
+    webhookToleranceSec = 300
   ) {
     if (!secretKey) throw new Error('Stripe secret key is required');
+    this.#secretKey = secretKey;
+    this.#webhookSecret = webhookSecret;
+    this.#timeoutMs = timeoutMs;
+    this.#webhookToleranceSec = webhookToleranceSec > 0 ? webhookToleranceSec : 300;
   }
 
-  private async request(endpoint: string, options: RequestInit = {}): Promise<any> {
+  private async request(
+    endpoint: string,
+    options: RequestInit = {},
+    isMutatingDisburse = false
+  ): Promise<any> {
     const url = `https://api.stripe.com/v1${endpoint}`;
     const headers: Record<string, string> = {
-      Authorization: `Bearer ${this.secretKey}`,
+      Authorization: `Bearer ${this.#secretKey}`,
       ...(options.headers as Record<string, string>),
     };
     if (options.method && options.method.toUpperCase() !== 'GET' && !headers['Content-Type']) {
       headers['Content-Type'] = 'application/x-www-form-urlencoded';
     }
 
-    const res = await fetch(url, { ...options, headers });
+    const res = await fetchWithTimeout(
+      url,
+      { ...options, headers },
+      this.#timeoutMs,
+      'STRIPE_CONNECT',
+      isMutatingDisburse
+    );
     const data = await res.json();
     if (!res.ok) {
-      throw new Error(data?.error?.message || `Stripe request failed with status ${res.status}`);
+      const status = res.status || 500;
+      throw new PayoutProviderError({
+        message: data?.error?.message || `Stripe request failed with status ${status}`,
+        rail: 'STRIPE_CONNECT',
+        statusCode: status,
+        isAmbiguous: isMutatingDisburse && isHttpStatusAmbiguous(status),
+      });
     }
     return data;
   }
@@ -59,13 +95,13 @@ export class StripeConnectAdapter {
       throw new Error('stripeAccountId is required for Stripe Connect disbursements');
     }
 
-    // Convert decimal amount to cents/smallest currency unit
-    const amountInCents = Math.round(params.amount * 100);
+    const currency = params.currency.toUpperCase();
+    const amountInMinor = toMinorUnits(params.amount, currency);
 
     // 1. Transfer funds from platform to connected account (idempotent per reference)
     const transferBody = new URLSearchParams({
-      amount: String(amountInCents),
-      currency: params.currency.toLowerCase(),
+      amount: String(amountInMinor),
+      currency: currency.toLowerCase(),
       destination: params.stripeAccountId,
       'metadata[reference]': params.reference,
     });
@@ -73,13 +109,17 @@ export class StripeConnectAdapter {
       transferBody.set('description', params.narration);
     }
 
-    const transfer = await this.request('/transfers', {
-      method: 'POST',
-      headers: {
-        'Idempotency-Key': `${params.reference}:transfer`,
+    const transfer = await this.request(
+      '/transfers',
+      {
+        method: 'POST',
+        headers: {
+          'Idempotency-Key': `${params.reference}:transfer`,
+        },
+        body: transferBody.toString(),
       },
-      body: transferBody.toString(),
-    });
+      true
+    );
 
     let transactionId = transfer.id;
     let providerStatus: string | undefined = transfer.status;
@@ -90,20 +130,24 @@ export class StripeConnectAdapter {
     // 2. If instant payout requested, trigger an instant payout on the connected account
     if (params.speed === 'instant') {
       const payoutBody = new URLSearchParams({
-        amount: String(amountInCents),
-        currency: params.currency.toLowerCase(),
+        amount: String(amountInMinor),
+        currency: currency.toLowerCase(),
         method: 'instant',
         'metadata[reference]': params.reference,
       });
 
-      const payout = await this.request('/payouts', {
-        method: 'POST',
-        headers: {
-          'Stripe-Account': params.stripeAccountId,
-          'Idempotency-Key': `${params.reference}:payout`,
+      const payout = await this.request(
+        '/payouts',
+        {
+          method: 'POST',
+          headers: {
+            'Stripe-Account': params.stripeAccountId,
+            'Idempotency-Key': `${params.reference}:payout`,
+          },
+          body: payoutBody.toString(),
         },
-        body: payoutBody.toString(),
-      });
+        true
+      );
       transactionId = payout.id;
       providerStatus = payout.status;
       status = normalizeStripeStatus(payout.status, 'PENDING');
@@ -119,7 +163,7 @@ export class StripeConnectAdapter {
       providerStatus,
       rail: 'STRIPE_CONNECT',
       amount: params.amount,
-      currency: params.currency.toUpperCase(),
+      currency,
       error: status === 'FAILED' ? failureMessage || 'Stripe payout failed' : undefined,
       rawResponse,
     };
@@ -130,8 +174,9 @@ export class StripeConnectAdapter {
     stripeAccountId?: string,
     reference?: string
   ): Promise<DisburseResult> {
-    const isPayout = transactionId.startsWith('po_');
-    const endpoint = isPayout ? `/payouts/${transactionId}` : `/transfers/${transactionId}`;
+    const safeId = validateSafeIdentifier(transactionId, 'transactionId');
+    const isPayout = transactionId.trim().startsWith('po_');
+    const endpoint = isPayout ? `/payouts/${safeId}` : `/transfers/${safeId}`;
     const headers: Record<string, string> = {};
     if (isPayout && stripeAccountId) {
       headers['Stripe-Account'] = stripeAccountId;
@@ -139,6 +184,7 @@ export class StripeConnectAdapter {
 
     const data = await this.request(endpoint, { method: 'GET', headers });
     const status = normalizeStripeStatus(data.status, isPayout ? 'PENDING' : 'SUCCESSFUL');
+    const currency = String(data.currency || 'USD').toUpperCase();
 
     return {
       success: status !== 'FAILED',
@@ -147,8 +193,8 @@ export class StripeConnectAdapter {
       status,
       providerStatus: data.status,
       rail: 'STRIPE_CONNECT',
-      amount: typeof data.amount === 'number' ? data.amount / 100 : 0,
-      currency: (data.currency || '').toUpperCase(),
+      amount: typeof data.amount === 'number' ? fromMinorUnits(data.amount, currency) : 0,
+      currency,
       error: status === 'FAILED' ? data.failure_message || 'Stripe payout failed' : undefined,
       rawResponse: data,
     };
@@ -182,7 +228,7 @@ export class StripeConnectAdapter {
       byCurrency.set(currency, {
         rail: 'STRIPE_CONNECT',
         currency,
-        available: typeof entry.amount === 'number' ? entry.amount / 100 : 0,
+        available: typeof entry.amount === 'number' ? fromMinorUnits(entry.amount, currency) : 0,
         pending: 0,
       });
     }
@@ -194,7 +240,8 @@ export class StripeConnectAdapter {
         available: 0,
         pending: 0,
       };
-      existing.pending = typeof entry.amount === 'number' ? entry.amount / 100 : 0;
+      existing.pending =
+        typeof entry.amount === 'number' ? fromMinorUnits(entry.amount, currency) : 0;
       byCurrency.set(currency, existing);
     }
 
@@ -202,7 +249,7 @@ export class StripeConnectAdapter {
   }
 
   verifyWebhook(rawBody: string, signatureHeader: string): WebhookEvent {
-    if (!this.webhookSecret) {
+    if (!this.#webhookSecret) {
       throw new Error('Stripe webhookSecret is required to verify webhooks');
     }
 
@@ -218,15 +265,22 @@ export class StripeConnectAdapter {
       throw new Error('Invalid Stripe-Signature header format');
     }
 
+    const tsNum = Number(timestamp);
+    if (!Number.isInteger(tsNum) || tsNum <= 0) {
+      throw new Error('Invalid Stripe webhook timestamp');
+    }
+    const nowSec = Math.floor(Date.now() / 1000);
+    if (Math.abs(nowSec - tsNum) > this.#webhookToleranceSec) {
+      throw new Error('Stripe webhook timestamp outside tolerance window (possible replay attack)');
+    }
+
     const signedPayload = `${timestamp}.${rawBody}`;
     const expected = crypto
-      .createHmac('sha256', this.webhookSecret)
+      .createHmac('sha256', this.#webhookSecret)
       .update(signedPayload)
       .digest('hex');
 
-    const sigBuf = Buffer.from(signature, 'utf8');
-    const expBuf = Buffer.from(expected, 'utf8');
-    if (sigBuf.length !== expBuf.length || !crypto.timingSafeEqual(sigBuf, expBuf)) {
+    if (!constantTimeHexEqual(signature, expected)) {
       throw new Error('Invalid Stripe webhook signature');
     }
 
@@ -240,6 +294,7 @@ export class StripeConnectAdapter {
           ? 'FAILED'
           : 'PENDING';
     const status = normalizeStripeStatus(obj.status, defaultStatus);
+    const currency = String(obj.currency || 'USD').toUpperCase();
 
     return {
       rail: 'STRIPE_CONNECT',
@@ -248,8 +303,8 @@ export class StripeConnectAdapter {
       reference: String(obj.metadata?.reference || obj.id || ''),
       status,
       providerStatus: obj.status,
-      amount: typeof obj.amount === 'number' ? obj.amount / 100 : 0,
-      currency: String(obj.currency || '').toUpperCase(),
+      amount: typeof obj.amount === 'number' ? fromMinorUnits(obj.amount, currency) : 0,
+      currency,
       error: status === 'FAILED' ? obj.failure_message || 'Stripe payout failed' : undefined,
       rawPayload: payload,
     };

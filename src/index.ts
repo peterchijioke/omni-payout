@@ -1,4 +1,5 @@
 export * from './types';
+export * from './utils';
 export * from './health';
 export * from './adapters/stripe.adapter';
 export * from './adapters/flutterwave.adapter';

@@ -29,6 +29,12 @@ export interface DisburseParams {
   rail?: PayoutRail;
   fallbackRails?: PayoutRail[];
   checkBalanceBeforeDisburse?: boolean;
+  /**
+   * Defaults to false. When false, ambiguous timeout/502/504 errors during a payout POST
+   * trigger a status lookup first and halt automatic failover if state cannot be confirmed,
+   * preventing double payouts.
+   */
+  allowUnsafeTimeoutFailover?: boolean;
   stripeAccountId?: string;
   speed?: PayoutSpeed;
   bankDetails?: BankAccountDetails;
@@ -117,9 +123,13 @@ export interface OnboardingLinkResult {
 }
 
 export interface OmniPayoutConfig {
+  /** Per-request HTTP timeout in milliseconds (defaults to 30000ms). */
+  timeoutMs?: number;
   stripe?: {
     secretKey: string;
     webhookSecret?: string;
+    /** Maximum allowed webhook timestamp age in seconds (defaults to 300s). */
+    webhookToleranceSec?: number;
   };
   flutterwave?: {
     secretKey: string;

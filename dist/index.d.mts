@@ -18,6 +18,12 @@ interface DisburseParams {
     rail?: PayoutRail;
     fallbackRails?: PayoutRail[];
     checkBalanceBeforeDisburse?: boolean;
+    /**
+     * Defaults to false. When false, ambiguous timeout/502/504 errors during a payout POST
+     * trigger a status lookup first and halt automatic failover if state cannot be confirmed,
+     * preventing double payouts.
+     */
+    allowUnsafeTimeoutFailover?: boolean;
     stripeAccountId?: string;
     speed?: PayoutSpeed;
     bankDetails?: BankAccountDetails;
@@ -96,9 +102,13 @@ interface OnboardingLinkResult {
     expiresAt?: Date;
 }
 interface OmniPayoutConfig {
+    /** Per-request HTTP timeout in milliseconds (defaults to 30000ms). */
+    timeoutMs?: number;
     stripe?: {
         secretKey: string;
         webhookSecret?: string;
+        /** Maximum allowed webhook timestamp age in seconds (defaults to 300s). */
+        webhookToleranceSec?: number;
     };
     flutterwave?: {
         secretKey: string;
@@ -134,6 +144,44 @@ interface OmniPayoutConfig {
     health?: HealthConfig;
 }
 
+declare class PayoutProviderError extends Error {
+    readonly rail: PayoutRail;
+    readonly statusCode?: number;
+    readonly isAmbiguous: boolean;
+    constructor(opts: {
+        message: string;
+        rail: PayoutRail;
+        statusCode?: number;
+        isAmbiguous: boolean;
+    });
+}
+declare class PayoutAmbiguousError extends Error {
+    readonly rail: PayoutRail;
+    readonly reference: string;
+    readonly isAmbiguous = true;
+    constructor(rail: PayoutRail, reference: string, causeMessage: string);
+}
+declare function currencyExponent(currency: string): number;
+declare function toMinorUnits(amount: number, currency: string): number;
+declare function fromMinorUnits(minorAmount: number, currency: string): number;
+declare function validateDisburseInputs(amount: number, currency: string, reference: string): void;
+declare function validateSafeIdentifier(value: string, fieldName: string): string;
+declare function sanitizeBaseUrl(baseUrl: string | undefined, defaultUrl: string): string;
+/**
+ * Deterministically converts any reference string into a valid RFC 4122 UUID
+ * so PawaPay accepts human-readable references while preserving retry idempotency.
+ */
+declare function toDeterministicUuid(reference: string): string;
+/**
+ * Determines whether an HTTP status code from a POST disbursement is ambiguous
+ * (i.e. the upstream bank/MNO may still have received and processed it).
+ * 4xx and 501/503 are pre-execution rejections; 500/502/504 and network timeouts are ambiguous.
+ */
+declare function isHttpStatusAmbiguous(statusCode: number): boolean;
+declare function fetchWithTimeout(url: string, options: RequestInit, timeoutMs: number, rail: PayoutRail, isMutatingPost?: boolean): Promise<Response>;
+declare function constantTimeHexEqual(providedSig: string, expectedHex: string): boolean;
+declare function constantTimeStringEqual(provided: string, expected: string): boolean;
+
 declare class RailHealthTracker {
     private readonly failureThreshold;
     private readonly cooldownMs;
@@ -148,9 +196,8 @@ declare class RailHealthTracker {
 }
 
 declare class StripeConnectAdapter {
-    private readonly secretKey;
-    private readonly webhookSecret?;
-    constructor(secretKey: string, webhookSecret?: string | undefined);
+    #private;
+    constructor(secretKey: string, webhookSecret?: string, timeoutMs?: number, webhookToleranceSec?: number);
     private request;
     disburse(params: DisburseParams): Promise<DisburseResult>;
     getPayoutStatus(transactionId: string, stripeAccountId?: string, reference?: string): Promise<DisburseResult>;
@@ -160,9 +207,8 @@ declare class StripeConnectAdapter {
 }
 
 declare class FlutterwaveAdapter {
-    private readonly secretKey;
-    private readonly webhookSecret?;
-    constructor(secretKey: string, webhookSecret?: string | undefined);
+    #private;
+    constructor(secretKey: string, webhookSecret?: string, timeoutMs?: number);
     private request;
     resolveBankAccount(bankCode: string, accountNumber: string): Promise<BankResolutionResult>;
     disburse(params: DisburseParams): Promise<DisburseResult>;
@@ -172,9 +218,8 @@ declare class FlutterwaveAdapter {
 }
 
 declare class PaystackAdapter {
-    private readonly secretKey;
-    private readonly webhookSecret?;
-    constructor(secretKey: string, webhookSecret?: string | undefined);
+    #private;
+    constructor(secretKey: string, webhookSecret?: string, timeoutMs?: number);
     private request;
     resolveBankAccount(bankCode: string, accountNumber: string): Promise<BankResolutionResult>;
     disburse(params: DisburseParams): Promise<DisburseResult>;
@@ -184,10 +229,8 @@ declare class PaystackAdapter {
 }
 
 declare class PawaPayAdapter {
-    private readonly apiToken;
-    private readonly webhookSecret?;
-    private readonly baseUrl;
-    constructor(apiToken: string, baseUrl?: string, webhookSecret?: string | undefined);
+    #private;
+    constructor(apiToken: string, baseUrl?: string, webhookSecret?: string, timeoutMs?: number);
     private request;
     disburse(params: DisburseParams): Promise<DisburseResult>;
     getPayoutStatus(transactionId: string, reference?: string): Promise<DisburseResult>;
@@ -196,11 +239,8 @@ declare class PawaPayAdapter {
 }
 
 declare class YellowCardAdapter {
-    private readonly apiKey;
-    private readonly secretKey;
-    private readonly webhookSecret?;
-    private readonly baseUrl;
-    constructor(apiKey: string, secretKey: string, baseUrl?: string, webhookSecret?: string | undefined);
+    #private;
+    constructor(apiKey: string, secretKey: string, baseUrl?: string, webhookSecret?: string, timeoutMs?: number);
     private buildAuthHeaders;
     private request;
     disburse(params: DisburseParams): Promise<DisburseResult>;
@@ -221,11 +261,8 @@ interface MpesaDarajaConfig {
     webhookSecret?: string;
 }
 declare class MpesaDarajaAdapter {
-    private readonly config;
-    private readonly baseUrl;
-    private cachedToken?;
-    private tokenExpiresAt;
-    constructor(config: MpesaDarajaConfig);
+    #private;
+    constructor(config: MpesaDarajaConfig, timeoutMs?: number);
     private getAccessToken;
     private request;
     disburse(params: DisburseParams): Promise<DisburseResult>;
@@ -235,13 +272,7 @@ declare class MpesaDarajaAdapter {
 }
 
 declare class OmniPayoutEngine {
-    private readonly stripe?;
-    private readonly flutterwave?;
-    private readonly paystack?;
-    private readonly pawapay?;
-    private readonly yellowCard?;
-    private readonly mpesaDaraja?;
-    private readonly health;
+    #private;
     constructor(config: OmniPayoutConfig);
     private getConfiguredRails;
     /**
@@ -250,7 +281,8 @@ declare class OmniPayoutEngine {
     resolveRail(params: DisburseParams): PayoutRail;
     private disburseOnRail;
     /**
-     * Unified disbursement method with circuit-breaker health checks, pre-flight balance checks, and automatic failover.
+     * Unified disbursement method with input sanitization, circuit-breaker health checks,
+     * pre-flight float balance checks, and timeout-safe failover (preventing double payouts).
      */
     disburse(params: DisburseParams): Promise<DisburseResult>;
     /**
@@ -279,4 +311,4 @@ declare class OmniPayoutEngine {
     createConnectOnboardingLink(params: OnboardingLinkParams): Promise<OnboardingLinkResult>;
 }
 
-export { type BankAccountDetails, type BankResolutionResult, type DisburseParams, type DisburseResult, FlutterwaveAdapter, type HealthConfig, type MobileMoneyDetails, MpesaDarajaAdapter, type MpesaDarajaConfig, type OmniPayoutConfig, OmniPayoutEngine, type OnboardingLinkParams, type OnboardingLinkResult, PawaPayAdapter, type PayoutRail, type PayoutSpeed, type PayoutStatus, type PayoutStatusParams, PaystackAdapter, type RailBalance, type RailHealth, RailHealthTracker, StripeConnectAdapter, type WebhookEvent, YellowCardAdapter };
+export { type BankAccountDetails, type BankResolutionResult, type DisburseParams, type DisburseResult, FlutterwaveAdapter, type HealthConfig, type MobileMoneyDetails, MpesaDarajaAdapter, type MpesaDarajaConfig, type OmniPayoutConfig, OmniPayoutEngine, type OnboardingLinkParams, type OnboardingLinkResult, PawaPayAdapter, PayoutAmbiguousError, PayoutProviderError, type PayoutRail, type PayoutSpeed, type PayoutStatus, type PayoutStatusParams, PaystackAdapter, type RailBalance, type RailHealth, RailHealthTracker, StripeConnectAdapter, type WebhookEvent, YellowCardAdapter, constantTimeHexEqual, constantTimeStringEqual, currencyExponent, fetchWithTimeout, fromMinorUnits, isHttpStatusAmbiguous, sanitizeBaseUrl, toDeterministicUuid, toMinorUnits, validateDisburseInputs, validateSafeIdentifier };

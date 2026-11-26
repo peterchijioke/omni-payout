@@ -1,4 +1,3 @@
-import crypto from 'crypto';
 import {
   BankResolutionResult,
   DisburseParams,
@@ -7,6 +6,13 @@ import {
   RailBalance,
   WebhookEvent,
 } from '../types';
+import {
+  PayoutProviderError,
+  constantTimeStringEqual,
+  fetchWithTimeout,
+  isHttpStatusAmbiguous,
+  validateSafeIdentifier,
+} from '../utils';
 
 function normalizeFlutterwaveStatus(rawStatus?: string): PayoutStatus {
   if (!rawStatus) return 'PENDING';
@@ -25,25 +31,47 @@ function normalizeFlutterwaveStatus(rawStatus?: string): PayoutStatus {
 }
 
 export class FlutterwaveAdapter {
-  constructor(
-    private readonly secretKey: string,
-    private readonly webhookSecret?: string
-  ) {
+  readonly #secretKey: string;
+  readonly #webhookSecret?: string;
+  readonly #timeoutMs: number;
+
+  constructor(secretKey: string, webhookSecret?: string, timeoutMs = 30_000) {
     if (!secretKey) throw new Error('Flutterwave secret key is required');
+    this.#secretKey = secretKey;
+    this.#webhookSecret = webhookSecret;
+    this.#timeoutMs = timeoutMs;
   }
 
-  private async request(endpoint: string, options: RequestInit = {}): Promise<any> {
+  private async request(
+    endpoint: string,
+    options: RequestInit = {},
+    isMutatingDisburse = false
+  ): Promise<any> {
     const url = `https://api.flutterwave.com/v3${endpoint}`;
-    const headers = {
-      Authorization: `Bearer ${this.secretKey}`,
-      'Content-Type': 'application/json',
-      ...options.headers,
+    const headers: Record<string, string> = {
+      Authorization: `Bearer ${this.#secretKey}`,
+      ...(options.headers as Record<string, string>),
     };
+    if (options.method && options.method.toUpperCase() !== 'GET' && !headers['Content-Type']) {
+      headers['Content-Type'] = 'application/json';
+    }
 
-    const res = await fetch(url, { ...options, headers });
+    const res = await fetchWithTimeout(
+      url,
+      { ...options, headers },
+      this.#timeoutMs,
+      'FLUTTERWAVE',
+      isMutatingDisburse
+    );
     const data = await res.json();
     if (!res.ok || data.status === 'error') {
-      throw new Error(data?.message || `Flutterwave request failed with status ${res.status}`);
+      const status = res.status || (res.ok ? 400 : 500);
+      throw new PayoutProviderError({
+        message: data?.message || `Flutterwave request failed with status ${status}`,
+        rail: 'FLUTTERWAVE',
+        statusCode: status,
+        isAmbiguous: isMutatingDisburse && !res.ok && isHttpStatusAmbiguous(status),
+      });
     }
     return data;
   }
@@ -87,13 +115,19 @@ export class FlutterwaveAdapter {
         narration: params.narration || 'Mobile Money payout',
       };
     } else {
-      throw new Error('Either bankDetails or mobileMoneyDetails must be provided for African disbursements');
+      throw new Error(
+        'Either bankDetails or mobileMoneyDetails must be provided for African disbursements'
+      );
     }
 
-    const res = await this.request('/transfers', {
-      method: 'POST',
-      body: JSON.stringify(payload),
-    });
+    const res = await this.request(
+      '/transfers',
+      {
+        method: 'POST',
+        body: JSON.stringify(payload),
+      },
+      true
+    );
 
     const transferData = res.data || {};
     const status = normalizeFlutterwaveStatus(transferData.status);
@@ -115,7 +149,8 @@ export class FlutterwaveAdapter {
   }
 
   async getPayoutStatus(transactionId: string, reference?: string): Promise<DisburseResult> {
-    const res = await this.request(`/transfers/${transactionId}`, {
+    const safeId = validateSafeIdentifier(transactionId, 'transactionId');
+    const res = await this.request(`/transfers/${safeId}`, {
       method: 'GET',
     });
 
@@ -145,18 +180,18 @@ export class FlutterwaveAdapter {
       rail: 'FLUTTERWAVE' as const,
       currency: String(row.currency || '').toUpperCase(),
       available: Number(row.available_balance || 0),
-      pending: row.ledger_balance !== undefined ? Number(row.ledger_balance) - Number(row.available_balance || 0) : undefined,
+      pending:
+        row.ledger_balance !== undefined
+          ? Number(row.ledger_balance) - Number(row.available_balance || 0)
+          : undefined,
     }));
   }
 
   verifyWebhook(rawBody: string, verifHash: string): WebhookEvent {
-    if (!this.webhookSecret) {
+    if (!this.#webhookSecret) {
       throw new Error('Flutterwave webhookSecret is required to verify webhooks');
     }
-
-    const sigBuf = Buffer.from(verifHash || '', 'utf8');
-    const expBuf = Buffer.from(this.webhookSecret, 'utf8');
-    if (sigBuf.length !== expBuf.length || !crypto.timingSafeEqual(sigBuf, expBuf)) {
+    if (!constantTimeStringEqual(verifHash, this.#webhookSecret)) {
       throw new Error('Invalid Flutterwave webhook signature');
     }
 
@@ -174,7 +209,8 @@ export class FlutterwaveAdapter {
       providerStatus: data.status,
       amount: data.amount ? Number(data.amount) : 0,
       currency: String(data.currency || '').toUpperCase(),
-      error: status === 'FAILED' ? data.complete_message || 'Flutterwave transfer failed' : undefined,
+      error:
+        status === 'FAILED' ? data.complete_message || 'Flutterwave transfer failed' : undefined,
       rawPayload: payload,
     };
   }

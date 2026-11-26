@@ -6,9 +6,16 @@ import (
 	"crypto/sha256"
 	"crypto/sha512"
 	"encoding/hex"
+	"encoding/json"
+	"errors"
+	"fmt"
 	"io"
+	"math"
 	"net/http"
+	"strconv"
+	"strings"
 	"testing"
+	"time"
 )
 
 type roundTripFunc func(req *http.Request) *http.Response
@@ -320,7 +327,7 @@ func TestVerifyWebhooks(t *testing.T) {
 
 	// Stripe webhook
 	stripeBody := []byte(`{"type":"payout.paid","data":{"object":{"id":"po_go_1","status":"paid","amount":15000,"currency":"usd","metadata":{"reference":"REF-GO-STRIPE"}}}}`)
-	ts := "1700000000"
+	ts := strconv.FormatInt(time.Now().Unix(), 10)
 	mac256 := hmac.New(sha256.New, []byte("whsec_go_test"))
 	mac256.Write([]byte(ts + "."))
 	mac256.Write(stripeBody)
@@ -330,6 +337,15 @@ func TestVerifyWebhooks(t *testing.T) {
 	}
 	if stripeEv.Status != string(StatusSuccessful) || stripeEv.Reference != "REF-GO-STRIPE" || stripeEv.Amount != 150 {
 		t.Errorf("unexpected stripe webhook event: %+v", stripeEv)
+	}
+
+	// Reject stale Stripe webhook timestamp (> 300s old)
+	staleTs := strconv.FormatInt(time.Now().Unix()-600, 10)
+	staleMac := hmac.New(sha256.New, []byte("whsec_go_test"))
+	staleMac.Write([]byte(staleTs + "."))
+	staleMac.Write(stripeBody)
+	if _, err := engine.VerifyWebhook(RailStripeConnect, stripeBody, "t="+staleTs+",v1="+hex.EncodeToString(staleMac.Sum(nil))); err == nil {
+		t.Errorf("expected replay protection error for stale stripe webhook")
 	}
 
 	// Flutterwave webhook
@@ -472,5 +488,117 @@ func TestPawaPayYellowCardMpesaAndCircuitBreaker(t *testing.T) {
 	})
 	if err != nil || flwCalls != 2 || cbRes.Rail != RailPaystack || cbRes.FailoverFrom != RailFlutterwave {
 		t.Fatalf("expected proactive circuit-breaker failover to Paystack, flwCalls=%d res=%+v err=%v", flwCalls, cbRes, err)
+	}
+}
+
+func TestTimeoutSafeFailoverZeroDecimalAndSecurityHardening(t *testing.T) {
+	cfg := Config{
+		StripeSecretKey:      "sk_secret_do_not_leak",
+		FlutterwaveSecretKey: "flw_secret_do_not_leak",
+		PaystackSecretKey:    "ps_secret_do_not_leak",
+		PawaPayAPIToken:      "pp_secret_do_not_leak",
+		MpesaDaraja: &MpesaDarajaConfig{
+			ConsumerKey:        "mp_key_secret",
+			ConsumerSecret:     "mp_sec_secret",
+			ShortCode:          "600999",
+			InitiatorName:      "init",
+			SecurityCredential: "cred_secret",
+			ResultURL:          "https://example.com/res",
+			QueueTimeoutURL:    "https://example.com/to",
+		},
+	}
+	engine := NewEngine(cfg)
+
+	// 1. Secret redaction in fmt and JSON
+	if strings.Contains(fmt.Sprintf("%v %s", cfg, engine), "do_not_leak") {
+		t.Fatalf("secrets leaked in String() output")
+	}
+	cfgJSON, _ := json.Marshal(cfg)
+	if strings.Contains(string(cfgJSON), "do_not_leak") || strings.Contains(string(cfgJSON), "mp_sec_secret") {
+		t.Fatalf("secrets leaked in json.Marshal(Config): %s", string(cfgJSON))
+	}
+
+	// 2. Input sanitization (NaN, CRLF, path traversal, unsigned webhook)
+	if _, err := engine.Disburse(DisburseParams{Amount: math.NaN(), Currency: "USD", Reference: "R1", StripeAccountID: "acct_1"}); err == nil {
+		t.Fatalf("expected error for NaN amount")
+	}
+	if _, err := engine.Disburse(DisburseParams{Amount: 10, Currency: "USD", Reference: "R1\r\nEvil:1", StripeAccountID: "acct_1"}); err == nil {
+		t.Fatalf("expected error for control chars in reference")
+	}
+	if _, err := engine.GetPayoutStatus(PayoutStatusParams{TransactionID: "../../charges", Rail: RailStripeConnect}); err == nil {
+		t.Fatalf("expected error for path traversal transactionId")
+	}
+	if _, err := engine.VerifyWebhook(RailPawaPay, []byte(`{}`), "sig"); err == nil {
+		t.Fatalf("expected error when PawaPayWebhookSecret is unconfigured")
+	}
+
+	// 3. Ambiguous 504 on Flutterwave halts failover (Paystack is NOT called)
+	psCalled := false
+	oauthCalls := 0
+	var stripeForm string
+	var pawaPayBody map[string]interface{}
+
+	engine.httpClient = &http.Client{
+		Transport: roundTripFunc(func(req *http.Request) *http.Response {
+			switch req.URL.Host {
+			case "api.flutterwave.com":
+				return &http.Response{
+					StatusCode: 504,
+					Body:       io.NopCloser(bytes.NewBufferString(`{"status":"error","message":"gateway timeout"}`)),
+					Header:     make(http.Header),
+				}
+			case "api.paystack.co":
+				psCalled = true
+				return &http.Response{StatusCode: 200, Body: io.NopCloser(bytes.NewBufferString(`{"status":true}`)), Header: make(http.Header)}
+			case "api.stripe.com":
+				b, _ := io.ReadAll(req.Body)
+				stripeForm = string(b)
+				return &http.Response{StatusCode: 200, Body: io.NopCloser(bytes.NewBufferString(`{"id":"tr_rwf_1"}`)), Header: make(http.Header)}
+			case "api.pawapay.io":
+				b, _ := io.ReadAll(req.Body)
+				_ = json.Unmarshal(b, &pawaPayBody)
+				return &http.Response{StatusCode: 200, Body: io.NopCloser(bytes.NewBufferString(`{"status":"ACCEPTED"}`)), Header: make(http.Header)}
+			default: // Safaricom M-Pesa OAuth caching check
+				if req.URL.Path == "/oauth/v1/generate" {
+					oauthCalls++
+					return &http.Response{StatusCode: 200, Body: io.NopCloser(bytes.NewBufferString(`{"access_token":"cached_tok","expires_in":"3599"}`)), Header: make(http.Header)}
+				}
+				return &http.Response{StatusCode: 200, Body: io.NopCloser(bytes.NewBufferString(`{"ResponseCode":"0","ConversationID":"AG_CACHE"}`)), Header: make(http.Header)}
+			}
+		}),
+	}
+
+	_, err := engine.Disburse(DisburseParams{
+		Amount: 20000, Currency: "NGN", Reference: "AMB-GO-1",
+		Rail: RailFlutterwave, FallbackRails: []PayoutRail{RailPaystack},
+		BankDetails: &BankAccountDetails{BankCode: "058", AccountNumber: "0123456789"},
+	})
+	var ambErr *AmbiguousPayoutError
+	if !errors.As(err, &ambErr) || psCalled {
+		t.Fatalf("expected AmbiguousPayoutError and zero Paystack calls, err=%v psCalled=%v", err, psCalled)
+	}
+
+	// 4. Zero-decimal RWF on Stripe (5000 RWF -> amount=5000, not 500000)
+	if _, err := engine.Disburse(DisburseParams{Amount: 5000, Currency: "RWF", Reference: "RWF-1", StripeAccountID: "acct_1"}); err != nil {
+		t.Fatalf("unexpected RWF error: %v", err)
+	}
+	if !strings.Contains(stripeForm, "amount=5000") || strings.Contains(stripeForm, "amount=500000") {
+		t.Fatalf("expected zero-decimal amount=5000, got form: %s", stripeForm)
+	}
+
+	// 5. PawaPay deterministic UUID conversion with stable original Reference
+	ppRes, err := engine.Disburse(DisburseParams{
+		Amount: 1500, Currency: "KES", Reference: "HUMAN-REF-GO", Rail: RailPawaPay,
+		MobileMoneyDetails: &MobileMoneyDetails{Phone: "254712345678", Network: "MPESA"},
+	})
+	if err != nil || ppRes.Reference != "HUMAN-REF-GO" || !uuidRegex.MatchString(fmt.Sprint(pawaPayBody["payoutId"])) {
+		t.Fatalf("expected deterministic UUID payoutId and preserved reference, res=%+v body=%+v err=%v", ppRes, pawaPayBody, err)
+	}
+
+	// 6. M-Pesa OAuth token cache: 2 disbursements -> only 1 OAuth request
+	_, _ = engine.Disburse(DisburseParams{Amount: 1000, Currency: "KES", Reference: "MP-C1", Rail: RailMpesaDaraja, MobileMoneyDetails: &MobileMoneyDetails{Phone: "254712345678", Network: "MPESA"}})
+	_, _ = engine.Disburse(DisburseParams{Amount: 1000, Currency: "KES", Reference: "MP-C2", Rail: RailMpesaDaraja, MobileMoneyDetails: &MobileMoneyDetails{Phone: "254712345678", Network: "MPESA"}})
+	if oauthCalls != 1 {
+		t.Fatalf("expected M-Pesa OAuth token to be cached (1 call), got %d calls", oauthCalls)
 	}
 }

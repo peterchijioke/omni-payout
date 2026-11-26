@@ -1,5 +1,14 @@
 import crypto from 'crypto';
 import { DisburseParams, DisburseResult, PayoutStatus, RailBalance, WebhookEvent } from '../types';
+import {
+  PayoutProviderError,
+  constantTimeHexEqual,
+  fetchWithTimeout,
+  isHttpStatusAmbiguous,
+  sanitizeBaseUrl,
+  toDeterministicUuid,
+  validateSafeIdentifier,
+} from '../utils';
 
 function normalizePawaPayStatus(rawStatus?: string): PayoutStatus {
   if (!rawStatus) return 'PENDING';
@@ -36,35 +45,52 @@ function resolvePawaPayCorrespondent(network: string, currency: string): string 
 }
 
 export class PawaPayAdapter {
-  private readonly baseUrl: string;
+  readonly #apiToken: string;
+  readonly #baseUrl: string;
+  readonly #webhookSecret?: string;
+  readonly #timeoutMs: number;
 
-  constructor(
-    private readonly apiToken: string,
-    baseUrl?: string,
-    private readonly webhookSecret?: string
-  ) {
+  constructor(apiToken: string, baseUrl?: string, webhookSecret?: string, timeoutMs = 30_000) {
     if (!apiToken) throw new Error('PawaPay apiToken is required');
-    this.baseUrl = (baseUrl || 'https://api.pawapay.io').replace(/\/$/, '');
+    this.#apiToken = apiToken;
+    this.#baseUrl = sanitizeBaseUrl(baseUrl, 'https://api.pawapay.io');
+    this.#webhookSecret = webhookSecret;
+    this.#timeoutMs = timeoutMs;
   }
 
-  private async request(endpoint: string, options: RequestInit = {}): Promise<any> {
-    const url = `${this.baseUrl}${endpoint}`;
+  private async request(
+    endpoint: string,
+    options: RequestInit = {},
+    isMutatingDisburse = false
+  ): Promise<any> {
+    const url = `${this.#baseUrl}${endpoint}`;
     const headers: Record<string, string> = {
-      Authorization: `Bearer ${this.apiToken}`,
+      Authorization: `Bearer ${this.#apiToken}`,
       ...(options.headers as Record<string, string>),
     };
     if (options.method && options.method.toUpperCase() !== 'GET' && !headers['Content-Type']) {
       headers['Content-Type'] = 'application/json';
     }
 
-    const res = await fetch(url, { ...options, headers });
+    const res = await fetchWithTimeout(
+      url,
+      { ...options, headers },
+      this.#timeoutMs,
+      'PAWAPAY',
+      isMutatingDisburse
+    );
     const data = await res.json();
     if (!res.ok) {
-      throw new Error(
-        data?.failureReason?.failureMessage ||
+      const status = res.status || 500;
+      throw new PayoutProviderError({
+        message:
+          data?.failureReason?.failureMessage ||
           data?.message ||
-          `PawaPay request failed with status ${res.status}`
-      );
+          `PawaPay request failed with status ${status}`,
+        rail: 'PAWAPAY',
+        statusCode: status,
+        isAmbiguous: isMutatingDisburse && isHttpStatusAmbiguous(status),
+      });
     }
     return data;
   }
@@ -79,8 +105,11 @@ export class PawaPayAdapter {
       params.metadata?.correspondent ||
       resolvePawaPayCorrespondent(params.mobileMoneyDetails.network, currency);
 
+    // PawaPay strictly requires payoutId to be a valid UUID; hash non-UUID references deterministically
+    const payoutId = toDeterministicUuid(params.reference);
+
     const payload = {
-      payoutId: params.reference,
+      payoutId,
       amount: String(params.amount),
       currency,
       correspondent,
@@ -94,10 +123,14 @@ export class PawaPayAdapter {
       statementDescription: (params.narration || 'Marketplace payout').slice(0, 22),
     };
 
-    const data = await this.request('/payouts', {
-      method: 'POST',
-      body: JSON.stringify(payload),
-    });
+    const data = await this.request(
+      '/payouts',
+      {
+        method: 'POST',
+        body: JSON.stringify(payload),
+      },
+      true
+    );
 
     const rawStatus = data.status || 'ACCEPTED';
     const status = normalizePawaPayStatus(rawStatus);
@@ -105,8 +138,8 @@ export class PawaPayAdapter {
 
     return {
       success: status !== 'FAILED',
-      transactionId: String(data.payoutId || params.reference),
-      reference: String(data.payoutId || params.reference),
+      transactionId: String(data.payoutId || payoutId),
+      reference: params.reference,
       status,
       providerStatus: rawStatus,
       rail: 'PAWAPAY',
@@ -118,21 +151,25 @@ export class PawaPayAdapter {
   }
 
   async getPayoutStatus(transactionId: string, reference?: string): Promise<DisburseResult> {
-    const id = reference || transactionId;
-    const raw = await this.request(`/payouts/${encodeURIComponent(id)}`, { method: 'GET' });
+    const lookupId = reference ? toDeterministicUuid(reference) : transactionId;
+    const safeId = validateSafeIdentifier(lookupId, 'payoutId');
+    const raw = await this.request(`/payouts/${safeId}`, { method: 'GET' });
     const data = Array.isArray(raw) ? raw[0] || {} : raw.data || raw;
     const status = normalizePawaPayStatus(data.status);
 
     return {
       success: status !== 'FAILED',
-      transactionId: String(data.payoutId || transactionId),
-      reference: String(data.payoutId || reference || transactionId),
+      transactionId: String(data.payoutId || lookupId),
+      reference: reference || String(data.payoutId || transactionId),
       status,
       providerStatus: data.status,
       rail: 'PAWAPAY',
       amount: data.amount ? Number(data.amount) : 0,
       currency: String(data.currency || '').toUpperCase(),
-      error: status === 'FAILED' ? data.failureReason?.failureMessage || 'PawaPay payout failed' : undefined,
+      error:
+        status === 'FAILED'
+          ? data.failureReason?.failureMessage || 'PawaPay payout failed'
+          : undefined,
       rawResponse: raw,
     };
   }
@@ -148,13 +185,12 @@ export class PawaPayAdapter {
   }
 
   verifyWebhook(rawBody: string, signature: string): WebhookEvent {
-    if (this.webhookSecret) {
-      const expected = crypto.createHmac('sha256', this.webhookSecret).update(rawBody).digest('hex');
-      const sigBuf = Buffer.from(signature || '', 'utf8');
-      const expBuf = Buffer.from(expected, 'utf8');
-      if (sigBuf.length !== expBuf.length || !crypto.timingSafeEqual(sigBuf, expBuf)) {
-        throw new Error('Invalid PawaPay webhook signature');
-      }
+    if (!this.#webhookSecret) {
+      throw new Error('PawaPay webhookSecret is required to verify webhooks');
+    }
+    const expected = crypto.createHmac('sha256', this.#webhookSecret).update(rawBody).digest('hex');
+    if (!constantTimeHexEqual(signature, expected)) {
+      throw new Error('Invalid PawaPay webhook signature');
     }
 
     const payload = JSON.parse(rawBody);
@@ -169,7 +205,10 @@ export class PawaPayAdapter {
       providerStatus: payload.status,
       amount: payload.amount ? Number(payload.amount) : 0,
       currency: String(payload.currency || '').toUpperCase(),
-      error: status === 'FAILED' ? payload.failureReason?.failureMessage || 'PawaPay payout failed' : undefined,
+      error:
+        status === 'FAILED'
+          ? payload.failureReason?.failureMessage || 'PawaPay payout failed'
+          : undefined,
       rawPayload: payload,
     };
   }

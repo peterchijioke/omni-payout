@@ -2,6 +2,7 @@ package omnipayout
 
 import (
 	"bytes"
+	"context"
 	"crypto/hmac"
 	"crypto/sha256"
 	"crypto/subtle"
@@ -12,7 +13,6 @@ import (
 	"io"
 	"math"
 	"net/http"
-	"net/url"
 	"strconv"
 	"strings"
 	"time"
@@ -51,19 +51,20 @@ func resolvePawaPayCorrespondent(network, currency string) string {
 	return key
 }
 
-func (e *Engine) pawaPayBaseURL() string {
-	if e.config.PawaPayBaseURL != "" {
-		return strings.TrimRight(e.config.PawaPayBaseURL, "/")
-	}
-	return "https://api.pawapay.io"
+func (e *Engine) pawaPayBaseURL() (string, error) {
+	return sanitizeBaseURL(e.config.PawaPayBaseURL, "https://api.pawapay.io")
 }
 
-func (e *Engine) disbursePawaPay(params DisburseParams) (*DisburseResult, error) {
+func (e *Engine) disbursePawaPay(ctx context.Context, params DisburseParams) (*DisburseResult, error) {
 	if e.config.PawaPayAPIToken == "" {
 		return nil, fmt.Errorf("pawapay apiToken is not configured")
 	}
 	if params.MobileMoneyDetails == nil {
 		return nil, fmt.Errorf("mobileMoneyDetails is required for PawaPay disbursements")
+	}
+	baseURL, err := e.pawaPayBaseURL()
+	if err != nil {
+		return nil, err
 	}
 
 	currency := strings.ToUpper(params.Currency)
@@ -83,8 +84,9 @@ func (e *Engine) disbursePawaPay(params DisburseParams) (*DisburseResult, error)
 		desc = desc[:22]
 	}
 
+	payoutID := toDeterministicUUID(params.Reference)
 	payload := map[string]interface{}{
-		"payoutId":      params.Reference,
+		"payoutId":      payoutID,
 		"amount":        strconv.FormatFloat(params.Amount, 'f', -1, 64),
 		"currency":      currency,
 		"correspondent": correspondent,
@@ -99,7 +101,7 @@ func (e *Engine) disbursePawaPay(params DisburseParams) (*DisburseResult, error)
 	}
 
 	bodyBytes, _ := json.Marshal(payload)
-	req, err := http.NewRequest("POST", e.pawaPayBaseURL()+"/payouts", bytes.NewBuffer(bodyBytes))
+	req, err := http.NewRequestWithContext(ctx, "POST", baseURL+"/payouts", bytes.NewBuffer(bodyBytes))
 	if err != nil {
 		return nil, err
 	}
@@ -108,7 +110,7 @@ func (e *Engine) disbursePawaPay(params DisburseParams) (*DisburseResult, error)
 
 	resp, err := e.httpClient.Do(req)
 	if err != nil {
-		return nil, err
+		return nil, &ProviderError{Rail: RailPawaPay, Message: err.Error(), IsAmbiguous: true}
 	}
 	defer resp.Body.Close()
 
@@ -133,7 +135,12 @@ func (e *Engine) disbursePawaPay(params DisburseParams) (*DisburseResult, error)
 		if msg == "" {
 			msg = fmt.Sprintf("pawapay request failed with status %d", resp.StatusCode)
 		}
-		return nil, fmt.Errorf("%s", msg)
+		return nil, &ProviderError{
+			Rail:        RailPawaPay,
+			StatusCode:  resp.StatusCode,
+			Message:     msg,
+			IsAmbiguous: isHTTPStatusAmbiguous(resp.StatusCode),
+		}
 	}
 
 	rawStatus := data.Status
@@ -143,7 +150,7 @@ func (e *Engine) disbursePawaPay(params DisburseParams) (*DisburseResult, error)
 	status := normalizePawaPayStatus(rawStatus)
 	txID := data.PayoutID
 	if txID == "" {
-		txID = params.Reference
+		txID = payoutID
 	}
 	errMsg := ""
 	if status == string(StatusFailed) {
@@ -159,7 +166,7 @@ func (e *Engine) disbursePawaPay(params DisburseParams) (*DisburseResult, error)
 	return &DisburseResult{
 		Success:        status != string(StatusFailed),
 		TransactionID:  txID,
-		Reference:      txID,
+		Reference:      params.Reference,
 		Status:         status,
 		ProviderStatus: rawStatus,
 		Rail:           RailPawaPay,
@@ -169,16 +176,25 @@ func (e *Engine) disbursePawaPay(params DisburseParams) (*DisburseResult, error)
 	}, nil
 }
 
-func (e *Engine) getPawaPayPayoutStatus(params PayoutStatusParams) (*DisburseResult, error) {
+func (e *Engine) getPawaPayPayoutStatus(ctx context.Context, params PayoutStatusParams) (*DisburseResult, error) {
 	if e.config.PawaPayAPIToken == "" {
 		return nil, fmt.Errorf("pawapay apiToken is not configured")
 	}
-	id := params.Reference
-	if id == "" {
-		id = params.TransactionID
+	baseURL, err := e.pawaPayBaseURL()
+	if err != nil {
+		return nil, err
 	}
 
-	req, err := http.NewRequest("GET", e.pawaPayBaseURL()+"/payouts/"+url.PathEscape(id), nil)
+	lookupID := params.TransactionID
+	if params.Reference != "" {
+		lookupID = toDeterministicUUID(params.Reference)
+	}
+	safeID, err := validateSafeIdentifier(lookupID, "payoutId")
+	if err != nil {
+		return nil, err
+	}
+
+	req, err := http.NewRequestWithContext(ctx, "GET", baseURL+"/payouts/"+safeID, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -192,7 +208,11 @@ func (e *Engine) getPawaPayPayoutStatus(params PayoutStatusParams) (*DisburseRes
 
 	respBytes, _ := io.ReadAll(resp.Body)
 	if resp.StatusCode >= 400 {
-		return nil, fmt.Errorf("pawapay status lookup failed with status %d", resp.StatusCode)
+		return nil, &ProviderError{
+			Rail:       RailPawaPay,
+			StatusCode: resp.StatusCode,
+			Message:    fmt.Sprintf("pawapay status lookup failed with status %d", resp.StatusCode),
+		}
 	}
 
 	type pawaItem struct {
@@ -209,9 +229,14 @@ func (e *Engine) getPawaPayPayoutStatus(params PayoutStatusParams) (*DisburseRes
 	if len(trimmed) > 0 && trimmed[0] == '[' {
 		var list []pawaItem
 		_ = json.Unmarshal(trimmed, &list)
-		if len(list) > 0 {
-			item = list[0]
+		if len(list) == 0 {
+			return nil, &ProviderError{
+				Rail:       RailPawaPay,
+				StatusCode: http.StatusNotFound,
+				Message:    "pawapay payout not found",
+			}
 		}
+		item = list[0]
 	} else {
 		_ = json.Unmarshal(trimmed, &item)
 	}
@@ -220,7 +245,11 @@ func (e *Engine) getPawaPayPayoutStatus(params PayoutStatusParams) (*DisburseRes
 	amt, _ := strconv.ParseFloat(item.Amount, 64)
 	txID := item.PayoutID
 	if txID == "" {
-		txID = params.TransactionID
+		txID = lookupID
+	}
+	ref := params.Reference
+	if ref == "" {
+		ref = txID
 	}
 	errMsg := ""
 	if status == string(StatusFailed) {
@@ -234,7 +263,7 @@ func (e *Engine) getPawaPayPayoutStatus(params PayoutStatusParams) (*DisburseRes
 	return &DisburseResult{
 		Success:        status != string(StatusFailed),
 		TransactionID:  txID,
-		Reference:      txID,
+		Reference:      ref,
 		Status:         status,
 		ProviderStatus: item.Status,
 		Rail:           RailPawaPay,
@@ -244,11 +273,15 @@ func (e *Engine) getPawaPayPayoutStatus(params PayoutStatusParams) (*DisburseRes
 	}, nil
 }
 
-func (e *Engine) getPawaPayBalances() ([]RailBalance, error) {
+func (e *Engine) getPawaPayBalances(ctx context.Context) ([]RailBalance, error) {
 	if e.config.PawaPayAPIToken == "" {
 		return nil, fmt.Errorf("pawapay apiToken is not configured")
 	}
-	req, err := http.NewRequest("GET", e.pawaPayBaseURL()+"/wallets/balances", nil)
+	baseURL, err := e.pawaPayBaseURL()
+	if err != nil {
+		return nil, err
+	}
+	req, err := http.NewRequestWithContext(ctx, "GET", baseURL+"/wallets/balances", nil)
 	if err != nil {
 		return nil, err
 	}
@@ -284,13 +317,14 @@ func (e *Engine) getPawaPayBalances() ([]RailBalance, error) {
 }
 
 func (e *Engine) verifyPawaPayWebhook(rawBody []byte, signature string) (*WebhookEvent, error) {
-	if e.config.PawaPayWebhookSecret != "" {
-		mac := hmac.New(sha256.New, []byte(e.config.PawaPayWebhookSecret))
-		mac.Write(rawBody)
-		expected := hex.EncodeToString(mac.Sum(nil))
-		if subtle.ConstantTimeCompare([]byte(signature), []byte(expected)) != 1 {
-			return nil, fmt.Errorf("invalid pawapay webhook signature")
-		}
+	if e.config.PawaPayWebhookSecret == "" {
+		return nil, fmt.Errorf("pawapay webhookSecret is required to verify webhooks")
+	}
+	mac := hmac.New(sha256.New, []byte(e.config.PawaPayWebhookSecret))
+	mac.Write(rawBody)
+	expected := hex.EncodeToString(mac.Sum(nil))
+	if !constantTimeHexEqual(signature, expected) {
+		return nil, fmt.Errorf("invalid pawapay webhook signature")
 	}
 
 	var payload struct {
@@ -341,14 +375,15 @@ func normalizeYellowCardStatus(raw string) string {
 	}
 }
 
-func (e *Engine) yellowCardBaseURL() string {
-	if e.config.YellowCardBaseURL != "" {
-		return strings.TrimRight(e.config.YellowCardBaseURL, "/")
-	}
-	return "https://api.yellowcard.io"
+func (e *Engine) yellowCardBaseURL() (string, error) {
+	return sanitizeBaseURL(e.config.YellowCardBaseURL, "https://api.yellowcard.io")
 }
 
-func (e *Engine) yellowCardRequest(method, path string, bodyObj interface{}) ([]byte, int, error) {
+func (e *Engine) yellowCardRequest(ctx context.Context, method, path string, bodyObj interface{}, isMutating bool) ([]byte, int, error) {
+	baseURL, err := e.yellowCardBaseURL()
+	if err != nil {
+		return nil, 0, err
+	}
 	var bodyBytes []byte
 	if bodyObj != nil {
 		bodyBytes, _ = json.Marshal(bodyObj)
@@ -358,7 +393,7 @@ func (e *Engine) yellowCardRequest(method, path string, bodyObj interface{}) ([]
 		bodyReader = bytes.NewBuffer(bodyBytes)
 	}
 
-	req, err := http.NewRequest(method, e.yellowCardBaseURL()+path, bodyReader)
+	req, err := http.NewRequestWithContext(ctx, method, baseURL+path, bodyReader)
 	if err != nil {
 		return nil, 0, err
 	}
@@ -382,7 +417,7 @@ func (e *Engine) yellowCardRequest(method, path string, bodyObj interface{}) ([]
 
 	resp, err := e.httpClient.Do(req)
 	if err != nil {
-		return nil, 0, err
+		return nil, 0, &ProviderError{Rail: RailYellowCard, Message: err.Error(), IsAmbiguous: isMutating}
 	}
 	defer resp.Body.Close()
 
@@ -390,7 +425,7 @@ func (e *Engine) yellowCardRequest(method, path string, bodyObj interface{}) ([]
 	return respBytes, resp.StatusCode, nil
 }
 
-func (e *Engine) disburseYellowCard(params DisburseParams) (*DisburseResult, error) {
+func (e *Engine) disburseYellowCard(ctx context.Context, params DisburseParams) (*DisburseResult, error) {
 	if e.config.YellowCardAPIKey == "" || e.config.YellowCardSecretKey == "" {
 		return nil, fmt.Errorf("yellow card apiKey and secretKey are required")
 	}
@@ -447,7 +482,7 @@ func (e *Engine) disburseYellowCard(params DisburseParams) (*DisburseResult, err
 		"forceAccept": true,
 	}
 
-	respBytes, statusCode, err := e.yellowCardRequest("POST", "/business/payments", payload)
+	respBytes, statusCode, err := e.yellowCardRequest(ctx, "POST", "/business/payments", payload, true)
 	if err != nil {
 		return nil, err
 	}
@@ -465,7 +500,12 @@ func (e *Engine) disburseYellowCard(params DisburseParams) (*DisburseResult, err
 		if msg == "" {
 			msg = fmt.Sprintf("yellow card request failed with status %d", statusCode)
 		}
-		return nil, fmt.Errorf("%s", msg)
+		return nil, &ProviderError{
+			Rail:        RailYellowCard,
+			StatusCode:  statusCode,
+			Message:     msg,
+			IsAmbiguous: isHTTPStatusAmbiguous(statusCode),
+		}
 	}
 
 	status := normalizeYellowCardStatus(data.Status)
@@ -499,21 +539,36 @@ func (e *Engine) disburseYellowCard(params DisburseParams) (*DisburseResult, err
 	}, nil
 }
 
-func (e *Engine) getYellowCardPayoutStatus(params PayoutStatusParams) (*DisburseResult, error) {
+func (e *Engine) getYellowCardPayoutStatus(ctx context.Context, params PayoutStatusParams) (*DisburseResult, error) {
 	if e.config.YellowCardAPIKey == "" || e.config.YellowCardSecretKey == "" {
 		return nil, fmt.Errorf("yellow card apiKey and secretKey are required")
 	}
-	path := "/business/payments/" + url.PathEscape(params.TransactionID)
+
+	var path string
 	if params.Reference != "" {
-		path = "/business/payments/sequence-id/" + url.PathEscape(params.Reference)
+		safeRef, err := validateSafeIdentifier(params.Reference, "reference")
+		if err != nil {
+			return nil, err
+		}
+		path = "/business/payments/sequence-id/" + safeRef
+	} else {
+		safeID, err := validateSafeIdentifier(params.TransactionID, "transactionId")
+		if err != nil {
+			return nil, err
+		}
+		path = "/business/payments/" + safeID
 	}
 
-	respBytes, statusCode, err := e.yellowCardRequest("GET", path, nil)
+	respBytes, statusCode, err := e.yellowCardRequest(ctx, "GET", path, nil, false)
 	if err != nil {
 		return nil, err
 	}
 	if statusCode >= 400 {
-		return nil, fmt.Errorf("yellow card status lookup failed with status %d", statusCode)
+		return nil, &ProviderError{
+			Rail:       RailYellowCard,
+			StatusCode: statusCode,
+			Message:    fmt.Sprintf("yellow card status lookup failed with status %d", statusCode),
+		}
 	}
 
 	var data struct {
@@ -564,11 +619,11 @@ func (e *Engine) getYellowCardPayoutStatus(params PayoutStatusParams) (*Disburse
 	}, nil
 }
 
-func (e *Engine) getYellowCardBalances() ([]RailBalance, error) {
+func (e *Engine) getYellowCardBalances(ctx context.Context) ([]RailBalance, error) {
 	if e.config.YellowCardAPIKey == "" || e.config.YellowCardSecretKey == "" {
 		return nil, fmt.Errorf("yellow card apiKey and secretKey are required")
 	}
-	respBytes, statusCode, err := e.yellowCardRequest("GET", "/business/account", nil)
+	respBytes, statusCode, err := e.yellowCardRequest(ctx, "GET", "/business/account", nil, false)
 	if err != nil {
 		return nil, err
 	}
@@ -612,7 +667,7 @@ func (e *Engine) verifyYellowCardWebhook(rawBody []byte, signature string) (*Web
 	mac := hmac.New(sha256.New, []byte(secret))
 	mac.Write(rawBody)
 	expected := base64.StdEncoding.EncodeToString(mac.Sum(nil))
-	if subtle.ConstantTimeCompare([]byte(signature), []byte(expected)) != 1 {
+	if signature == "" || subtle.ConstantTimeCompare([]byte(signature), []byte(expected)) != 1 {
 		return nil, fmt.Errorf("invalid yellow card webhook signature")
 	}
 
@@ -657,19 +712,32 @@ func (e *Engine) verifyYellowCardWebhook(rawBody []byte, signature string) (*Web
 
 // --- M-Pesa Daraja ---
 
-func (e *Engine) mpesaBaseURL() string {
-	if e.config.MpesaDaraja != nil && e.config.MpesaDaraja.BaseURL != "" {
-		return strings.TrimRight(e.config.MpesaDaraja.BaseURL, "/")
+func (e *Engine) mpesaBaseURL() (string, error) {
+	raw := ""
+	if e.config.MpesaDaraja != nil {
+		raw = e.config.MpesaDaraja.BaseURL
 	}
-	return "https://api.safaricom.co.ke"
+	return sanitizeBaseURL(raw, "https://api.safaricom.co.ke")
 }
 
-func (e *Engine) getMpesaAccessToken() (string, error) {
+func (e *Engine) getMpesaAccessToken(ctx context.Context) (string, error) {
 	cfg := e.config.MpesaDaraja
 	if cfg == nil || cfg.ConsumerKey == "" || cfg.ConsumerSecret == "" {
 		return "", fmt.Errorf("mpesa daraja consumerKey and consumerSecret are required")
 	}
-	req, err := http.NewRequest("GET", e.mpesaBaseURL()+"/oauth/v1/generate?grant_type=client_credentials", nil)
+
+	e.mpesaMu.Lock()
+	defer e.mpesaMu.Unlock()
+
+	if e.mpesaToken != "" && time.Now().Before(e.mpesaTokenExpiry) {
+		return e.mpesaToken, nil
+	}
+
+	baseURL, err := e.mpesaBaseURL()
+	if err != nil {
+		return "", err
+	}
+	req, err := http.NewRequestWithContext(ctx, "GET", baseURL+"/oauth/v1/generate?grant_type=client_credentials", nil)
 	if err != nil {
 		return "", err
 	}
@@ -678,14 +746,15 @@ func (e *Engine) getMpesaAccessToken() (string, error) {
 
 	resp, err := e.httpClient.Do(req)
 	if err != nil {
-		return "", err
+		return "", &ProviderError{Rail: RailMpesaDaraja, Message: err.Error(), IsAmbiguous: false}
 	}
 	defer resp.Body.Close()
 
 	bodyBytes, _ := io.ReadAll(resp.Body)
 	var data struct {
-		AccessToken  string `json:"access_token"`
-		ErrorMessage string `json:"errorMessage"`
+		AccessToken  string      `json:"access_token"`
+		ExpiresIn    interface{} `json:"expires_in"`
+		ErrorMessage string      `json:"errorMessage"`
 	}
 	_ = json.Unmarshal(bodyBytes, &data)
 	if resp.StatusCode >= 400 || data.AccessToken == "" {
@@ -693,18 +762,42 @@ func (e *Engine) getMpesaAccessToken() (string, error) {
 		if msg == "" {
 			msg = fmt.Sprintf("mpesa oauth failed with status %d", resp.StatusCode)
 		}
-		return "", fmt.Errorf("%s", msg)
+		return "", &ProviderError{Rail: RailMpesaDaraja, StatusCode: resp.StatusCode, Message: msg, IsAmbiguous: false}
 	}
+
+	expiresSec := int64(3500)
+	switch v := data.ExpiresIn.(type) {
+	case string:
+		if parsed, pErr := strconv.ParseInt(v, 10, 64); pErr == nil && parsed > 0 {
+			expiresSec = parsed
+		}
+	case float64:
+		if v > 0 {
+			expiresSec = int64(v)
+		}
+	}
+	if expiresSec > 120 {
+		expiresSec -= 60
+	} else {
+		expiresSec = 60
+	}
+
+	e.mpesaToken = data.AccessToken
+	e.mpesaTokenExpiry = time.Now().Add(time.Duration(expiresSec) * time.Second)
 	return data.AccessToken, nil
 }
 
-func (e *Engine) mpesaPost(path string, body interface{}) ([]byte, error) {
-	token, err := e.getMpesaAccessToken()
+func (e *Engine) mpesaPost(ctx context.Context, path string, body interface{}, isMutating bool) ([]byte, error) {
+	baseURL, err := e.mpesaBaseURL()
+	if err != nil {
+		return nil, err
+	}
+	token, err := e.getMpesaAccessToken(ctx)
 	if err != nil {
 		return nil, err
 	}
 	jsonBytes, _ := json.Marshal(body)
-	req, err := http.NewRequest("POST", e.mpesaBaseURL()+path, bytes.NewBuffer(jsonBytes))
+	req, err := http.NewRequestWithContext(ctx, "POST", baseURL+path, bytes.NewBuffer(jsonBytes))
 	if err != nil {
 		return nil, err
 	}
@@ -713,7 +806,7 @@ func (e *Engine) mpesaPost(path string, body interface{}) ([]byte, error) {
 
 	resp, err := e.httpClient.Do(req)
 	if err != nil {
-		return nil, err
+		return nil, &ProviderError{Rail: RailMpesaDaraja, Message: err.Error(), IsAmbiguous: isMutating}
 	}
 	defer resp.Body.Close()
 
@@ -732,12 +825,21 @@ func (e *Engine) mpesaPost(path string, body interface{}) ([]byte, error) {
 		if msg == "" {
 			msg = fmt.Sprintf("mpesa daraja request failed with status %d", resp.StatusCode)
 		}
-		return nil, fmt.Errorf("%s", msg)
+		st := resp.StatusCode
+		if st < 400 {
+			st = 400
+		}
+		return nil, &ProviderError{
+			Rail:        RailMpesaDaraja,
+			StatusCode:  st,
+			Message:     msg,
+			IsAmbiguous: isMutating && resp.StatusCode >= 500 && isHTTPStatusAmbiguous(resp.StatusCode),
+		}
 	}
 	return respBytes, nil
 }
 
-func (e *Engine) disburseMpesaDaraja(params DisburseParams) (*DisburseResult, error) {
+func (e *Engine) disburseMpesaDaraja(ctx context.Context, params DisburseParams) (*DisburseResult, error) {
 	cfg := e.config.MpesaDaraja
 	if cfg == nil {
 		return nil, fmt.Errorf("mpesa daraja is not configured")
@@ -755,7 +857,7 @@ func (e *Engine) disburseMpesaDaraja(params DisburseParams) (*DisburseResult, er
 		remarks = "Marketplace payout"
 	}
 
-	respBytes, err := e.mpesaPost("/mpesa/b2c/v3/paymentrequest", map[string]interface{}{
+	respBytes, err := e.mpesaPost(ctx, "/mpesa/b2c/v3/paymentrequest", map[string]interface{}{
 		"OriginatorConversationID": params.Reference,
 		"InitiatorName":            cfg.InitiatorName,
 		"SecurityCredential":       cfg.SecurityCredential,
@@ -767,7 +869,7 @@ func (e *Engine) disburseMpesaDaraja(params DisburseParams) (*DisburseResult, er
 		"QueueTimeOutURL":          cfg.QueueTimeoutURL,
 		"ResultURL":                cfg.ResultURL,
 		"Occasion":                 params.Reference,
-	})
+	}, true)
 	if err != nil {
 		return nil, err
 	}
@@ -798,7 +900,7 @@ func (e *Engine) disburseMpesaDaraja(params DisburseParams) (*DisburseResult, er
 	}, nil
 }
 
-func (e *Engine) getMpesaDarajaPayoutStatus(params PayoutStatusParams) (*DisburseResult, error) {
+func (e *Engine) getMpesaDarajaPayoutStatus(ctx context.Context, params PayoutStatusParams) (*DisburseResult, error) {
 	cfg := e.config.MpesaDaraja
 	if cfg == nil {
 		return nil, fmt.Errorf("mpesa daraja is not configured")
@@ -808,7 +910,7 @@ func (e *Engine) getMpesaDarajaPayoutStatus(params PayoutStatusParams) (*Disburs
 		ref = params.TransactionID
 	}
 
-	respBytes, err := e.mpesaPost("/mpesa/transactionstatus/v1/query", map[string]interface{}{
+	respBytes, err := e.mpesaPost(ctx, "/mpesa/transactionstatus/v1/query", map[string]interface{}{
 		"Initiator":                cfg.InitiatorName,
 		"SecurityCredential":       cfg.SecurityCredential,
 		"CommandID":                "TransactionStatusQuery",
@@ -820,7 +922,7 @@ func (e *Engine) getMpesaDarajaPayoutStatus(params PayoutStatusParams) (*Disburs
 		"QueueTimeOutURL":          cfg.QueueTimeoutURL,
 		"Remarks":                  "Payout status check",
 		"Occasion":                 ref,
-	})
+	}, false)
 	if err != nil {
 		return nil, err
 	}
@@ -846,12 +948,12 @@ func (e *Engine) getMpesaDarajaPayoutStatus(params PayoutStatusParams) (*Disburs
 	}, nil
 }
 
-func (e *Engine) getMpesaDarajaBalances() ([]RailBalance, error) {
+func (e *Engine) getMpesaDarajaBalances(ctx context.Context) ([]RailBalance, error) {
 	cfg := e.config.MpesaDaraja
 	if cfg == nil {
 		return nil, fmt.Errorf("mpesa daraja is not configured")
 	}
-	respBytes, err := e.mpesaPost("/mpesa/accountbalance/v1/query", map[string]interface{}{
+	respBytes, err := e.mpesaPost(ctx, "/mpesa/accountbalance/v1/query", map[string]interface{}{
 		"Initiator":          cfg.InitiatorName,
 		"SecurityCredential": cfg.SecurityCredential,
 		"CommandID":          "AccountBalance",
@@ -860,7 +962,7 @@ func (e *Engine) getMpesaDarajaBalances() ([]RailBalance, error) {
 		"Remarks":            "Float balance check",
 		"QueueTimeOutURL":    cfg.QueueTimeoutURL,
 		"ResultURL":          cfg.ResultURL,
-	})
+	}, false)
 	if err != nil {
 		return nil, err
 	}
@@ -887,10 +989,11 @@ func (e *Engine) getMpesaDarajaBalances() ([]RailBalance, error) {
 }
 
 func (e *Engine) verifyMpesaDarajaWebhook(rawBody []byte, signature string) (*WebhookEvent, error) {
-	if e.config.MpesaDaraja != nil && e.config.MpesaDaraja.WebhookSecret != "" {
-		if subtle.ConstantTimeCompare([]byte(signature), []byte(e.config.MpesaDaraja.WebhookSecret)) != 1 {
-			return nil, fmt.Errorf("invalid mpesa daraja webhook signature")
-		}
+	if e.config.MpesaDaraja == nil || e.config.MpesaDaraja.WebhookSecret == "" {
+		return nil, fmt.Errorf("mpesa daraja webhookSecret is required to verify webhooks")
+	}
+	if signature == "" || subtle.ConstantTimeCompare([]byte(signature), []byte(e.config.MpesaDaraja.WebhookSecret)) != 1 {
+		return nil, fmt.Errorf("invalid mpesa daraja webhook signature")
 	}
 
 	var wrapper struct {

@@ -406,7 +406,7 @@ describe('OmniPayoutEngine', () => {
           },
         },
       });
-      const ts = '1700000000';
+      const ts = String(Math.floor(Date.now() / 1000));
       const stripeSig = crypto
         .createHmac('sha256', 'whsec_test_stripe')
         .update(`${ts}.${stripeBody}`)
@@ -415,6 +415,16 @@ describe('OmniPayoutEngine', () => {
       expect(stripeEvent.status).toBe('SUCCESSFUL');
       expect(stripeEvent.reference).toBe('REF-STRIPE-WH');
       expect(stripeEvent.amount).toBe(150);
+
+      // Rejects replayed / stale Stripe webhook (> 300s old)
+      const staleTs = String(Math.floor(Date.now() / 1000) - 600);
+      const staleSig = crypto
+        .createHmac('sha256', 'whsec_test_stripe')
+        .update(`${staleTs}.${stripeBody}`)
+        .digest('hex');
+      expect(() =>
+        engine.verifyWebhook('STRIPE_CONNECT', stripeBody, `t=${staleTs},v1=${staleSig}`)
+      ).toThrow('outside tolerance window');
 
       // Flutterwave webhook
       const flwBody = JSON.stringify({
@@ -619,6 +629,177 @@ describe('OmniPayoutEngine', () => {
       expect(res.rail).toBe('PAYSTACK');
       expect(res.failoverFrom).toBe('FLUTTERWAVE');
       expect(res.attemptedRails).toEqual(['PAYSTACK']);
+    });
+
+    it('halts failover on ambiguous 504 timeout when state cannot be reconciled, preventing double payouts', async () => {
+      let paystackCalls = 0;
+      global.fetch = jest.fn().mockImplementation(async (url: string) => {
+        if (url.includes('api.flutterwave.com')) {
+          return {
+            ok: false,
+            status: 504,
+            json: async () => ({ status: 'error', message: 'Gateway timeout' }),
+          };
+        }
+        paystackCalls++;
+        return { ok: true, json: async () => ({ status: true }) };
+      });
+
+      await expect(
+        engine.disburse({
+          amount: 25000,
+          currency: 'NGN',
+          reference: 'REF-AMBIGUOUS-1',
+          rail: 'FLUTTERWAVE',
+          fallbackRails: ['PAYSTACK'],
+          bankDetails: { bankCode: '058', accountNumber: '0123456789' },
+        })
+      ).rejects.toThrow('Failover halted to prevent double payout');
+
+      expect(paystackCalls).toBe(0);
+    });
+
+    it('auto-reconciles ambiguous 504 on Paystack by reference without double-paying, and fails over if 404', async () => {
+      const reconcileEngine = new OmniPayoutEngine({
+        paystack: { secretKey: 'sk_test_mock_paystack' },
+        yellowCard: { apiKey: 'yc_mock_k', secretKey: 'yc_mock_s' },
+      });
+      let ycCalls = 0;
+      // Case A: Paystack /transfer returns 504, but /transfer/verify/:reference confirms it WAS created -> returns PENDING, zero YellowCard calls!
+      global.fetch = jest.fn().mockImplementation(async (url: string) => {
+        if (url.includes('/transferrecipient')) {
+          return { ok: true, json: async () => ({ status: true, data: { recipient_code: 'RCP_1' } }) };
+        }
+        if (url.endsWith('/transfer')) {
+          return { ok: false, status: 504, json: async () => ({ status: false, message: 'Gateway Timeout' }) };
+        }
+        if (url.includes('/transfer/verify/REF-RECONCILE-OK')) {
+          return {
+            ok: true,
+            status: 200,
+            json: async () => ({
+              status: true,
+              data: { transfer_code: 'TRF_rec_1', reference: 'REF-RECONCILE-OK', status: 'pending', amount: 1500000, currency: 'NGN' },
+            }),
+          };
+        }
+        ycCalls++;
+        return { ok: true, json: async () => ({ id: 'yc_1', sequenceId: 'REF-RECONCILE-OK', status: 'processing' }) };
+      });
+
+      const reconciled = await reconcileEngine.disburse({
+        amount: 15000,
+        currency: 'NGN',
+        reference: 'REF-RECONCILE-OK',
+        rail: 'PAYSTACK',
+        fallbackRails: ['YELLOW_CARD'],
+        bankDetails: { bankCode: '058', accountNumber: '0123456789' },
+      });
+      expect(reconciled.rail).toBe('PAYSTACK');
+      expect(reconciled.status).toBe('PENDING');
+      expect(ycCalls).toBe(0);
+
+      // Case B: /transfer/verify returns 404 (never recorded on Paystack) -> safely fails over to Yellow Card!
+      global.fetch = jest.fn().mockImplementation(async (url: string) => {
+        if (url.includes('/transferrecipient')) {
+          return { ok: true, json: async () => ({ status: true, data: { recipient_code: 'RCP_1' } }) };
+        }
+        if (url.endsWith('/transfer')) {
+          return { ok: false, status: 504, json: async () => ({ status: false, message: 'Gateway Timeout' }) };
+        }
+        if (url.includes('/transfer/verify/REF-RECONCILE-404')) {
+          return { ok: false, status: 404, json: async () => ({ status: false, message: 'Transfer not found' }) };
+        }
+        ycCalls++;
+        return { ok: true, status: 200, json: async () => ({ id: 'yc_2', sequenceId: 'REF-RECONCILE-404', status: 'processing' }) };
+      });
+
+      const failedOver = await reconcileEngine.disburse({
+        amount: 15000,
+        currency: 'NGN',
+        reference: 'REF-RECONCILE-404',
+        rail: 'PAYSTACK',
+        fallbackRails: ['YELLOW_CARD'],
+        bankDetails: { bankCode: '058', accountNumber: '0123456789' },
+      });
+      expect(failedOver.rail).toBe('YELLOW_CARD');
+      expect(failedOver.failoverFrom).toBe('PAYSTACK');
+      expect(ycCalls).toBe(1);
+    });
+
+    it('handles zero-decimal currencies (RWF/XOF) without 100x overpay and converts PawaPay references to valid UUIDs', async () => {
+      const fetchMock = jest
+        .fn()
+        .mockResolvedValueOnce({
+          ok: true,
+          json: async () => ({ id: 'tr_rwf_1', status: 'paid' }),
+        } as any)
+        .mockResolvedValueOnce({
+          ok: true,
+          json: async () => ({ status: 'ACCEPTED' }),
+        } as any);
+      global.fetch = fetchMock;
+
+      const ppEngine = new OmniPayoutEngine({
+        stripe: { secretKey: 'sk_test_mock' },
+        pawapay: { apiToken: 'pp_tok' },
+      });
+
+      await ppEngine.disburse({
+        amount: 5000,
+        currency: 'RWF',
+        reference: 'REF-RWF-ZERO-DEC',
+        stripeAccountId: 'acct_rwf_1',
+      });
+      // RWF is zero-decimal: amount must be 5000, NOT 500000
+      expect(fetchMock.mock.calls[0][1].body).toContain('amount=5000');
+
+      const ppRes = await ppEngine.disburse({
+        amount: 2500,
+        currency: 'KES',
+        reference: 'HUMAN-REF-001',
+        rail: 'PAWAPAY',
+        mobileMoneyDetails: { phone: '254712345678', network: 'MPESA' },
+      });
+      const sentPayload = JSON.parse(fetchMock.mock.calls[1][1].body);
+      expect(sentPayload.payoutId).toMatch(
+        /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/
+      );
+      expect(ppRes.reference).toBe('HUMAN-REF-001');
+    });
+
+    it('enforces input sanitization, SSRF/HTTPS baseUrl validation, unsigned webhook rejection, and secret non-leakage', async () => {
+      // 1. Secrets cannot leak via JSON.stringify or Object.keys
+      const serialized = JSON.stringify(engine);
+      expect(serialized).toBe('{}');
+      expect(Object.keys(engine)).toEqual([]);
+
+      // 2. Rejects NaN/Infinity amounts and CRLF header-injection references
+      await expect(
+        engine.disburse({ amount: Number.NaN, currency: 'USD', reference: 'REF-1', stripeAccountId: 'acct_1' })
+      ).rejects.toThrow('finite number');
+      await expect(
+        engine.disburse({ amount: 10, currency: 'USD', reference: 'REF\r\nEvil: 1', stripeAccountId: 'acct_1' })
+      ).rejects.toThrow('control characters');
+
+      // 3. Rejects path-traversal transactionId
+      await expect(
+        engine.getPayoutStatus({ transactionId: '../../charges', rail: 'STRIPE_CONNECT' })
+      ).rejects.toThrow('unsafe path characters');
+
+      // 4. Rejects insecure HTTP baseUrl and embedded credentials
+      expect(
+        () => new OmniPayoutEngine({ pawapay: { apiToken: 'tok', baseUrl: 'http://evil.example.com' } })
+      ).toThrow('HTTPS is required');
+      expect(
+        () => new OmniPayoutEngine({ pawapay: { apiToken: 'tok', baseUrl: 'https://user:pass@api.pawapay.io' } })
+      ).toThrow('embed credentials');
+
+      // 5. Rejects webhook verification when webhookSecret is not configured
+      const noWhEngine = new OmniPayoutEngine({ pawapay: { apiToken: 'tok' } });
+      expect(() => noWhEngine.verifyWebhook('PAWAPAY', '{}', 'sig')).toThrow(
+        'webhookSecret is required'
+      );
     });
   });
 });

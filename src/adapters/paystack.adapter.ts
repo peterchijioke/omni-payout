@@ -7,6 +7,15 @@ import {
   RailBalance,
   WebhookEvent,
 } from '../types';
+import {
+  PayoutProviderError,
+  constantTimeHexEqual,
+  fetchWithTimeout,
+  fromMinorUnits,
+  isHttpStatusAmbiguous,
+  toMinorUnits,
+  validateSafeIdentifier,
+} from '../utils';
 
 function normalizePaystackStatus(rawStatus?: string): PayoutStatus {
   if (!rawStatus) return 'PENDING';
@@ -24,27 +33,47 @@ function normalizePaystackStatus(rawStatus?: string): PayoutStatus {
 }
 
 export class PaystackAdapter {
-  constructor(
-    private readonly secretKey: string,
-    private readonly webhookSecret?: string
-  ) {
+  readonly #secretKey: string;
+  readonly #webhookSecret?: string;
+  readonly #timeoutMs: number;
+
+  constructor(secretKey: string, webhookSecret?: string, timeoutMs = 30_000) {
     if (!secretKey) throw new Error('Paystack secret key is required');
+    this.#secretKey = secretKey;
+    this.#webhookSecret = webhookSecret;
+    this.#timeoutMs = timeoutMs;
   }
 
-  private async request(endpoint: string, options: RequestInit = {}): Promise<any> {
+  private async request(
+    endpoint: string,
+    options: RequestInit = {},
+    isMutatingDisburse = false
+  ): Promise<any> {
     const url = `https://api.paystack.co${endpoint}`;
     const headers: Record<string, string> = {
-      Authorization: `Bearer ${this.secretKey}`,
+      Authorization: `Bearer ${this.#secretKey}`,
       ...(options.headers as Record<string, string>),
     };
     if (options.method && options.method.toUpperCase() !== 'GET' && !headers['Content-Type']) {
       headers['Content-Type'] = 'application/json';
     }
 
-    const res = await fetch(url, { ...options, headers });
+    const res = await fetchWithTimeout(
+      url,
+      { ...options, headers },
+      this.#timeoutMs,
+      'PAYSTACK',
+      isMutatingDisburse
+    );
     const data = await res.json();
     if (!res.ok || data?.status === false) {
-      throw new Error(data?.message || `Paystack request failed with status ${res.status}`);
+      const status = res.status || (res.ok ? 400 : 500);
+      throw new PayoutProviderError({
+        message: data?.message || `Paystack request failed with status ${status}`,
+        rail: 'PAYSTACK',
+        statusCode: status,
+        isAmbiguous: isMutatingDisburse && !res.ok && isHttpStatusAmbiguous(status),
+      });
     }
     return data;
   }
@@ -67,13 +96,15 @@ export class PaystackAdapter {
 
   async disburse(params: DisburseParams): Promise<DisburseResult> {
     if (!params.bankDetails && !params.mobileMoneyDetails) {
-      throw new Error('Either bankDetails or mobileMoneyDetails must be provided for Paystack disbursements');
+      throw new Error(
+        'Either bankDetails or mobileMoneyDetails must be provided for Paystack disbursements'
+      );
     }
 
     const currency = params.currency.toUpperCase();
-    const amountInSubunit = Math.round(params.amount * 100);
+    const amountInSubunit = toMinorUnits(params.amount, currency);
 
-    // 1. Create or retrieve transfer recipient
+    // 1. Create or retrieve transfer recipient (pre-execution, not fund-moving)
     const recipientPayload: Record<string, any> = params.bankDetails
       ? {
           type: currency === 'GHS' ? 'ghipss' : currency === 'ZAR' ? 'basa' : 'nuban',
@@ -90,10 +121,14 @@ export class PaystackAdapter {
           currency,
         };
 
-    const recipientRes = await this.request('/transferrecipient', {
-      method: 'POST',
-      body: JSON.stringify(recipientPayload),
-    });
+    const recipientRes = await this.request(
+      '/transferrecipient',
+      {
+        method: 'POST',
+        body: JSON.stringify(recipientPayload),
+      },
+      false
+    );
 
     const recipientCode = recipientRes.data?.recipient_code;
     if (!recipientCode) {
@@ -101,17 +136,21 @@ export class PaystackAdapter {
     }
 
     // 2. Initiate transfer (Paystack enforces idempotency on `reference`)
-    const transferRes = await this.request('/transfer', {
-      method: 'POST',
-      body: JSON.stringify({
-        source: 'balance',
-        amount: amountInSubunit,
-        recipient: recipientCode,
-        currency,
-        reference: params.reference,
-        reason: params.narration || 'Marketplace disbursement',
-      }),
-    });
+    const transferRes = await this.request(
+      '/transfer',
+      {
+        method: 'POST',
+        body: JSON.stringify({
+          source: 'balance',
+          amount: amountInSubunit,
+          recipient: recipientCode,
+          currency,
+          reference: params.reference,
+          reason: params.narration || 'Marketplace disbursement',
+        }),
+      },
+      true
+    );
 
     const transferData = transferRes.data || {};
     const status = normalizePaystackStatus(transferData.status);
@@ -132,12 +171,13 @@ export class PaystackAdapter {
 
   async getPayoutStatus(transactionId: string, reference?: string): Promise<DisburseResult> {
     const endpoint = reference
-      ? `/transfer/verify/${encodeURIComponent(reference)}`
-      : `/transfer/${encodeURIComponent(transactionId)}`;
+      ? `/transfer/verify/${validateSafeIdentifier(reference, 'reference')}`
+      : `/transfer/${validateSafeIdentifier(transactionId, 'transactionId')}`;
 
     const res = await this.request(endpoint, { method: 'GET' });
     const transferData = res.data || {};
     const status = normalizePaystackStatus(transferData.status);
+    const currency = String(transferData.currency || 'NGN').toUpperCase();
 
     return {
       success: status !== 'FAILED',
@@ -146,8 +186,11 @@ export class PaystackAdapter {
       status,
       providerStatus: transferData.status,
       rail: 'PAYSTACK',
-      amount: typeof transferData.amount === 'number' ? transferData.amount / 100 : 0,
-      currency: (transferData.currency || '').toUpperCase(),
+      amount:
+        typeof transferData.amount === 'number'
+          ? fromMinorUnits(transferData.amount, currency)
+          : 0,
+      currency,
       error: status === 'FAILED' ? transferData.failures || res.message : undefined,
       rawResponse: res,
     };
@@ -156,20 +199,21 @@ export class PaystackAdapter {
   async getBalances(): Promise<RailBalance[]> {
     const res = await this.request('/balance', { method: 'GET' });
     const rows = Array.isArray(res.data) ? res.data : [];
-    return rows.map((row: any) => ({
-      rail: 'PAYSTACK' as const,
-      currency: String(row.currency || '').toUpperCase(),
-      available: typeof row.balance === 'number' ? row.balance / 100 : 0,
-    }));
+    return rows.map((row: any) => {
+      const currency = String(row.currency || 'NGN').toUpperCase();
+      return {
+        rail: 'PAYSTACK' as const,
+        currency,
+        available: typeof row.balance === 'number' ? fromMinorUnits(row.balance, currency) : 0,
+      };
+    });
   }
 
   verifyWebhook(rawBody: string, signature: string): WebhookEvent {
-    const secret = this.webhookSecret || this.secretKey;
+    const secret = this.#webhookSecret || this.#secretKey;
     const expected = crypto.createHmac('sha512', secret).update(rawBody).digest('hex');
 
-    const sigBuf = Buffer.from(signature || '', 'utf8');
-    const expBuf = Buffer.from(expected, 'utf8');
-    if (sigBuf.length !== expBuf.length || !crypto.timingSafeEqual(sigBuf, expBuf)) {
+    if (!constantTimeHexEqual(signature, expected)) {
       throw new Error('Invalid Paystack webhook signature');
     }
 
@@ -184,6 +228,7 @@ export class PaystackAdapter {
           ? 'failed'
           : 'pending');
     const status = normalizePaystackStatus(rawStatus);
+    const currency = String(data.currency || 'NGN').toUpperCase();
 
     return {
       rail: 'PAYSTACK',
@@ -192,9 +237,10 @@ export class PaystackAdapter {
       reference: String(data.reference || ''),
       status,
       providerStatus: rawStatus,
-      amount: typeof data.amount === 'number' ? data.amount / 100 : 0,
-      currency: String(data.currency || '').toUpperCase(),
-      error: status === 'FAILED' ? data.reason || data.failures || 'Paystack transfer failed' : undefined,
+      amount: typeof data.amount === 'number' ? fromMinorUnits(data.amount, currency) : 0,
+      currency,
+      error:
+        status === 'FAILED' ? data.reason || data.failures || 'Paystack transfer failed' : undefined,
       rawPayload: payload,
     };
   }
