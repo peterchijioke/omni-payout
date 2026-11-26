@@ -83,8 +83,15 @@ interface WebhookEvent {
     providerStatus?: string;
     amount: number;
     currency: string;
+    fee?: number;
     error?: string;
     rawPayload?: any;
+}
+interface NameMatchResult {
+    matched: boolean;
+    score: number;
+    normalizedExpected: string;
+    normalizedActual: string;
 }
 interface BankResolutionResult {
     accountName: string;
@@ -135,7 +142,10 @@ interface OmniPayoutConfig {
         consumerSecret: string;
         shortCode: string;
         initiatorName: string;
-        securityCredential: string;
+        /** Pre-encrypted Base64 credential, OR omit and provide initiatorPassword + certificatePem. */
+        securityCredential?: string;
+        initiatorPassword?: string;
+        certificatePem?: string;
         resultUrl: string;
         queueTimeoutUrl: string;
         baseUrl?: string;
@@ -181,6 +191,31 @@ declare function isHttpStatusAmbiguous(statusCode: number): boolean;
 declare function fetchWithTimeout(url: string, options: RequestInit, timeoutMs: number, rail: PayoutRail, isMutatingPost?: boolean): Promise<Response>;
 declare function constantTimeHexEqual(providedSig: string, expectedHex: string): boolean;
 declare function constantTimeStringEqual(provided: string, expected: string): boolean;
+/**
+ * Normalizes phone numbers (`+254 712-345-678`, `0712345678`, `00254712345678`)
+ * into bare ITU-T E.164 MSISDN digits (`254712345678`) required by M-Pesa Daraja & PawaPay.
+ */
+declare function normalizeMsisdn(phone: string, currency?: string): string;
+/**
+ * Encrypts a plaintext Safaricom M-Pesa initiator password using the Daraja X.509 certificate
+ * (RSA PKCS#1 v1.5 padding, Base64-encoded) to produce `SecurityCredential`.
+ */
+declare function encryptMpesaInitiatorPassword(initiatorPassword: string, certificatePem: string): string;
+/**
+ * Compares an expected beneficiary name against a resolved bank account name,
+ * handling word-order differences (e.g. "Peter Chukwu" vs "CHUKWU CHIJIOKE PETER") and honorifics.
+ */
+declare function matchAccountNames(expectedName: string, resolvedName: string, threshold?: number): NameMatchResult;
+/**
+ * Guards payout state machines against out-of-order webhooks
+ * (e.g. a delayed PENDING webhook arriving after SUCCESSFUL or FAILED).
+ */
+declare function canTransitionStatus(currentStatus: PayoutStatus | undefined | null, nextStatus: PayoutStatus, allowReversal?: boolean): boolean;
+/**
+ * Resolves canonical mobile-money network codes or cross-corridor bank aliases
+ * to the target provider's expected code during multi-rail failover.
+ */
+declare function resolveProviderCode(code: string, currency: string, rail: PayoutRail, isMobileMoney?: boolean): string;
 
 declare class RailHealthTracker {
     private readonly failureThreshold;
@@ -254,7 +289,9 @@ interface MpesaDarajaConfig {
     consumerSecret: string;
     shortCode: string;
     initiatorName: string;
-    securityCredential: string;
+    securityCredential?: string;
+    initiatorPassword?: string;
+    certificatePem?: string;
     resultUrl: string;
     queueTimeoutUrl: string;
     baseUrl?: string;
@@ -302,13 +339,31 @@ declare class OmniPayoutEngine {
      */
     verifyWebhook(rail: PayoutRail, rawBody: string, signature: string): WebhookEvent;
     /**
-     * Resolves a Nigerian / African bank account name using Flutterwave or Paystack.
+     * Verifies a webhook signature, guards against out-of-order status regressions,
+     * and confirms the authoritative payout state & amount directly against the provider API.
      */
-    resolveBankAccount(bankCode: string, accountNumber: string, rail?: 'FLUTTERWAVE' | 'PAYSTACK'): Promise<BankResolutionResult>;
+    verifyAndConfirmWebhook(rail: PayoutRail, rawBody: string, signature: string, options?: {
+        stripeAccountId?: string;
+        currentStatus?: PayoutStatus;
+    }): Promise<WebhookEvent>;
+    /**
+     * Compares an expected beneficiary name against a resolved bank account name,
+     * tolerating word-order differences and honorifics.
+     */
+    matchAccountNames(expectedName: string, resolvedName: string, threshold?: number): NameMatchResult;
+    /**
+     * Checks whether a payout status transition is valid (preventing out-of-order regressions).
+     */
+    canTransitionStatus(currentStatus: PayoutStatus | undefined | null, nextStatus: PayoutStatus, allowReversal?: boolean): boolean;
+    /**
+     * Resolves an African bank account name using Flutterwave or Paystack,
+     * with automatic failover between configured providers when `rail` is omitted.
+     */
+    resolveBankAccount(bankCode: string, accountNumber: string, rail?: 'FLUTTERWAVE' | 'PAYSTACK', currency?: string): Promise<BankResolutionResult>;
     /**
      * Generates a Stripe Connect Express onboarding URL for US/European merchants and couriers.
      */
     createConnectOnboardingLink(params: OnboardingLinkParams): Promise<OnboardingLinkResult>;
 }
 
-export { type BankAccountDetails, type BankResolutionResult, type DisburseParams, type DisburseResult, FlutterwaveAdapter, type HealthConfig, type MobileMoneyDetails, MpesaDarajaAdapter, type MpesaDarajaConfig, type OmniPayoutConfig, OmniPayoutEngine, type OnboardingLinkParams, type OnboardingLinkResult, PawaPayAdapter, PayoutAmbiguousError, PayoutProviderError, type PayoutRail, type PayoutSpeed, type PayoutStatus, type PayoutStatusParams, PaystackAdapter, type RailBalance, type RailHealth, RailHealthTracker, StripeConnectAdapter, type WebhookEvent, YellowCardAdapter, constantTimeHexEqual, constantTimeStringEqual, currencyExponent, fetchWithTimeout, fromMinorUnits, isHttpStatusAmbiguous, sanitizeBaseUrl, toDeterministicUuid, toMinorUnits, validateDisburseInputs, validateSafeIdentifier };
+export { type BankAccountDetails, type BankResolutionResult, type DisburseParams, type DisburseResult, FlutterwaveAdapter, type HealthConfig, type MobileMoneyDetails, MpesaDarajaAdapter, type MpesaDarajaConfig, type NameMatchResult, type OmniPayoutConfig, OmniPayoutEngine, type OnboardingLinkParams, type OnboardingLinkResult, PawaPayAdapter, PayoutAmbiguousError, PayoutProviderError, type PayoutRail, type PayoutSpeed, type PayoutStatus, type PayoutStatusParams, PaystackAdapter, type RailBalance, type RailHealth, RailHealthTracker, StripeConnectAdapter, type WebhookEvent, YellowCardAdapter, canTransitionStatus, constantTimeHexEqual, constantTimeStringEqual, currencyExponent, encryptMpesaInitiatorPassword, fetchWithTimeout, fromMinorUnits, isHttpStatusAmbiguous, matchAccountNames, normalizeMsisdn, resolveProviderCode, sanitizeBaseUrl, toDeterministicUuid, toMinorUnits, validateDisburseInputs, validateSafeIdentifier };

@@ -13,6 +13,8 @@ import {
   fetchWithTimeout,
   fromMinorUnits,
   isHttpStatusAmbiguous,
+  normalizeMsisdn,
+  resolveProviderCode,
   toMinorUnits,
   validateSafeIdentifier,
 } from '../utils';
@@ -110,14 +112,14 @@ export class PaystackAdapter {
           type: currency === 'GHS' ? 'ghipss' : currency === 'ZAR' ? 'basa' : 'nuban',
           name: params.bankDetails.accountName || params.bankDetails.accountNumber,
           account_number: params.bankDetails.accountNumber,
-          bank_code: params.bankDetails.bankCode,
+          bank_code: resolveProviderCode(params.bankDetails.bankCode, currency, 'PAYSTACK', false),
           currency,
         }
       : {
           type: 'mobile_money',
-          name: params.mobileMoneyDetails!.phone,
-          account_number: params.mobileMoneyDetails!.phone,
-          bank_code: params.mobileMoneyDetails!.network.toUpperCase(),
+          name: normalizeMsisdn(params.mobileMoneyDetails!.phone, currency),
+          account_number: normalizeMsisdn(params.mobileMoneyDetails!.phone, currency),
+          bank_code: resolveProviderCode(params.mobileMoneyDetails!.network, currency, 'PAYSTACK', true),
           currency,
         };
 
@@ -191,6 +193,10 @@ export class PaystackAdapter {
           ? fromMinorUnits(transferData.amount, currency)
           : 0,
       currency,
+      fee:
+        typeof transferData.fee === 'number'
+          ? fromMinorUnits(transferData.fee, currency)
+          : undefined,
       error: status === 'FAILED' ? transferData.failures || res.message : undefined,
       rawResponse: res,
     };
@@ -239,6 +245,7 @@ export class PaystackAdapter {
       providerStatus: rawStatus,
       amount: typeof data.amount === 'number' ? fromMinorUnits(data.amount, currency) : 0,
       currency,
+      fee: typeof data.fee === 'number' ? fromMinorUnits(data.fee, currency) : undefined,
       error:
         status === 'FAILED' ? data.reason || data.failures || 'Paystack transfer failed' : undefined,
       rawPayload: payload,

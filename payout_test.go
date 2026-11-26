@@ -2,11 +2,17 @@ package omnipayout
 
 import (
 	"bytes"
+	"context"
 	"crypto/hmac"
+	"crypto/rand"
+	"crypto/rsa"
 	"crypto/sha256"
 	"crypto/sha512"
+	"crypto/x509"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
+	"encoding/pem"
 	"errors"
 	"fmt"
 	"io"
@@ -600,5 +606,106 @@ func TestTimeoutSafeFailoverZeroDecimalAndSecurityHardening(t *testing.T) {
 	_, _ = engine.Disburse(DisburseParams{Amount: 1000, Currency: "KES", Reference: "MP-C2", Rail: RailMpesaDaraja, MobileMoneyDetails: &MobileMoneyDetails{Phone: "254712345678", Network: "MPESA"}})
 	if oauthCalls != 1 {
 		t.Fatalf("expected M-Pesa OAuth token to be cached (1 call), got %d calls", oauthCalls)
+	}
+}
+
+func TestV150DeveloperPainPointFixes(t *testing.T) {
+	// 1. MSISDN normalization
+	msisdn1, err := NormalizeMSISDN("+254 712-345-678", "KES")
+	if err != nil || msisdn1 != "254712345678" {
+		t.Fatalf("expected 254712345678, got %q err=%v", msisdn1, err)
+	}
+	msisdn2, err := NormalizeMSISDN("0712345678", "KES")
+	if err != nil || msisdn2 != "254712345678" {
+		t.Fatalf("expected 254712345678 from local 07..., got %q err=%v", msisdn2, err)
+	}
+
+	// 2. M-Pesa RSA PKCS#1 v1.5 SecurityCredential encryption
+	privKey, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		t.Fatalf("rsa keygen failed: %v", err)
+	}
+	pubDER, _ := x509.MarshalPKIXPublicKey(&privKey.PublicKey)
+	pubPEM := string(pem.EncodeToMemory(&pem.Block{Type: "PUBLIC KEY", Bytes: pubDER}))
+	credB64, err := EncryptMpesaInitiatorPassword("SafaricomGoPass!", pubPEM)
+	if err != nil {
+		t.Fatalf("encrypt initiator password failed: %v", err)
+	}
+	cipherBytes, _ := base64.StdEncoding.DecodeString(credB64)
+	plainBytes, err := rsa.DecryptPKCS1v15(rand.Reader, privKey, cipherBytes)
+	if err != nil || string(plainBytes) != "SafaricomGoPass!" {
+		t.Fatalf("decrypted initiator password mismatch: %q err=%v", string(plainBytes), err)
+	}
+
+	// 3. Name matching & FSM transition guard & code mapping
+	nm := MatchAccountNames("Chief Peter Chukwu", "CHUKWU CHIJIOKE PETER", 0.66)
+	if !nm.Matched || nm.Score < 0.8 {
+		t.Fatalf("expected name match, got %+v", nm)
+	}
+	if CanTransitionStatus(string(StatusSuccessful), string(StatusPending), false) {
+		t.Fatalf("expected SUCCESSFUL -> PENDING regression to be blocked")
+	}
+	if ResolveProviderCode("VODAFONE", "GHS", RailPaystack, true) != "VOD" {
+		t.Fatalf("expected VOD for Paystack GHS Vodafone")
+	}
+	if ResolveProviderCode("GCB", "GHS", RailFlutterwave, false) != "GH040100" {
+		t.Fatalf("expected GH040100 for Flutterwave GCB GHS")
+	}
+
+	// 4. Bank resolution failover (Flutterwave 503 -> Paystack 200), M-Pesa QueueTimeout, and VerifyAndConfirmWebhook
+	engine := NewEngine(Config{
+		FlutterwaveSecretKey:  "flw_k",
+		PaystackSecretKey:     "ps_k",
+		PaystackWebhookSecret: "ps_wh_sec",
+		MpesaDaraja: &MpesaDarajaConfig{
+			ConsumerKey:       "mk",
+			ConsumerSecret:    "ms",
+			ShortCode:         "600999",
+			InitiatorName:     "init",
+			InitiatorPassword: "SafaricomGoPass!",
+			CertificatePEM:    pubPEM,
+			ResultURL:         "https://example.com/res",
+			QueueTimeoutURL:   "https://example.com/to",
+			WebhookSecret:     "mp_wh_sec",
+		},
+	})
+
+	engine.httpClient = &http.Client{
+		Transport: roundTripFunc(func(req *http.Request) *http.Response {
+			if req.URL.Host == "api.flutterwave.com" {
+				return &http.Response{StatusCode: 503, Body: io.NopCloser(bytes.NewBufferString(`{"status":"error"}`)), Header: make(http.Header)}
+			}
+			if strings.HasPrefix(req.URL.Path, "/bank/resolve") {
+				return &http.Response{
+					StatusCode: 200,
+					Body:       io.NopCloser(bytes.NewBufferString(`{"status":true,"data":{"account_name":"CHUKWU CHIJIOKE PETER","account_number":"0123456789"}}`)),
+					Header:     make(http.Header),
+				}
+			}
+			return &http.Response{
+				StatusCode: 200,
+				Body:       io.NopCloser(bytes.NewBufferString(`{"status":true,"data":{"transfer_code":"TRF_conf_go","reference":"REF-CONF-GO","status":"success","amount":2000000,"currency":"NGN"}}`)),
+				Header:     make(http.Header),
+			}
+		}),
+	}
+
+	bankRes, err := engine.ResolveBankAccount("058", "0123456789")
+	if err != nil || bankRes.AccountName != "CHUKWU CHIJIOKE PETER" {
+		t.Fatalf("expected bank resolution failover to Paystack, got %+v err=%v", bankRes, err)
+	}
+
+	toBody := []byte(`{"Result":{"ResultCode":1037,"ResultDesc":"Queue timeout","OriginatorConversationID":"MP-TO-1"}}`)
+	toEv, err := engine.VerifyWebhook(RailMpesaDaraja, toBody, "mp_wh_sec")
+	if err != nil || toEv.EventType != "b2c.result.timeout" || toEv.ProviderStatus != "QUEUE_TIMEOUT" {
+		t.Fatalf("expected M-Pesa QUEUE_TIMEOUT event, got %+v err=%v", toEv, err)
+	}
+
+	psWhBody := []byte(`{"event":"transfer.success","data":{"transfer_code":"TRF_conf_go","reference":"REF-CONF-GO","status":"success","amount":2000000,"fee":2688,"currency":"NGN"}}`)
+	mac := hmac.New(sha512.New, []byte("ps_wh_sec"))
+	mac.Write(psWhBody)
+	confEv, err := engine.VerifyAndConfirmWebhook(context.Background(), RailPaystack, psWhBody, hex.EncodeToString(mac.Sum(nil)), "", "")
+	if err != nil || confEv.Status != string(StatusSuccessful) || confEv.Fee != 26.88 {
+		t.Fatalf("expected confirmed Paystack webhook with fee=26.88, got %+v err=%v", confEv, err)
 	}
 }

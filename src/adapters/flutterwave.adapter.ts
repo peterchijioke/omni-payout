@@ -11,6 +11,8 @@ import {
   constantTimeStringEqual,
   fetchWithTimeout,
   isHttpStatusAmbiguous,
+  normalizeMsisdn,
+  resolveProviderCode,
   validateSafeIdentifier,
 } from '../utils';
 
@@ -95,22 +97,23 @@ export class FlutterwaveAdapter {
   async disburse(params: DisburseParams): Promise<DisburseResult> {
     let payload: Record<string, any>;
 
+    const currency = params.currency.toUpperCase();
     if (params.bankDetails) {
       payload = {
-        account_bank: params.bankDetails.bankCode,
+        account_bank: resolveProviderCode(params.bankDetails.bankCode, currency, 'FLUTTERWAVE', false),
         account_number: params.bankDetails.accountNumber,
         amount: params.amount,
-        currency: params.currency.toUpperCase(),
+        currency,
         reference: params.reference,
         narration: params.narration || 'Marketplace disbursement',
-        debit_currency: params.currency.toUpperCase(),
+        debit_currency: currency,
       };
     } else if (params.mobileMoneyDetails) {
       payload = {
-        account_bank: params.mobileMoneyDetails.network.toLowerCase(),
-        account_number: params.mobileMoneyDetails.phone,
+        account_bank: resolveProviderCode(params.mobileMoneyDetails.network, currency, 'FLUTTERWAVE', true),
+        account_number: normalizeMsisdn(params.mobileMoneyDetails.phone, currency),
         amount: params.amount,
-        currency: params.currency.toUpperCase(),
+        currency,
         reference: params.reference,
         narration: params.narration || 'Mobile Money payout',
       };
@@ -209,6 +212,7 @@ export class FlutterwaveAdapter {
       providerStatus: data.status,
       amount: data.amount ? Number(data.amount) : 0,
       currency: String(data.currency || '').toUpperCase(),
+      fee: data.fee !== undefined ? Number(data.fee) : undefined,
       error:
         status === 'FAILED' ? data.complete_message || 'Flutterwave transfer failed' : undefined,
       rawPayload: payload,

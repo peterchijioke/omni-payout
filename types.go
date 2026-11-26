@@ -124,7 +124,16 @@ type WebhookEvent struct {
 	ProviderStatus string     `json:"providerStatus,omitempty"`
 	Amount         float64    `json:"amount"`
 	Currency       string     `json:"currency"`
+	Fee            float64    `json:"fee,omitempty"`
 	Error          string     `json:"error,omitempty"`
+}
+
+// NameMatchResult holds the token-similarity comparison between expected and resolved account names.
+type NameMatchResult struct {
+	Matched            bool    `json:"matched"`
+	Score              float64 `json:"score"`
+	NormalizedExpected string  `json:"normalizedExpected"`
+	NormalizedActual   string  `json:"normalizedActual"`
 }
 
 // BankResolutionResult holds the resolved account details from NIP inquiry.
@@ -155,6 +164,8 @@ type MpesaDarajaConfig struct {
 	ShortCode          string `json:"shortCode"`
 	InitiatorName      string `json:"initiatorName"`
 	SecurityCredential string `json:"-"`
+	InitiatorPassword  string `json:"-"`
+	CertificatePEM     string `json:"-"`
 	ResultURL          string `json:"resultUrl"`
 	QueueTimeoutURL    string `json:"queueTimeoutUrl"`
 	BaseURL            string `json:"baseUrl,omitempty"`

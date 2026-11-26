@@ -1,5 +1,12 @@
 import crypto from 'crypto';
 import { OmniPayoutEngine } from '../src/engine';
+import {
+  canTransitionStatus,
+  encryptMpesaInitiatorPassword,
+  matchAccountNames,
+  normalizeMsisdn,
+  resolveProviderCode,
+} from '../src/utils';
 
 describe('OmniPayoutEngine', () => {
   const engine = new OmniPayoutEngine({
@@ -800,6 +807,122 @@ describe('OmniPayoutEngine', () => {
       expect(() => noWhEngine.verifyWebhook('PAWAPAY', '{}', 'sig')).toThrow(
         'webhookSecret is required'
       );
+    });
+
+    it('normalizes MSISDNs, encrypts M-Pesa RSA credentials, fails over bank resolution, matches names, maps codes, and confirms webhooks', async () => {
+      // 1. MSISDN normalization
+      expect(normalizeMsisdn('+254 712-345-678', 'KES')).toBe('254712345678');
+      expect(normalizeMsisdn('0712345678', 'KES')).toBe('254712345678');
+      expect(normalizeMsisdn('08031234567', 'NGN')).toBe('2348031234567');
+
+      // 2. M-Pesa RSA PKCS#1 v1.5 SecurityCredential encryption
+      const { publicKey, privateKey } = crypto.generateKeyPairSync('rsa', { modulusLength: 2048 });
+      const pubPem = publicKey.export({ type: 'spki', format: 'pem' }) as string;
+      const encryptedCred = encryptMpesaInitiatorPassword('SafaricomPass123!', pubPem);
+      const decrypted = crypto.privateDecrypt(
+        { key: privateKey, padding: crypto.constants.RSA_PKCS1_PADDING },
+        Buffer.from(encryptedCred, 'base64')
+      );
+      expect(decrypted.toString('utf8')).toBe('SafaricomPass123!');
+
+      // 3. Fuzzy / word-order & honorific account name matching
+      const match = matchAccountNames('Mr. Peter Chukwu', 'CHUKWU CHIJIOKE PETER');
+      expect(match.matched).toBe(true);
+      expect(match.score).toBeGreaterThan(0.8);
+      expect(matchAccountNames('Jane Smith', 'CHUKWU CHIJIOKE PETER').matched).toBe(false);
+
+      // 4. Cross-rail bank & MoMo code mapping
+      expect(resolveProviderCode('VODAFONE', 'GHS', 'PAYSTACK', true)).toBe('VOD');
+      expect(resolveProviderCode('AIRTEL', 'GHS', 'PAYSTACK', true)).toBe('ATL');
+      expect(resolveProviderCode('GCB', 'GHS', 'FLUTTERWAVE', false)).toBe('GH040100');
+      expect(resolveProviderCode('GCB', 'GHS', 'PAYSTACK', false)).toBe('040100');
+
+      // 5. Out-of-order FSM state guard
+      expect(canTransitionStatus('PENDING', 'SUCCESSFUL')).toBe(true);
+      expect(canTransitionStatus('SUCCESSFUL', 'PENDING')).toBe(false);
+      expect(canTransitionStatus('FAILED', 'PENDING')).toBe(false);
+      expect(canTransitionStatus('SUCCESSFUL', 'FAILED', true)).toBe(true);
+
+      // 6. Bank resolution failover (Flutterwave 503 -> Paystack 200)
+      global.fetch = jest
+        .fn()
+        .mockResolvedValueOnce({
+          ok: false,
+          status: 503,
+          json: async () => ({ status: 'error', message: 'NIBSS timeout' }),
+        } as any)
+        .mockResolvedValueOnce({
+          ok: true,
+          status: 200,
+          json: async () => ({
+            status: true,
+            data: { account_name: 'CHUKWU CHIJIOKE PETER', account_number: '0123456789' },
+          }),
+        } as any);
+
+      const resolved = await engine.resolveBankAccount('058', '0123456789');
+      expect(resolved.accountName).toBe('CHUKWU CHIJIOKE PETER');
+
+      // 7. M-Pesa QueueTimeOutURL callback detection
+      const mpesaEngine = new OmniPayoutEngine({
+        mpesaDaraja: {
+          consumerKey: 'k',
+          consumerSecret: 's',
+          shortCode: '600999',
+          initiatorName: 'init',
+          initiatorPassword: 'SafaricomPass123!',
+          certificatePem: pubPem,
+          resultUrl: 'https://example.com/res',
+          queueTimeoutUrl: 'https://example.com/to',
+          webhookSecret: 'mp_wh',
+        },
+      });
+      const timeoutBody = JSON.stringify({
+        Result: {
+          ResultCode: 1037,
+          ResultDesc: 'DS timeout: Queue timeout reached',
+          OriginatorConversationID: 'REF-MP-TIMEOUT',
+        },
+      });
+      const timeoutEv = mpesaEngine.verifyWebhook('MPESA_DARAJA', timeoutBody, 'mp_wh');
+      expect(timeoutEv.eventType).toBe('b2c.result.timeout');
+      expect(timeoutEv.providerStatus).toBe('QUEUE_TIMEOUT');
+      expect(timeoutEv.status).toBe('FAILED');
+
+      // 8. verifyAndConfirmWebhook (cross-checks API, extracts fee, and rejects tampered amount)
+      const psWhBody = JSON.stringify({
+        event: 'transfer.success',
+        data: {
+          transfer_code: 'TRF_conf_1',
+          reference: 'REF-CONF-1',
+          status: 'success',
+          amount: 2000000,
+          fee: 2688,
+          currency: 'NGN',
+        },
+      });
+      const psWhSig = crypto.createHmac('sha512', 'ps_webhook_secret').update(psWhBody).digest('hex');
+
+      global.fetch = jest.fn().mockResolvedValueOnce({
+        ok: true,
+        status: 200,
+        json: async () => ({
+          status: true,
+          data: {
+            transfer_code: 'TRF_conf_1',
+            reference: 'REF-CONF-1',
+            status: 'success',
+            amount: 2000000,
+            fee: 2688,
+            currency: 'NGN',
+          },
+        }),
+      } as any);
+
+      const confirmedEv = await engine.verifyAndConfirmWebhook('PAYSTACK', psWhBody, psWhSig);
+      expect(confirmedEv.status).toBe('SUCCESSFUL');
+      expect(confirmedEv.amount).toBe(20000);
+      expect(confirmedEv.fee).toBe(26.88);
     });
   });
 });

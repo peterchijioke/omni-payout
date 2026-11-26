@@ -2,8 +2,10 @@ import { DisburseParams, DisburseResult, PayoutStatus, RailBalance, WebhookEvent
 import {
   PayoutProviderError,
   constantTimeStringEqual,
+  encryptMpesaInitiatorPassword,
   fetchWithTimeout,
   isHttpStatusAmbiguous,
+  normalizeMsisdn,
   sanitizeBaseUrl,
 } from '../utils';
 
@@ -12,7 +14,9 @@ export interface MpesaDarajaConfig {
   consumerSecret: string;
   shortCode: string;
   initiatorName: string;
-  securityCredential: string;
+  securityCredential?: string;
+  initiatorPassword?: string;
+  certificatePem?: string;
   resultUrl: string;
   queueTimeoutUrl: string;
   baseUrl?: string;
@@ -21,6 +25,7 @@ export interface MpesaDarajaConfig {
 
 export class MpesaDarajaAdapter {
   readonly #config: MpesaDarajaConfig;
+  readonly #securityCredential: string;
   readonly #baseUrl: string;
   readonly #timeoutMs: number;
   #cachedToken?: string;
@@ -30,7 +35,19 @@ export class MpesaDarajaAdapter {
     if (!config.consumerKey || !config.consumerSecret) {
       throw new Error('M-Pesa Daraja consumerKey and consumerSecret are required');
     }
+    const credential =
+      config.securityCredential ||
+      (config.initiatorPassword && config.certificatePem
+        ? encryptMpesaInitiatorPassword(config.initiatorPassword, config.certificatePem)
+        : '');
+    if (!credential) {
+      throw new Error(
+        'M-Pesa Daraja requires either securityCredential or both initiatorPassword and certificatePem'
+      );
+    }
+
     this.#config = { ...config };
+    this.#securityCredential = credential;
     this.#baseUrl = sanitizeBaseUrl(config.baseUrl, 'https://api.safaricom.co.ke');
     this.#timeoutMs = timeoutMs;
   }
@@ -110,16 +127,17 @@ export class MpesaDarajaAdapter {
       throw new Error('mobileMoneyDetails is required for M-Pesa Daraja disbursements');
     }
 
+    const msisdn = normalizeMsisdn(params.mobileMoneyDetails.phone, params.currency || 'KES');
     const data = await this.request(
       '/mpesa/b2c/v3/paymentrequest',
       {
         OriginatorConversationID: params.reference,
         InitiatorName: this.#config.initiatorName,
-        SecurityCredential: this.#config.securityCredential,
+        SecurityCredential: this.#securityCredential,
         CommandID: params.metadata?.commandId || 'BusinessPayment',
         Amount: Math.round(params.amount),
         PartyA: this.#config.shortCode,
-        PartyB: params.mobileMoneyDetails.phone,
+        PartyB: msisdn,
         Remarks: params.narration || 'Marketplace payout',
         QueueTimeOutURL: this.#config.queueTimeoutUrl,
         ResultURL: this.#config.resultUrl,
@@ -146,7 +164,7 @@ export class MpesaDarajaAdapter {
   async getPayoutStatus(transactionId: string, reference?: string): Promise<DisburseResult> {
     const data = await this.request('/mpesa/transactionstatus/v1/query', {
       Initiator: this.#config.initiatorName,
-      SecurityCredential: this.#config.securityCredential,
+      SecurityCredential: this.#securityCredential,
       CommandID: 'TransactionStatusQuery',
       TransactionID: transactionId,
       OriginatorConversationID: reference || transactionId,
@@ -174,7 +192,7 @@ export class MpesaDarajaAdapter {
   async getBalances(): Promise<RailBalance[]> {
     const data = await this.request('/mpesa/accountbalance/v1/query', {
       Initiator: this.#config.initiatorName,
-      SecurityCredential: this.#config.securityCredential,
+      SecurityCredential: this.#securityCredential,
       CommandID: 'AccountBalance',
       PartyA: this.#config.shortCode,
       IdentifierType: '4',
@@ -206,27 +224,50 @@ export class MpesaDarajaAdapter {
 
     const payload = JSON.parse(rawBody);
     const result = payload.Result || payload;
-    const resultCode = Number(result.ResultCode);
-    const status: PayoutStatus = resultCode === 0 ? 'SUCCESSFUL' : 'FAILED';
+    const resultDesc = String(result.ResultDesc || '');
+    const rawCode = result.ResultCode;
+    const resultCode = rawCode !== undefined ? Number(rawCode) : -1;
+
+    const isQueueTimeout =
+      Boolean(payload.QueueTimeout) ||
+      resultCode === 1037 ||
+      /queue\s*time\s*out|timed\s*out/i.test(resultDesc);
+
+    const status: PayoutStatus = resultCode === 0 && !isQueueTimeout ? 'SUCCESSFUL' : 'FAILED';
+    const eventType = isQueueTimeout
+      ? 'b2c.result.timeout'
+      : status === 'SUCCESSFUL'
+        ? 'b2c.result.success'
+        : 'b2c.result.failed';
+    const providerStatus = isQueueTimeout ? 'QUEUE_TIMEOUT' : String(rawCode ?? '');
 
     let amount = 0;
+    let fee: number | undefined;
     const params: any[] = result.ResultParameters?.ResultParameter || [];
     for (const p of params) {
       if (p.Key === 'TransactionAmount') {
         amount = Number(p.Value || 0);
+      } else if (p.Key === 'B2CChargesPaidAccountAvailableFunds' || p.Key === 'TransactionCharge') {
+        if (p.Key === 'TransactionCharge') {
+          fee = Number(p.Value || 0);
+        }
       }
     }
 
     return {
       rail: 'MPESA_DARAJA',
-      eventType: status === 'SUCCESSFUL' ? 'b2c.result.success' : 'b2c.result.failed',
+      eventType,
       transactionId: String(result.TransactionID || result.ConversationID || ''),
       reference: String(result.OriginatorConversationID || result.TransactionID || ''),
       status,
-      providerStatus: String(result.ResultCode ?? ''),
+      providerStatus,
       amount,
       currency: 'KES',
-      error: status === 'FAILED' ? result.ResultDesc || 'M-Pesa B2C payout failed' : undefined,
+      fee,
+      error:
+        status === 'FAILED'
+          ? resultDesc || (isQueueTimeout ? 'M-Pesa B2C queue timeout' : 'M-Pesa B2C payout failed')
+          : undefined,
       rawPayload: payload,
     };
   }

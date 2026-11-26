@@ -305,6 +305,7 @@ export class StripeConnectAdapter {
       providerStatus: obj.status,
       amount: typeof obj.amount === 'number' ? fromMinorUnits(obj.amount, currency) : 0,
       currency,
+      fee: typeof obj.fee === 'number' ? fromMinorUnits(obj.fee, currency) : undefined,
       error: status === 'FAILED' ? obj.failure_message || 'Stripe payout failed' : undefined,
       rawPayload: payload,
     };

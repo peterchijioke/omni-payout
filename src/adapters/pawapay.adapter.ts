@@ -5,6 +5,7 @@ import {
   constantTimeHexEqual,
   fetchWithTimeout,
   isHttpStatusAmbiguous,
+  normalizeMsisdn,
   sanitizeBaseUrl,
   toDeterministicUuid,
   validateSafeIdentifier,
@@ -116,7 +117,7 @@ export class PawaPayAdapter {
       recipient: {
         type: 'MSISDN',
         address: {
-          value: params.mobileMoneyDetails.phone,
+          value: normalizeMsisdn(params.mobileMoneyDetails.phone, currency),
         },
       },
       customerTimestamp: new Date().toISOString(),
@@ -205,6 +206,7 @@ export class PawaPayAdapter {
       providerStatus: payload.status,
       amount: payload.amount ? Number(payload.amount) : 0,
       currency: String(payload.currency || '').toUpperCase(),
+      fee: payload.fee !== undefined ? Number(payload.fee) : undefined,
       error:
         status === 'FAILED'
           ? payload.failureReason?.failureMessage || 'PawaPay payout failed'

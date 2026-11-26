@@ -1,5 +1,5 @@
 import crypto from 'crypto';
-import { PayoutRail } from './types';
+import { NameMatchResult, PayoutRail, PayoutStatus } from './types';
 
 const ZERO_DECIMAL_CURRENCIES = new Set([
   'BIF', 'CLP', 'DJF', 'GNF', 'JPY', 'KMF', 'KRW', 'MGA',
@@ -192,3 +192,198 @@ export function constantTimeStringEqual(provided: string, expected: string): boo
   if (a.length !== b.length) return false;
   return crypto.timingSafeEqual(a, b);
 }
+
+const CURRENCY_DIAL_CODES: Record<string, string> = {
+  NGN: '234',
+  KES: '254',
+  GHS: '233',
+  UGX: '256',
+  TZS: '255',
+  RWF: '250',
+  ZAR: '27',
+  ZMW: '260',
+  XAF: '237',
+  XOF: '225',
+};
+
+/**
+ * Normalizes phone numbers (`+254 712-345-678`, `0712345678`, `00254712345678`)
+ * into bare ITU-T E.164 MSISDN digits (`254712345678`) required by M-Pesa Daraja & PawaPay.
+ */
+export function normalizeMsisdn(phone: string, currency?: string): string {
+  if (!phone || typeof phone !== 'string') {
+    throw new Error('Mobile money phone number is required');
+  }
+  let cleaned = phone.trim().replace(/[\s\-().]/g, '');
+  if (cleaned.startsWith('+')) {
+    cleaned = cleaned.slice(1);
+  } else if (cleaned.startsWith('00')) {
+    cleaned = cleaned.slice(2);
+  } else if (cleaned.startsWith('0') && currency) {
+    const dial = CURRENCY_DIAL_CODES[currency.toUpperCase()];
+    if (dial) {
+      cleaned = dial + cleaned.slice(1);
+    }
+  }
+
+  if (!/^\d{7,15}$/.test(cleaned)) {
+    throw new Error(`Invalid mobile money phone number: "${phone}"`);
+  }
+  return cleaned;
+}
+
+/**
+ * Encrypts a plaintext Safaricom M-Pesa initiator password using the Daraja X.509 certificate
+ * (RSA PKCS#1 v1.5 padding, Base64-encoded) to produce `SecurityCredential`.
+ */
+export function encryptMpesaInitiatorPassword(
+  initiatorPassword: string,
+  certificatePem: string
+): string {
+  if (!initiatorPassword || !certificatePem) {
+    throw new Error('Both initiatorPassword and certificatePem are required to generate SecurityCredential');
+  }
+  const encrypted = crypto.publicEncrypt(
+    {
+      key: certificatePem,
+      padding: crypto.constants.RSA_PKCS1_PADDING,
+    },
+    Buffer.from(initiatorPassword, 'utf8')
+  );
+  return encrypted.toString('base64');
+}
+
+const HONORIFIC_TOKENS = new Set([
+  'mr', 'mrs', 'ms', 'miss', 'dr', 'prof', 'chief', 'alhaji', 'hajia', 'engr', 'sir', 'lady',
+]);
+
+function tokenizeAccountName(name: string): string[] {
+  return (name || '')
+    .toLowerCase()
+    .replace(/[^a-z0-9\s]/g, ' ')
+    .split(/\s+/)
+    .filter((tok) => tok.length > 0 && !HONORIFIC_TOKENS.has(tok));
+}
+
+/**
+ * Compares an expected beneficiary name against a resolved bank account name,
+ * handling word-order differences (e.g. "Peter Chukwu" vs "CHUKWU CHIJIOKE PETER") and honorifics.
+ */
+export function matchAccountNames(
+  expectedName: string,
+  resolvedName: string,
+  threshold = 0.66
+): NameMatchResult {
+  const expectedTokens = tokenizeAccountName(expectedName);
+  const actualTokens = tokenizeAccountName(resolvedName);
+  const normalizedExpected = expectedTokens.join(' ');
+  const normalizedActual = actualTokens.join(' ');
+
+  if (expectedTokens.length === 0 || actualTokens.length === 0) {
+    return { matched: false, score: 0, normalizedExpected, normalizedActual };
+  }
+
+  const actualSet = new Set(actualTokens);
+  const expectedSet = new Set(expectedTokens);
+  let intersection = 0;
+  for (const tok of expectedSet) {
+    if (actualSet.has(tok)) intersection++;
+  }
+
+  // Containment score relative to the shorter name handles middle-name presence cleanly
+  const minSize = Math.min(expectedSet.size, actualSet.size);
+  const unionSize = new Set([...expectedSet, ...actualSet]).size;
+  const containment = intersection / minSize;
+  const jaccard = intersection / unionSize;
+  const score = Number((containment * 0.75 + jaccard * 0.25).toFixed(4));
+
+  return {
+    matched: score >= threshold,
+    score,
+    normalizedExpected,
+    normalizedActual,
+  };
+}
+
+/**
+ * Guards payout state machines against out-of-order webhooks
+ * (e.g. a delayed PENDING webhook arriving after SUCCESSFUL or FAILED).
+ */
+export function canTransitionStatus(
+  currentStatus: PayoutStatus | undefined | null,
+  nextStatus: PayoutStatus,
+  allowReversal = false
+): boolean {
+  if (!currentStatus || currentStatus === 'PENDING') {
+    return true;
+  }
+  if (currentStatus === nextStatus) {
+    return true;
+  }
+  if (currentStatus === 'SUCCESSFUL' && nextStatus === 'FAILED' && allowReversal) {
+    return true;
+  }
+  return false;
+}
+
+const PAYSTACK_MOMO_BANK_CODES: Record<string, string> = {
+  MTN: 'MTN',
+  VODAFONE: 'VOD',
+  TELECEL: 'VOD',
+  AIRTEL: 'ATL',
+  AIRTELTIGO: 'ATL',
+  MPESA: 'MPESA',
+  ORANGE: 'ORANGE',
+  WAVE: 'WAVE',
+};
+
+const CROSS_RAIL_BANK_CODES: Record<string, Partial<Record<PayoutRail, string>>> = {
+  // Ghana (GHS) canonical aliases
+  GCB_GHS: { FLUTTERWAVE: 'GH040100', PAYSTACK: '040100', YELLOW_CARD: 'GCB' },
+  ECOBANK_GHS: { FLUTTERWAVE: 'GH130100', PAYSTACK: '130100', YELLOW_CARD: 'ECOBANK' },
+  ABSA_GHS: { FLUTTERWAVE: 'GH030100', PAYSTACK: '030100', YELLOW_CARD: 'ABSA' },
+  STANBIC_GHS: { FLUTTERWAVE: 'GH190100', PAYSTACK: '190100', YELLOW_CARD: 'STANBIC' },
+  FIDELITY_GHS: { FLUTTERWAVE: 'GH240100', PAYSTACK: '240100', YELLOW_CARD: 'FIDELITY' },
+  // Kenya (KES) canonical aliases
+  EQUITY_KES: { FLUTTERWAVE: '68', PAYSTACK: '68', YELLOW_CARD: 'EQUITY' },
+  KCB_KES: { FLUTTERWAVE: '01', PAYSTACK: '01', YELLOW_CARD: 'KCB' },
+  COOP_KES: { FLUTTERWAVE: '11', PAYSTACK: '11', YELLOW_CARD: 'COOP' },
+  ABSA_KES: { FLUTTERWAVE: '03', PAYSTACK: '03', YELLOW_CARD: 'ABSA' },
+  // South Africa (ZAR) canonical aliases
+  FNB_ZAR: { FLUTTERWAVE: '250655', PAYSTACK: '250655', YELLOW_CARD: 'FNB' },
+  ABSA_ZAR: { FLUTTERWAVE: '632005', PAYSTACK: '632005', YELLOW_CARD: 'ABSA' },
+  STANDARD_BANK_ZAR: { FLUTTERWAVE: '051001', PAYSTACK: '051001', YELLOW_CARD: 'SBSA' },
+  CAPITEC_ZAR: { FLUTTERWAVE: '470010', PAYSTACK: '470010', YELLOW_CARD: 'CAPITEC' },
+  NEDBANK_ZAR: { FLUTTERWAVE: '198765', PAYSTACK: '198765', YELLOW_CARD: 'NEDBANK' },
+};
+
+/**
+ * Resolves canonical mobile-money network codes or cross-corridor bank aliases
+ * to the target provider's expected code during multi-rail failover.
+ */
+export function resolveProviderCode(
+  code: string,
+  currency: string,
+  rail: PayoutRail,
+  isMobileMoney = false
+): string {
+  const upperCode = code.trim().toUpperCase();
+  const upperCur = currency.trim().toUpperCase();
+
+  if (isMobileMoney) {
+    if (rail === 'PAYSTACK') {
+      return PAYSTACK_MOMO_BANK_CODES[upperCode] || upperCode;
+    }
+    if (rail === 'FLUTTERWAVE') {
+      return upperCode.toLowerCase();
+    }
+    return upperCode;
+  }
+
+  const compositeKey = upperCode.endsWith(`_${upperCur}`)
+    ? upperCode
+    : `${upperCode}_${upperCur}`;
+  const mapped = CROSS_RAIL_BANK_CODES[compositeKey]?.[rail];
+  return mapped || code.trim();
+}
+

@@ -477,20 +477,25 @@ func (e *Engine) disburseFlutterwave(ctx context.Context, params DisburseParams)
 		return nil, fmt.Errorf("flutterwave secret key is not configured")
 	}
 
+	currency := strings.ToUpper(params.Currency)
 	payload := map[string]interface{}{
 		"amount":    params.Amount,
-		"currency":  strings.ToUpper(params.Currency),
+		"currency":  currency,
 		"reference": params.Reference,
 		"narration": params.Narration,
 	}
 
 	if params.BankDetails != nil {
-		payload["account_bank"] = params.BankDetails.BankCode
+		payload["account_bank"] = ResolveProviderCode(params.BankDetails.BankCode, currency, RailFlutterwave, false)
 		payload["account_number"] = params.BankDetails.AccountNumber
-		payload["debit_currency"] = strings.ToUpper(params.Currency)
+		payload["debit_currency"] = currency
 	} else if params.MobileMoneyDetails != nil {
-		payload["account_bank"] = strings.ToLower(params.MobileMoneyDetails.Network)
-		payload["account_number"] = params.MobileMoneyDetails.Phone
+		msisdn, err := NormalizeMSISDN(params.MobileMoneyDetails.Phone, currency)
+		if err != nil {
+			return nil, err
+		}
+		payload["account_bank"] = ResolveProviderCode(params.MobileMoneyDetails.Network, currency, RailFlutterwave, true)
+		payload["account_number"] = msisdn
 	} else {
 		return nil, fmt.Errorf("either bankDetails or mobileMoneyDetails is required for African payouts")
 	}
@@ -794,12 +799,25 @@ func (e *Engine) ResolveBankAccount(bankCode, accountNumber string) (*BankResolu
 	return e.ResolveBankAccountContext(context.Background(), bankCode, accountNumber)
 }
 
-// ResolveBankAccountContext verifies a Nigerian / African bank account name via NIP inquiry.
+// ResolveBankAccountContext verifies an African bank account name via Flutterwave or Paystack with automatic failover.
 func (e *Engine) ResolveBankAccountContext(ctx context.Context, bankCode, accountNumber string) (*BankResolutionResult, error) {
-	if e.config.FlutterwaveSecretKey == "" {
-		return nil, fmt.Errorf("flutterwave secret key is required for account resolution")
+	if e.config.FlutterwaveSecretKey != "" {
+		res, err := e.resolveFlutterwaveBankAccount(ctx, ResolveProviderCode(bankCode, "NGN", RailFlutterwave, false), accountNumber)
+		if err == nil {
+			return res, nil
+		}
+		if e.config.PaystackSecretKey != "" {
+			return e.resolvePaystackBankAccount(ctx, ResolveProviderCode(bankCode, "NGN", RailPaystack, false), accountNumber)
+		}
+		return nil, err
 	}
+	if e.config.PaystackSecretKey != "" {
+		return e.resolvePaystackBankAccount(ctx, ResolveProviderCode(bankCode, "NGN", RailPaystack, false), accountNumber)
+	}
+	return nil, fmt.Errorf("neither flutterwave nor paystack secret key is configured for account resolution")
+}
 
+func (e *Engine) resolveFlutterwaveBankAccount(ctx context.Context, bankCode, accountNumber string) (*BankResolutionResult, error) {
 	body := map[string]string{
 		"account_bank":   bankCode,
 		"account_number": accountNumber,
@@ -841,6 +859,47 @@ func (e *Engine) ResolveBankAccountContext(ctx context.Context, bankCode, accoun
 	}, nil
 }
 
+func (e *Engine) resolvePaystackBankAccount(ctx context.Context, bankCode, accountNumber string) (*BankResolutionResult, error) {
+	q := url.Values{}
+	q.Set("account_number", accountNumber)
+	q.Set("bank_code", bankCode)
+
+	req, err := http.NewRequestWithContext(ctx, "GET", "https://api.paystack.co/bank/resolve?"+q.Encode(), nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Authorization", "Bearer "+e.config.PaystackSecretKey)
+
+	resp, err := e.httpClient.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	bodyBytes, _ := io.ReadAll(resp.Body)
+	var res struct {
+		Status  bool   `json:"status"`
+		Message string `json:"message"`
+		Data    struct {
+			AccountName   string `json:"account_name"`
+			AccountNumber string `json:"account_number"`
+		} `json:"data"`
+	}
+	_ = json.Unmarshal(bodyBytes, &res)
+	if resp.StatusCode >= 400 || !res.Status {
+		return nil, fmt.Errorf("paystack account resolution failed: %s", res.Message)
+	}
+	accNum := res.Data.AccountNumber
+	if accNum == "" {
+		accNum = accountNumber
+	}
+	return &BankResolutionResult{
+		AccountName:   res.Data.AccountName,
+		AccountNumber: accNum,
+		BankCode:      bankCode,
+	}, nil
+}
+
 func (e *Engine) disbursePaystack(ctx context.Context, params DisburseParams) (*DisburseResult, error) {
 	if e.config.PaystackSecretKey == "" {
 		return nil, fmt.Errorf("paystack secret key is not configured")
@@ -868,15 +927,19 @@ func (e *Engine) disbursePaystack(ctx context.Context, params DisburseParams) (*
 			"type":           recType,
 			"name":           name,
 			"account_number": params.BankDetails.AccountNumber,
-			"bank_code":      params.BankDetails.BankCode,
+			"bank_code":      ResolveProviderCode(params.BankDetails.BankCode, currency, RailPaystack, false),
 			"currency":       currency,
 		}
 	} else {
+		msisdn, err := NormalizeMSISDN(params.MobileMoneyDetails.Phone, currency)
+		if err != nil {
+			return nil, err
+		}
 		recipientPayload = map[string]interface{}{
 			"type":           "mobile_money",
-			"name":           params.MobileMoneyDetails.Phone,
-			"account_number": params.MobileMoneyDetails.Phone,
-			"bank_code":      strings.ToUpper(params.MobileMoneyDetails.Network),
+			"name":           msisdn,
+			"account_number": msisdn,
+			"bank_code":      ResolveProviderCode(params.MobileMoneyDetails.Network, currency, RailPaystack, true),
 			"currency":       currency,
 		}
 	}
@@ -1357,6 +1420,73 @@ func (e *Engine) VerifyWebhook(rail PayoutRail, rawBody []byte, signature string
 	}
 }
 
+// VerifyAndConfirmWebhook verifies a webhook signature, guards against out-of-order regressions,
+// and confirms the authoritative payout state & amount directly against the provider API.
+func (e *Engine) VerifyAndConfirmWebhook(ctx context.Context, rail PayoutRail, rawBody []byte, signature, currentStatus, stripeAccountID string) (*WebhookEvent, error) {
+	ev, err := e.VerifyWebhook(rail, rawBody, signature)
+	if err != nil {
+		return nil, err
+	}
+	isReversal := strings.Contains(strings.ToLower(ev.EventType), "reversed")
+	if currentStatus != "" && !CanTransitionStatus(currentStatus, ev.Status, isReversal) {
+		ev.Status = currentStatus
+		return ev, nil
+	}
+
+	txID := ev.TransactionID
+	if txID == "" {
+		txID = ev.Reference
+	}
+	confirmed, err := e.GetPayoutStatusContext(ctx, PayoutStatusParams{
+		TransactionID:   txID,
+		Reference:       ev.Reference,
+		Rail:            rail,
+		StripeAccountID: stripeAccountID,
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	if ev.Amount > 0 && confirmed.Amount > 0 && math.Abs(ev.Amount-confirmed.Amount) > 0.01 {
+		return nil, fmt.Errorf("webhook amount mismatch on %s: webhook reported %.2f, provider API reported %.2f", rail, ev.Amount, confirmed.Amount)
+	}
+	if ev.Currency != "" && confirmed.Currency != "" && ev.Currency != confirmed.Currency {
+		return nil, fmt.Errorf("webhook currency mismatch on %s: webhook reported %s, provider API reported %s", rail, ev.Currency, confirmed.Currency)
+	}
+
+	finalStatus := confirmed.Status
+	if currentStatus != "" && !CanTransitionStatus(currentStatus, confirmed.Status, isReversal) {
+		finalStatus = currentStatus
+	}
+	ev.Status = finalStatus
+	if confirmed.ProviderStatus != "" {
+		ev.ProviderStatus = confirmed.ProviderStatus
+	}
+	if confirmed.Amount > 0 {
+		ev.Amount = confirmed.Amount
+	}
+	if confirmed.Currency != "" {
+		ev.Currency = confirmed.Currency
+	}
+	if confirmed.Fee > 0 {
+		ev.Fee = confirmed.Fee
+	}
+	if confirmed.Error != "" {
+		ev.Error = confirmed.Error
+	}
+	return ev, nil
+}
+
+// MatchAccountNames compares an expected beneficiary name against a resolved bank name.
+func (e *Engine) MatchAccountNames(expectedName, resolvedName string, threshold float64) NameMatchResult {
+	return MatchAccountNames(expectedName, resolvedName, threshold)
+}
+
+// CanTransitionStatus checks whether a payout status transition is valid.
+func (e *Engine) CanTransitionStatus(currentStatus, nextStatus string, allowReversal bool) bool {
+	return CanTransitionStatus(currentStatus, nextStatus, allowReversal)
+}
+
 func (e *Engine) verifyStripeWebhook(rawBody []byte, signatureHeader string) (*WebhookEvent, error) {
 	if e.config.StripeWebhookSecret == "" {
 		return nil, fmt.Errorf("stripe webhookSecret is required to verify webhooks")
@@ -1470,6 +1600,7 @@ func (e *Engine) verifyFlutterwaveWebhook(rawBody []byte, verifHash string) (*We
 			Status          string  `json:"status"`
 			Amount          float64 `json:"amount"`
 			Currency        string  `json:"currency"`
+			Fee             float64 `json:"fee"`
 			CompleteMessage string  `json:"complete_message"`
 		} `json:"data"`
 	}
@@ -1496,6 +1627,7 @@ func (e *Engine) verifyFlutterwaveWebhook(rawBody []byte, verifHash string) (*We
 		ProviderStatus: payload.Data.Status,
 		Amount:         payload.Data.Amount,
 		Currency:       strings.ToUpper(payload.Data.Currency),
+		Fee:            payload.Data.Fee,
 		Error:          errMsg,
 	}, nil
 }
@@ -1524,6 +1656,7 @@ func (e *Engine) verifyPaystackWebhook(rawBody []byte, signature string) (*Webho
 			Reference    string `json:"reference"`
 			Status       string `json:"status"`
 			Amount       int64  `json:"amount"`
+			Fee          int64  `json:"fee"`
 			Currency     string `json:"currency"`
 			Reason       string `json:"reason"`
 			Failures     string `json:"failures"`
@@ -1573,6 +1706,7 @@ func (e *Engine) verifyPaystackWebhook(rawBody []byte, signature string) (*Webho
 		ProviderStatus: rawStatus,
 		Amount:         fromMinorUnits(payload.Data.Amount, cur),
 		Currency:       cur,
+		Fee:            fromMinorUnits(payload.Data.Fee, cur),
 		Error:          errMsg,
 	}, nil
 }

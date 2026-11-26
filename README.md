@@ -64,8 +64,12 @@ Every method is available in both **TypeScript** (`camelCase`) and **Go** (`Pasc
 | `getPayoutStatus(params)` / `GetPayoutStatus(params)` | Queries the provider for the latest settlement status of a `PENDING` payout by `transactionId` (and optional `reference` / `stripeAccountId`). |
 | `getBalances(rail?)` / `GetBalances(rail)` | Returns available and pending float balances (`RailBalance[]`) for a specific rail, or across **all configured rails** when omitted/`""`. |
 | `getRailHealth(rail?)` / `GetRailHealth(rail)` | Returns live uptime/latency telemetry and circuit-breaker state (`healthy`, `circuitOpen`, `consecutiveFailures`, `avgLatencyMs`, `lastError`) for one or all rails. |
-| `verifyWebhook(rail, rawBody, signature)` / `VerifyWebhook(rail, rawBody, signature)` | Verifies the provider's webhook signature using constant-time comparison and normalizes the payload into a unified `WebhookEvent`. |
-| `resolveBankAccount(bankCode, accountNumber, rail?)` / `ResolveBankAccount(bankCode, accountNumber)` | Resolves and verifies an African bank account holder's legal name before disbursing funds. |
+| `verifyWebhook(rail, rawBody, signature)` / `VerifyWebhook(rail, rawBody, signature)` | Verifies the provider's webhook signature using constant-time comparison and normalizes the payload (including `fee` and M-Pesa `QUEUE_TIMEOUT`) into a unified `WebhookEvent`. |
+| `verifyAndConfirmWebhook(...)` / `VerifyAndConfirmWebhook(...)` | Verifies the webhook signature, blocks out-of-order status regressions (`canTransitionStatus`), and cross-checks the authoritative status & amount directly against the provider API. |
+| `resolveBankAccount(bankCode, accountNumber, rail?)` / `ResolveBankAccount(bankCode, accountNumber)` | Resolves and verifies an African bank account holder's legal name with automatic Flutterwave ↔ Paystack failover. |
+| `matchAccountNames(expected, resolved, threshold?)` / `MatchAccountNames(...)` | Compares expected vs. resolved legal names, tolerating word-order differences (`"Peter Chukwu"` vs `"CHUKWU CHIJIOKE PETER"`) and honorifics. |
+| `normalizeMsisdn(phone, currency?)` / `NormalizeMSISDN(phone, currency)` | Normalizes `+254 712-345-678` / `0712345678` phone numbers into bare E.164 MSISDN digits (`254712345678`) automatically across all mobile money rails. |
+| `encryptMpesaInitiatorPassword(pass, certPem)` / `EncryptMpesaInitiatorPassword(...)` | Encrypts plaintext Safaricom Daraja initiator passwords with X.509 / RSA PKCS#1 v1.5 padding automatically when `initiatorPassword` + `certificatePem` are supplied. |
 | `createConnectOnboardingLink(params)` *(TypeScript)* | Generates a hosted Stripe Connect Express onboarding URL for US/EU payees. |
 
 ---

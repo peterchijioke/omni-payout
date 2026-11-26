@@ -40,12 +40,17 @@ __export(index_exports, {
   RailHealthTracker: () => RailHealthTracker,
   StripeConnectAdapter: () => StripeConnectAdapter,
   YellowCardAdapter: () => YellowCardAdapter,
+  canTransitionStatus: () => canTransitionStatus,
   constantTimeHexEqual: () => constantTimeHexEqual,
   constantTimeStringEqual: () => constantTimeStringEqual,
   currencyExponent: () => currencyExponent,
+  encryptMpesaInitiatorPassword: () => encryptMpesaInitiatorPassword,
   fetchWithTimeout: () => fetchWithTimeout,
   fromMinorUnits: () => fromMinorUnits,
   isHttpStatusAmbiguous: () => isHttpStatusAmbiguous,
+  matchAccountNames: () => matchAccountNames,
+  normalizeMsisdn: () => normalizeMsisdn,
+  resolveProviderCode: () => resolveProviderCode,
   sanitizeBaseUrl: () => sanitizeBaseUrl,
   toDeterministicUuid: () => toDeterministicUuid,
   toMinorUnits: () => toMinorUnits,
@@ -207,6 +212,151 @@ function constantTimeStringEqual(provided, expected) {
   const b = Buffer.from(expected, "utf8");
   if (a.length !== b.length) return false;
   return import_crypto.default.timingSafeEqual(a, b);
+}
+var CURRENCY_DIAL_CODES = {
+  NGN: "234",
+  KES: "254",
+  GHS: "233",
+  UGX: "256",
+  TZS: "255",
+  RWF: "250",
+  ZAR: "27",
+  ZMW: "260",
+  XAF: "237",
+  XOF: "225"
+};
+function normalizeMsisdn(phone, currency) {
+  if (!phone || typeof phone !== "string") {
+    throw new Error("Mobile money phone number is required");
+  }
+  let cleaned = phone.trim().replace(/[\s\-().]/g, "");
+  if (cleaned.startsWith("+")) {
+    cleaned = cleaned.slice(1);
+  } else if (cleaned.startsWith("00")) {
+    cleaned = cleaned.slice(2);
+  } else if (cleaned.startsWith("0") && currency) {
+    const dial = CURRENCY_DIAL_CODES[currency.toUpperCase()];
+    if (dial) {
+      cleaned = dial + cleaned.slice(1);
+    }
+  }
+  if (!/^\d{7,15}$/.test(cleaned)) {
+    throw new Error(`Invalid mobile money phone number: "${phone}"`);
+  }
+  return cleaned;
+}
+function encryptMpesaInitiatorPassword(initiatorPassword, certificatePem) {
+  if (!initiatorPassword || !certificatePem) {
+    throw new Error("Both initiatorPassword and certificatePem are required to generate SecurityCredential");
+  }
+  const encrypted = import_crypto.default.publicEncrypt(
+    {
+      key: certificatePem,
+      padding: import_crypto.default.constants.RSA_PKCS1_PADDING
+    },
+    Buffer.from(initiatorPassword, "utf8")
+  );
+  return encrypted.toString("base64");
+}
+var HONORIFIC_TOKENS = /* @__PURE__ */ new Set([
+  "mr",
+  "mrs",
+  "ms",
+  "miss",
+  "dr",
+  "prof",
+  "chief",
+  "alhaji",
+  "hajia",
+  "engr",
+  "sir",
+  "lady"
+]);
+function tokenizeAccountName(name) {
+  return (name || "").toLowerCase().replace(/[^a-z0-9\s]/g, " ").split(/\s+/).filter((tok) => tok.length > 0 && !HONORIFIC_TOKENS.has(tok));
+}
+function matchAccountNames(expectedName, resolvedName, threshold = 0.66) {
+  const expectedTokens = tokenizeAccountName(expectedName);
+  const actualTokens = tokenizeAccountName(resolvedName);
+  const normalizedExpected = expectedTokens.join(" ");
+  const normalizedActual = actualTokens.join(" ");
+  if (expectedTokens.length === 0 || actualTokens.length === 0) {
+    return { matched: false, score: 0, normalizedExpected, normalizedActual };
+  }
+  const actualSet = new Set(actualTokens);
+  const expectedSet = new Set(expectedTokens);
+  let intersection = 0;
+  for (const tok of expectedSet) {
+    if (actualSet.has(tok)) intersection++;
+  }
+  const minSize = Math.min(expectedSet.size, actualSet.size);
+  const unionSize = (/* @__PURE__ */ new Set([...expectedSet, ...actualSet])).size;
+  const containment = intersection / minSize;
+  const jaccard = intersection / unionSize;
+  const score = Number((containment * 0.75 + jaccard * 0.25).toFixed(4));
+  return {
+    matched: score >= threshold,
+    score,
+    normalizedExpected,
+    normalizedActual
+  };
+}
+function canTransitionStatus(currentStatus, nextStatus, allowReversal = false) {
+  if (!currentStatus || currentStatus === "PENDING") {
+    return true;
+  }
+  if (currentStatus === nextStatus) {
+    return true;
+  }
+  if (currentStatus === "SUCCESSFUL" && nextStatus === "FAILED" && allowReversal) {
+    return true;
+  }
+  return false;
+}
+var PAYSTACK_MOMO_BANK_CODES = {
+  MTN: "MTN",
+  VODAFONE: "VOD",
+  TELECEL: "VOD",
+  AIRTEL: "ATL",
+  AIRTELTIGO: "ATL",
+  MPESA: "MPESA",
+  ORANGE: "ORANGE",
+  WAVE: "WAVE"
+};
+var CROSS_RAIL_BANK_CODES = {
+  // Ghana (GHS) canonical aliases
+  GCB_GHS: { FLUTTERWAVE: "GH040100", PAYSTACK: "040100", YELLOW_CARD: "GCB" },
+  ECOBANK_GHS: { FLUTTERWAVE: "GH130100", PAYSTACK: "130100", YELLOW_CARD: "ECOBANK" },
+  ABSA_GHS: { FLUTTERWAVE: "GH030100", PAYSTACK: "030100", YELLOW_CARD: "ABSA" },
+  STANBIC_GHS: { FLUTTERWAVE: "GH190100", PAYSTACK: "190100", YELLOW_CARD: "STANBIC" },
+  FIDELITY_GHS: { FLUTTERWAVE: "GH240100", PAYSTACK: "240100", YELLOW_CARD: "FIDELITY" },
+  // Kenya (KES) canonical aliases
+  EQUITY_KES: { FLUTTERWAVE: "68", PAYSTACK: "68", YELLOW_CARD: "EQUITY" },
+  KCB_KES: { FLUTTERWAVE: "01", PAYSTACK: "01", YELLOW_CARD: "KCB" },
+  COOP_KES: { FLUTTERWAVE: "11", PAYSTACK: "11", YELLOW_CARD: "COOP" },
+  ABSA_KES: { FLUTTERWAVE: "03", PAYSTACK: "03", YELLOW_CARD: "ABSA" },
+  // South Africa (ZAR) canonical aliases
+  FNB_ZAR: { FLUTTERWAVE: "250655", PAYSTACK: "250655", YELLOW_CARD: "FNB" },
+  ABSA_ZAR: { FLUTTERWAVE: "632005", PAYSTACK: "632005", YELLOW_CARD: "ABSA" },
+  STANDARD_BANK_ZAR: { FLUTTERWAVE: "051001", PAYSTACK: "051001", YELLOW_CARD: "SBSA" },
+  CAPITEC_ZAR: { FLUTTERWAVE: "470010", PAYSTACK: "470010", YELLOW_CARD: "CAPITEC" },
+  NEDBANK_ZAR: { FLUTTERWAVE: "198765", PAYSTACK: "198765", YELLOW_CARD: "NEDBANK" }
+};
+function resolveProviderCode(code, currency, rail, isMobileMoney = false) {
+  const upperCode = code.trim().toUpperCase();
+  const upperCur = currency.trim().toUpperCase();
+  if (isMobileMoney) {
+    if (rail === "PAYSTACK") {
+      return PAYSTACK_MOMO_BANK_CODES[upperCode] || upperCode;
+    }
+    if (rail === "FLUTTERWAVE") {
+      return upperCode.toLowerCase();
+    }
+    return upperCode;
+  }
+  const compositeKey = upperCode.endsWith(`_${upperCur}`) ? upperCode : `${upperCode}_${upperCur}`;
+  const mapped = CROSS_RAIL_BANK_CODES[compositeKey]?.[rail];
+  return mapped || code.trim();
 }
 
 // src/health.ts
@@ -529,6 +679,7 @@ var StripeConnectAdapter = class {
       providerStatus: obj.status,
       amount: typeof obj.amount === "number" ? fromMinorUnits(obj.amount, currency) : 0,
       currency,
+      fee: typeof obj.fee === "number" ? fromMinorUnits(obj.fee, currency) : void 0,
       error: status === "FAILED" ? obj.failure_message || "Stripe payout failed" : void 0,
       rawPayload: payload
     };
@@ -605,22 +756,23 @@ var FlutterwaveAdapter = class {
   }
   async disburse(params) {
     let payload;
+    const currency = params.currency.toUpperCase();
     if (params.bankDetails) {
       payload = {
-        account_bank: params.bankDetails.bankCode,
+        account_bank: resolveProviderCode(params.bankDetails.bankCode, currency, "FLUTTERWAVE", false),
         account_number: params.bankDetails.accountNumber,
         amount: params.amount,
-        currency: params.currency.toUpperCase(),
+        currency,
         reference: params.reference,
         narration: params.narration || "Marketplace disbursement",
-        debit_currency: params.currency.toUpperCase()
+        debit_currency: currency
       };
     } else if (params.mobileMoneyDetails) {
       payload = {
-        account_bank: params.mobileMoneyDetails.network.toLowerCase(),
-        account_number: params.mobileMoneyDetails.phone,
+        account_bank: resolveProviderCode(params.mobileMoneyDetails.network, currency, "FLUTTERWAVE", true),
+        account_number: normalizeMsisdn(params.mobileMoneyDetails.phone, currency),
         amount: params.amount,
-        currency: params.currency.toUpperCase(),
+        currency,
         reference: params.reference,
         narration: params.narration || "Mobile Money payout"
       };
@@ -706,6 +858,7 @@ var FlutterwaveAdapter = class {
       providerStatus: data.status,
       amount: data.amount ? Number(data.amount) : 0,
       currency: String(data.currency || "").toUpperCase(),
+      fee: data.fee !== void 0 ? Number(data.fee) : void 0,
       error: status === "FAILED" ? data.complete_message || "Flutterwave transfer failed" : void 0,
       rawPayload: payload
     };
@@ -792,13 +945,13 @@ var PaystackAdapter = class {
       type: currency === "GHS" ? "ghipss" : currency === "ZAR" ? "basa" : "nuban",
       name: params.bankDetails.accountName || params.bankDetails.accountNumber,
       account_number: params.bankDetails.accountNumber,
-      bank_code: params.bankDetails.bankCode,
+      bank_code: resolveProviderCode(params.bankDetails.bankCode, currency, "PAYSTACK", false),
       currency
     } : {
       type: "mobile_money",
-      name: params.mobileMoneyDetails.phone,
-      account_number: params.mobileMoneyDetails.phone,
-      bank_code: params.mobileMoneyDetails.network.toUpperCase(),
+      name: normalizeMsisdn(params.mobileMoneyDetails.phone, currency),
+      account_number: normalizeMsisdn(params.mobileMoneyDetails.phone, currency),
+      bank_code: resolveProviderCode(params.mobileMoneyDetails.network, currency, "PAYSTACK", true),
       currency
     };
     const recipientRes = await this.request(
@@ -858,6 +1011,7 @@ var PaystackAdapter = class {
       rail: "PAYSTACK",
       amount: typeof transferData.amount === "number" ? fromMinorUnits(transferData.amount, currency) : 0,
       currency,
+      fee: typeof transferData.fee === "number" ? fromMinorUnits(transferData.fee, currency) : void 0,
       error: status === "FAILED" ? transferData.failures || res.message : void 0,
       rawResponse: res
     };
@@ -895,6 +1049,7 @@ var PaystackAdapter = class {
       providerStatus: rawStatus,
       amount: typeof data.amount === "number" ? fromMinorUnits(data.amount, currency) : 0,
       currency,
+      fee: typeof data.fee === "number" ? fromMinorUnits(data.fee, currency) : void 0,
       error: status === "FAILED" ? data.reason || data.failures || "Paystack transfer failed" : void 0,
       rawPayload: payload
     };
@@ -990,7 +1145,7 @@ var PawaPayAdapter = class {
       recipient: {
         type: "MSISDN",
         address: {
-          value: params.mobileMoneyDetails.phone
+          value: normalizeMsisdn(params.mobileMoneyDetails.phone, currency)
         }
       },
       customerTimestamp: (/* @__PURE__ */ new Date()).toISOString(),
@@ -1067,6 +1222,7 @@ var PawaPayAdapter = class {
       providerStatus: payload.status,
       amount: payload.amount ? Number(payload.amount) : 0,
       currency: String(payload.currency || "").toUpperCase(),
+      fee: payload.fee !== void 0 ? Number(payload.fee) : void 0,
       error: status === "FAILED" ? payload.failureReason?.failureMessage || "PawaPay payout failed" : void 0,
       rawPayload: payload
     };
@@ -1158,16 +1314,17 @@ var YellowCardAdapter = class {
       );
     }
     const currency = params.currency.toUpperCase();
+    const resolvedBank = params.bankDetails ? resolveProviderCode(params.bankDetails.bankCode, currency, "YELLOW_CARD", false) : "";
     const destination = params.bankDetails ? {
       accountType: "bank",
       accountNumber: params.bankDetails.accountNumber,
       accountName: params.bankDetails.accountName || params.bankDetails.accountNumber,
-      accountBank: params.bankDetails.bankCode,
-      networkId: params.metadata?.networkId || params.bankDetails.bankCode
+      accountBank: resolvedBank,
+      networkId: params.metadata?.networkId || resolvedBank
     } : {
       accountType: "momo",
-      accountNumber: params.mobileMoneyDetails.phone,
-      networkId: params.metadata?.networkId || params.mobileMoneyDetails.network
+      accountNumber: normalizeMsisdn(params.mobileMoneyDetails.phone, currency),
+      networkId: params.metadata?.networkId || resolveProviderCode(params.mobileMoneyDetails.network, currency, "YELLOW_CARD", true)
     };
     const payload = {
       sequenceId: params.reference,
@@ -1239,6 +1396,7 @@ var YellowCardAdapter = class {
       providerStatus: payload.status,
       amount: Number(payload.localAmount ?? payload.amount ?? 0),
       currency: String(payload.currency || "").toUpperCase(),
+      fee: payload.fee !== void 0 ? Number(payload.fee) : payload.serviceFee !== void 0 ? Number(payload.serviceFee) : void 0,
       error: status === "FAILED" ? payload.failureReason || "Yellow Card payout failed" : void 0,
       rawPayload: payload
     };
@@ -1248,6 +1406,7 @@ var YellowCardAdapter = class {
 // src/adapters/mpesa.adapter.ts
 var MpesaDarajaAdapter = class {
   #config;
+  #securityCredential;
   #baseUrl;
   #timeoutMs;
   #cachedToken;
@@ -1256,7 +1415,14 @@ var MpesaDarajaAdapter = class {
     if (!config.consumerKey || !config.consumerSecret) {
       throw new Error("M-Pesa Daraja consumerKey and consumerSecret are required");
     }
+    const credential = config.securityCredential || (config.initiatorPassword && config.certificatePem ? encryptMpesaInitiatorPassword(config.initiatorPassword, config.certificatePem) : "");
+    if (!credential) {
+      throw new Error(
+        "M-Pesa Daraja requires either securityCredential or both initiatorPassword and certificatePem"
+      );
+    }
     this.#config = { ...config };
+    this.#securityCredential = credential;
     this.#baseUrl = sanitizeBaseUrl(config.baseUrl, "https://api.safaricom.co.ke");
     this.#timeoutMs = timeoutMs;
   }
@@ -1323,16 +1489,17 @@ var MpesaDarajaAdapter = class {
     if (!params.mobileMoneyDetails) {
       throw new Error("mobileMoneyDetails is required for M-Pesa Daraja disbursements");
     }
+    const msisdn = normalizeMsisdn(params.mobileMoneyDetails.phone, params.currency || "KES");
     const data = await this.request(
       "/mpesa/b2c/v3/paymentrequest",
       {
         OriginatorConversationID: params.reference,
         InitiatorName: this.#config.initiatorName,
-        SecurityCredential: this.#config.securityCredential,
+        SecurityCredential: this.#securityCredential,
         CommandID: params.metadata?.commandId || "BusinessPayment",
         Amount: Math.round(params.amount),
         PartyA: this.#config.shortCode,
-        PartyB: params.mobileMoneyDetails.phone,
+        PartyB: msisdn,
         Remarks: params.narration || "Marketplace payout",
         QueueTimeOutURL: this.#config.queueTimeoutUrl,
         ResultURL: this.#config.resultUrl,
@@ -1357,7 +1524,7 @@ var MpesaDarajaAdapter = class {
   async getPayoutStatus(transactionId, reference) {
     const data = await this.request("/mpesa/transactionstatus/v1/query", {
       Initiator: this.#config.initiatorName,
-      SecurityCredential: this.#config.securityCredential,
+      SecurityCredential: this.#securityCredential,
       CommandID: "TransactionStatusQuery",
       TransactionID: transactionId,
       OriginatorConversationID: reference || transactionId,
@@ -1383,7 +1550,7 @@ var MpesaDarajaAdapter = class {
   async getBalances() {
     const data = await this.request("/mpesa/accountbalance/v1/query", {
       Initiator: this.#config.initiatorName,
-      SecurityCredential: this.#config.securityCredential,
+      SecurityCredential: this.#securityCredential,
       CommandID: "AccountBalance",
       PartyA: this.#config.shortCode,
       IdentifierType: "4",
@@ -1411,25 +1578,36 @@ var MpesaDarajaAdapter = class {
     }
     const payload = JSON.parse(rawBody);
     const result = payload.Result || payload;
-    const resultCode = Number(result.ResultCode);
-    const status = resultCode === 0 ? "SUCCESSFUL" : "FAILED";
+    const resultDesc = String(result.ResultDesc || "");
+    const rawCode = result.ResultCode;
+    const resultCode = rawCode !== void 0 ? Number(rawCode) : -1;
+    const isQueueTimeout = Boolean(payload.QueueTimeout) || resultCode === 1037 || /queue\s*time\s*out|timed\s*out/i.test(resultDesc);
+    const status = resultCode === 0 && !isQueueTimeout ? "SUCCESSFUL" : "FAILED";
+    const eventType = isQueueTimeout ? "b2c.result.timeout" : status === "SUCCESSFUL" ? "b2c.result.success" : "b2c.result.failed";
+    const providerStatus = isQueueTimeout ? "QUEUE_TIMEOUT" : String(rawCode ?? "");
     let amount = 0;
+    let fee;
     const params = result.ResultParameters?.ResultParameter || [];
     for (const p of params) {
       if (p.Key === "TransactionAmount") {
         amount = Number(p.Value || 0);
+      } else if (p.Key === "B2CChargesPaidAccountAvailableFunds" || p.Key === "TransactionCharge") {
+        if (p.Key === "TransactionCharge") {
+          fee = Number(p.Value || 0);
+        }
       }
     }
     return {
       rail: "MPESA_DARAJA",
-      eventType: status === "SUCCESSFUL" ? "b2c.result.success" : "b2c.result.failed",
+      eventType,
       transactionId: String(result.TransactionID || result.ConversationID || ""),
       reference: String(result.OriginatorConversationID || result.TransactionID || ""),
       status,
-      providerStatus: String(result.ResultCode ?? ""),
+      providerStatus,
       amount,
       currency: "KES",
-      error: status === "FAILED" ? result.ResultDesc || "M-Pesa B2C payout failed" : void 0,
+      fee,
+      error: status === "FAILED" ? resultDesc || (isQueueTimeout ? "M-Pesa B2C queue timeout" : "M-Pesa B2C payout failed") : void 0,
       rawPayload: payload
     };
   }
@@ -1792,19 +1970,104 @@ var OmniPayoutEngine = class {
     throw new Error(`Unsupported payout rail: ${rail}`);
   }
   /**
-   * Resolves a Nigerian / African bank account name using Flutterwave or Paystack.
+   * Verifies a webhook signature, guards against out-of-order status regressions,
+   * and confirms the authoritative payout state & amount directly against the provider API.
    */
-  async resolveBankAccount(bankCode, accountNumber, rail) {
-    if (rail === "PAYSTACK" || !rail && !this.#flutterwave && this.#paystack) {
+  async verifyAndConfirmWebhook(rail, rawBody, signature, options) {
+    const event = this.verifyWebhook(rail, rawBody, signature);
+    const isReversal = /reversed/i.test(event.eventType);
+    if (options?.currentStatus && !canTransitionStatus(options.currentStatus, event.status, isReversal)) {
+      return {
+        ...event,
+        status: options.currentStatus
+      };
+    }
+    const confirmed = await this.getPayoutStatus({
+      transactionId: event.transactionId || event.reference,
+      reference: event.reference || void 0,
+      rail,
+      stripeAccountId: options?.stripeAccountId
+    });
+    if (event.amount > 0 && confirmed.amount > 0 && Math.abs(event.amount - confirmed.amount) > 0.01) {
+      throw new Error(
+        `Webhook amount mismatch on ${rail}: webhook reported ${event.amount}, provider API reported ${confirmed.amount}`
+      );
+    }
+    if (event.currency && confirmed.currency && event.currency !== confirmed.currency) {
+      throw new Error(
+        `Webhook currency mismatch on ${rail}: webhook reported ${event.currency}, provider API reported ${confirmed.currency}`
+      );
+    }
+    const finalStatus = options?.currentStatus && !canTransitionStatus(options.currentStatus, confirmed.status, isReversal) ? options.currentStatus : confirmed.status;
+    return {
+      ...event,
+      status: finalStatus,
+      providerStatus: confirmed.providerStatus || event.providerStatus,
+      amount: confirmed.amount || event.amount,
+      currency: confirmed.currency || event.currency,
+      fee: confirmed.fee ?? event.fee,
+      error: confirmed.error || event.error
+    };
+  }
+  /**
+   * Compares an expected beneficiary name against a resolved bank account name,
+   * tolerating word-order differences and honorifics.
+   */
+  matchAccountNames(expectedName, resolvedName, threshold = 0.66) {
+    return matchAccountNames(expectedName, resolvedName, threshold);
+  }
+  /**
+   * Checks whether a payout status transition is valid (preventing out-of-order regressions).
+   */
+  canTransitionStatus(currentStatus, nextStatus, allowReversal = false) {
+    return canTransitionStatus(currentStatus, nextStatus, allowReversal);
+  }
+  /**
+   * Resolves an African bank account name using Flutterwave or Paystack,
+   * with automatic failover between configured providers when `rail` is omitted.
+   */
+  async resolveBankAccount(bankCode, accountNumber, rail, currency = "NGN") {
+    if (rail === "PAYSTACK") {
       if (!this.#paystack) {
         throw new Error("Paystack provider is not configured for bank resolution");
       }
-      return this.#paystack.resolveBankAccount(bankCode, accountNumber);
+      return this.#paystack.resolveBankAccount(
+        resolveProviderCode(bankCode, currency, "PAYSTACK", false),
+        accountNumber
+      );
     }
-    if (!this.#flutterwave) {
-      throw new Error("Flutterwave provider is not configured for bank resolution");
+    if (rail === "FLUTTERWAVE") {
+      if (!this.#flutterwave) {
+        throw new Error("Flutterwave provider is not configured for bank resolution");
+      }
+      return this.#flutterwave.resolveBankAccount(
+        resolveProviderCode(bankCode, currency, "FLUTTERWAVE", false),
+        accountNumber
+      );
     }
-    return this.#flutterwave.resolveBankAccount(bankCode, accountNumber);
+    if (this.#flutterwave) {
+      try {
+        return await this.#flutterwave.resolveBankAccount(
+          resolveProviderCode(bankCode, currency, "FLUTTERWAVE", false),
+          accountNumber
+        );
+      } catch (err) {
+        if (this.#paystack) {
+          return this.#paystack.resolveBankAccount(
+            resolveProviderCode(bankCode, currency, "PAYSTACK", false),
+            accountNumber
+          );
+        }
+        throw err;
+      }
+    }
+    if (this.#paystack) {
+      return this.#paystack.resolveBankAccount(
+        resolveProviderCode(bankCode, currency, "PAYSTACK", false),
+        accountNumber
+      );
+    }
+    throw new Error("Neither Flutterwave nor Paystack is configured for bank resolution");
   }
   /**
    * Generates a Stripe Connect Express onboarding URL for US/European merchants and couriers.
@@ -1828,12 +2091,17 @@ var OmniPayoutEngine = class {
   RailHealthTracker,
   StripeConnectAdapter,
   YellowCardAdapter,
+  canTransitionStatus,
   constantTimeHexEqual,
   constantTimeStringEqual,
   currencyExponent,
+  encryptMpesaInitiatorPassword,
   fetchWithTimeout,
   fromMinorUnits,
   isHttpStatusAmbiguous,
+  matchAccountNames,
+  normalizeMsisdn,
+  resolveProviderCode,
   sanitizeBaseUrl,
   toDeterministicUuid,
   toMinorUnits,

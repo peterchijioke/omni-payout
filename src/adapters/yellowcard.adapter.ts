@@ -5,6 +5,8 @@ import {
   constantTimeStringEqual,
   fetchWithTimeout,
   isHttpStatusAmbiguous,
+  normalizeMsisdn,
+  resolveProviderCode,
   sanitizeBaseUrl,
   validateSafeIdentifier,
 } from '../utils';
@@ -112,18 +114,23 @@ export class YellowCardAdapter {
     }
 
     const currency = params.currency.toUpperCase();
+    const resolvedBank = params.bankDetails
+      ? resolveProviderCode(params.bankDetails.bankCode, currency, 'YELLOW_CARD', false)
+      : '';
     const destination = params.bankDetails
       ? {
           accountType: 'bank',
           accountNumber: params.bankDetails.accountNumber,
           accountName: params.bankDetails.accountName || params.bankDetails.accountNumber,
-          accountBank: params.bankDetails.bankCode,
-          networkId: params.metadata?.networkId || params.bankDetails.bankCode,
+          accountBank: resolvedBank,
+          networkId: params.metadata?.networkId || resolvedBank,
         }
       : {
           accountType: 'momo',
-          accountNumber: params.mobileMoneyDetails!.phone,
-          networkId: params.metadata?.networkId || params.mobileMoneyDetails!.network,
+          accountNumber: normalizeMsisdn(params.mobileMoneyDetails!.phone, currency),
+          networkId:
+            params.metadata?.networkId ||
+            resolveProviderCode(params.mobileMoneyDetails!.network, currency, 'YELLOW_CARD', true),
         };
 
     const payload: Record<string, any> = {
@@ -217,6 +224,12 @@ export class YellowCardAdapter {
       providerStatus: payload.status,
       amount: Number(payload.localAmount ?? payload.amount ?? 0),
       currency: String(payload.currency || '').toUpperCase(),
+      fee:
+        payload.fee !== undefined
+          ? Number(payload.fee)
+          : payload.serviceFee !== undefined
+            ? Number(payload.serviceFee)
+            : undefined,
       error: status === 'FAILED' ? payload.failureReason || 'Yellow Card payout failed' : undefined,
       rawPayload: payload,
     };

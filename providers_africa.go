@@ -84,6 +84,11 @@ func (e *Engine) disbursePawaPay(ctx context.Context, params DisburseParams) (*D
 		desc = desc[:22]
 	}
 
+	msisdn, err := NormalizeMSISDN(params.MobileMoneyDetails.Phone, currency)
+	if err != nil {
+		return nil, err
+	}
+
 	payoutID := toDeterministicUUID(params.Reference)
 	payload := map[string]interface{}{
 		"payoutId":      payoutID,
@@ -93,7 +98,7 @@ func (e *Engine) disbursePawaPay(ctx context.Context, params DisburseParams) (*D
 		"recipient": map[string]interface{}{
 			"type": "MSISDN",
 			"address": map[string]string{
-				"value": params.MobileMoneyDetails.Phone,
+				"value": msisdn,
 			},
 		},
 		"customerTimestamp":    time.Now().UTC().Format(time.RFC3339),
@@ -331,6 +336,7 @@ func (e *Engine) verifyPawaPayWebhook(rawBody []byte, signature string) (*Webhoo
 		PayoutID      string `json:"payoutId"`
 		Status        string `json:"status"`
 		Amount        string `json:"amount"`
+		Fee           string `json:"fee"`
 		Currency      string `json:"currency"`
 		FailureReason *struct {
 			FailureMessage string `json:"failureMessage"`
@@ -341,6 +347,7 @@ func (e *Engine) verifyPawaPayWebhook(rawBody []byte, signature string) (*Webhoo
 	}
 	status := normalizePawaPayStatus(payload.Status)
 	amt, _ := strconv.ParseFloat(payload.Amount, 64)
+	fee, _ := strconv.ParseFloat(payload.Fee, 64)
 	errMsg := ""
 	if status == string(StatusFailed) {
 		if payload.FailureReason != nil && payload.FailureReason.FailureMessage != "" {
@@ -358,6 +365,7 @@ func (e *Engine) verifyPawaPayWebhook(rawBody []byte, signature string) (*Webhoo
 		ProviderStatus: payload.Status,
 		Amount:         amt,
 		Currency:       strings.ToUpper(payload.Currency),
+		Fee:            fee,
 		Error:          errMsg,
 	}, nil
 }
@@ -436,7 +444,8 @@ func (e *Engine) disburseYellowCard(ctx context.Context, params DisburseParams) 
 	currency := strings.ToUpper(params.Currency)
 	var dest map[string]interface{}
 	if params.BankDetails != nil {
-		netID := params.BankDetails.BankCode
+		resolvedBank := ResolveProviderCode(params.BankDetails.BankCode, currency, RailYellowCard, false)
+		netID := resolvedBank
 		if params.Metadata != nil && params.Metadata["networkId"] != "" {
 			netID = params.Metadata["networkId"]
 		}
@@ -448,17 +457,21 @@ func (e *Engine) disburseYellowCard(ctx context.Context, params DisburseParams) 
 			"accountType":   "bank",
 			"accountNumber": params.BankDetails.AccountNumber,
 			"accountName":   accName,
-			"accountBank":   params.BankDetails.BankCode,
+			"accountBank":   resolvedBank,
 			"networkId":     netID,
 		}
 	} else {
-		netID := params.MobileMoneyDetails.Network
+		msisdn, err := NormalizeMSISDN(params.MobileMoneyDetails.Phone, currency)
+		if err != nil {
+			return nil, err
+		}
+		netID := ResolveProviderCode(params.MobileMoneyDetails.Network, currency, RailYellowCard, true)
 		if params.Metadata != nil && params.Metadata["networkId"] != "" {
 			netID = params.Metadata["networkId"]
 		}
 		dest = map[string]interface{}{
 			"accountType":   "momo",
-			"accountNumber": params.MobileMoneyDetails.Phone,
+			"accountNumber": msisdn,
 			"networkId":     netID,
 		}
 	}
@@ -678,6 +691,8 @@ func (e *Engine) verifyYellowCardWebhook(rawBody []byte, signature string) (*Web
 		Status        string  `json:"status"`
 		LocalAmount   float64 `json:"localAmount"`
 		Amount        float64 `json:"amount"`
+		Fee           float64 `json:"fee"`
+		ServiceFee    float64 `json:"serviceFee"`
 		Currency      string  `json:"currency"`
 		FailureReason string  `json:"failureReason"`
 	}
@@ -688,6 +703,10 @@ func (e *Engine) verifyYellowCardWebhook(rawBody []byte, signature string) (*Web
 	amt := payload.LocalAmount
 	if amt == 0 {
 		amt = payload.Amount
+	}
+	fee := payload.Fee
+	if fee == 0 {
+		fee = payload.ServiceFee
 	}
 	errMsg := ""
 	if status == string(StatusFailed) {
@@ -706,6 +725,7 @@ func (e *Engine) verifyYellowCardWebhook(rawBody []byte, signature string) (*Web
 		ProviderStatus: payload.Status,
 		Amount:         amt,
 		Currency:       strings.ToUpper(payload.Currency),
+		Fee:            fee,
 		Error:          errMsg,
 	}, nil
 }
@@ -718,6 +738,20 @@ func (e *Engine) mpesaBaseURL() (string, error) {
 		raw = e.config.MpesaDaraja.BaseURL
 	}
 	return sanitizeBaseURL(raw, "https://api.safaricom.co.ke")
+}
+
+func (e *Engine) mpesaSecurityCredential() (string, error) {
+	cfg := e.config.MpesaDaraja
+	if cfg == nil {
+		return "", fmt.Errorf("mpesa daraja is not configured")
+	}
+	if cfg.SecurityCredential != "" {
+		return cfg.SecurityCredential, nil
+	}
+	if cfg.InitiatorPassword != "" && cfg.CertificatePEM != "" {
+		return EncryptMpesaInitiatorPassword(cfg.InitiatorPassword, cfg.CertificatePEM)
+	}
+	return "", fmt.Errorf("mpesa daraja requires either SecurityCredential or both InitiatorPassword and CertificatePEM")
 }
 
 func (e *Engine) getMpesaAccessToken(ctx context.Context) (string, error) {
@@ -847,6 +881,18 @@ func (e *Engine) disburseMpesaDaraja(ctx context.Context, params DisburseParams)
 	if params.MobileMoneyDetails == nil {
 		return nil, fmt.Errorf("mobileMoneyDetails is required for M-Pesa Daraja disbursements")
 	}
+	secCred, err := e.mpesaSecurityCredential()
+	if err != nil {
+		return nil, err
+	}
+	cur := params.Currency
+	if cur == "" {
+		cur = "KES"
+	}
+	msisdn, err := NormalizeMSISDN(params.MobileMoneyDetails.Phone, cur)
+	if err != nil {
+		return nil, err
+	}
 
 	commandID := "BusinessPayment"
 	if params.Metadata != nil && params.Metadata["commandId"] != "" {
@@ -860,11 +906,11 @@ func (e *Engine) disburseMpesaDaraja(ctx context.Context, params DisburseParams)
 	respBytes, err := e.mpesaPost(ctx, "/mpesa/b2c/v3/paymentrequest", map[string]interface{}{
 		"OriginatorConversationID": params.Reference,
 		"InitiatorName":            cfg.InitiatorName,
-		"SecurityCredential":       cfg.SecurityCredential,
+		"SecurityCredential":       secCred,
 		"CommandID":                commandID,
 		"Amount":                   int64(math.Round(params.Amount)),
 		"PartyA":                   cfg.ShortCode,
-		"PartyB":                   params.MobileMoneyDetails.Phone,
+		"PartyB":                   msisdn,
 		"Remarks":                  remarks,
 		"QueueTimeOutURL":          cfg.QueueTimeoutURL,
 		"ResultURL":                cfg.ResultURL,
@@ -905,6 +951,10 @@ func (e *Engine) getMpesaDarajaPayoutStatus(ctx context.Context, params PayoutSt
 	if cfg == nil {
 		return nil, fmt.Errorf("mpesa daraja is not configured")
 	}
+	secCred, err := e.mpesaSecurityCredential()
+	if err != nil {
+		return nil, err
+	}
 	ref := params.Reference
 	if ref == "" {
 		ref = params.TransactionID
@@ -912,7 +962,7 @@ func (e *Engine) getMpesaDarajaPayoutStatus(ctx context.Context, params PayoutSt
 
 	respBytes, err := e.mpesaPost(ctx, "/mpesa/transactionstatus/v1/query", map[string]interface{}{
 		"Initiator":                cfg.InitiatorName,
-		"SecurityCredential":       cfg.SecurityCredential,
+		"SecurityCredential":       secCred,
 		"CommandID":                "TransactionStatusQuery",
 		"TransactionID":            params.TransactionID,
 		"OriginatorConversationID": ref,
@@ -953,9 +1003,13 @@ func (e *Engine) getMpesaDarajaBalances(ctx context.Context) ([]RailBalance, err
 	if cfg == nil {
 		return nil, fmt.Errorf("mpesa daraja is not configured")
 	}
+	secCred, err := e.mpesaSecurityCredential()
+	if err != nil {
+		return nil, err
+	}
 	respBytes, err := e.mpesaPost(ctx, "/mpesa/accountbalance/v1/query", map[string]interface{}{
 		"Initiator":          cfg.InitiatorName,
-		"SecurityCredential": cfg.SecurityCredential,
+		"SecurityCredential": secCred,
 		"CommandID":          "AccountBalance",
 		"PartyA":             cfg.ShortCode,
 		"IdentifierType":     "4",
@@ -997,7 +1051,8 @@ func (e *Engine) verifyMpesaDarajaWebhook(rawBody []byte, signature string) (*We
 	}
 
 	var wrapper struct {
-		Result struct {
+		QueueTimeout interface{} `json:"QueueTimeout"`
+		Result       struct {
 			ResultCode               int    `json:"ResultCode"`
 			ResultDesc               string `json:"ResultDesc"`
 			OriginatorConversationID string `json:"OriginatorConversationID"`
@@ -1016,20 +1071,40 @@ func (e *Engine) verifyMpesaDarajaWebhook(rawBody []byte, signature string) (*We
 	}
 
 	res := wrapper.Result
+	lowerDesc := strings.ToLower(res.ResultDesc)
+	isQueueTimeout := wrapper.QueueTimeout != nil ||
+		res.ResultCode == 1037 ||
+		strings.Contains(lowerDesc, "queue timeout") ||
+		strings.Contains(lowerDesc, "timed out")
+
 	status := string(StatusFailed)
 	eventType := "b2c.result.failed"
-	if res.ResultCode == 0 {
+	providerStatus := strconv.Itoa(res.ResultCode)
+	if isQueueTimeout {
+		eventType = "b2c.result.timeout"
+		providerStatus = "QUEUE_TIMEOUT"
+	} else if res.ResultCode == 0 {
 		status = string(StatusSuccessful)
 		eventType = "b2c.result.success"
 	}
+
 	amount := 0.0
+	fee := 0.0
 	for _, p := range res.ResultParameters.ResultParameter {
-		if p.Key == "TransactionAmount" {
+		switch p.Key {
+		case "TransactionAmount":
 			switch v := p.Value.(type) {
 			case float64:
 				amount = v
 			case string:
 				amount, _ = strconv.ParseFloat(v, 64)
+			}
+		case "TransactionCharge":
+			switch v := p.Value.(type) {
+			case float64:
+				fee = v
+			case string:
+				fee, _ = strconv.ParseFloat(v, 64)
 			}
 		}
 	}
@@ -1044,7 +1119,13 @@ func (e *Engine) verifyMpesaDarajaWebhook(rawBody []byte, signature string) (*We
 	}
 	errMsg := ""
 	if status == string(StatusFailed) {
-		errMsg = res.ResultDesc
+		if res.ResultDesc != "" {
+			errMsg = res.ResultDesc
+		} else if isQueueTimeout {
+			errMsg = "mpesa b2c queue timeout"
+		} else {
+			errMsg = "mpesa b2c payout failed"
+		}
 	}
 
 	return &WebhookEvent{
@@ -1053,9 +1134,10 @@ func (e *Engine) verifyMpesaDarajaWebhook(rawBody []byte, signature string) (*We
 		TransactionID:  txID,
 		Reference:      ref,
 		Status:         status,
-		ProviderStatus: strconv.Itoa(res.ResultCode),
+		ProviderStatus: providerStatus,
 		Amount:         amount,
 		Currency:       "KES",
+		Fee:            fee,
 		Error:          errMsg,
 	}, nil
 }

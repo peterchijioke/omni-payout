@@ -72,7 +72,9 @@ const payoutEngine = new OmniPayoutEngine({
     consumerSecret: process.env.MPESA_CONSUMER_SECRET!,
     shortCode: process.env.MPESA_SHORT_CODE!,
     initiatorName: process.env.MPESA_INITIATOR!,
-    securityCredential: process.env.MPESA_SECURITY_CREDENTIAL!,
+    // Pass pre-encrypted securityCredential OR plaintext initiatorPassword + certificatePem:
+    initiatorPassword: process.env.MPESA_INITIATOR_PASSWORD,
+    certificatePem: process.env.MPESA_CERT_PEM,
     resultUrl: 'https://api.example.com/webhooks/mpesa/result',
     queueTimeoutUrl: 'https://api.example.com/webhooks/mpesa/timeout',
   },
@@ -197,16 +199,25 @@ const event = payoutEngine.verifyWebhook(
 if (event.status === 'SUCCESSFUL') {
   // Mark payout settled using event.reference
 }
+
+// Or verify signature + cross-check authoritative state & amount against the provider API:
+const confirmed = await payoutEngine.verifyAndConfirmWebhook(
+  'PAYSTACK',
+  rawBody,
+  req.headers['x-paystack-signature'] as string,
+  { currentStatus: 'PENDING' } // blocks out-of-order regressions (e.g. SUCCESSFUL -> PENDING)
+);
 ```
 
 ---
 
-### 6. `resolveBankAccount(bankCode, accountNumber, rail?)`
-Verifies an African bank account number and retrieves the account holder's legal name via Flutterwave or Paystack before sending money.
+### 6. `resolveBankAccount(bankCode, accountNumber, rail?, currency?)` & `matchAccountNames(...)`
+Verifies an African bank account number (with automatic Flutterwave ↔ Paystack failover when `rail` is omitted) and compares the resolved legal name against the expected beneficiary name.
 
 ```typescript
 const account = await payoutEngine.resolveBankAccount('058', '0123456789');
-console.log(account.accountName);
+const nameCheck = payoutEngine.matchAccountNames('Mr. Peter Chukwu', account.accountName);
+console.log(nameCheck.matched, nameCheck.score); // true, 0.9167
 ```
 
 ---

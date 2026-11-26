@@ -100,8 +100,16 @@ export interface WebhookEvent {
   providerStatus?: string;
   amount: number;
   currency: string;
+  fee?: number;
   error?: string;
   rawPayload?: any;
+}
+
+export interface NameMatchResult {
+  matched: boolean;
+  score: number;
+  normalizedExpected: string;
+  normalizedActual: string;
 }
 
 export interface BankResolutionResult {
@@ -156,7 +164,10 @@ export interface OmniPayoutConfig {
     consumerSecret: string;
     shortCode: string;
     initiatorName: string;
-    securityCredential: string;
+    /** Pre-encrypted Base64 credential, OR omit and provide initiatorPassword + certificatePem. */
+    securityCredential?: string;
+    initiatorPassword?: string;
+    certificatePem?: string;
     resultUrl: string;
     queueTimeoutUrl: string;
     baseUrl?: string;

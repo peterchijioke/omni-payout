@@ -8,16 +8,21 @@ import { RailHealthTracker } from './health';
 import {
   PayoutAmbiguousError,
   PayoutProviderError,
+  canTransitionStatus,
+  matchAccountNames,
+  resolveProviderCode,
   validateDisburseInputs,
 } from './utils';
 import {
   BankResolutionResult,
   DisburseParams,
   DisburseResult,
+  NameMatchResult,
   OnboardingLinkParams,
   OnboardingLinkResult,
   OmniPayoutConfig,
   PayoutRail,
+  PayoutStatus,
   PayoutStatusParams,
   RailBalance,
   RailHealth,
@@ -415,24 +420,140 @@ export class OmniPayoutEngine {
   }
 
   /**
-   * Resolves a Nigerian / African bank account name using Flutterwave or Paystack.
+   * Verifies a webhook signature, guards against out-of-order status regressions,
+   * and confirms the authoritative payout state & amount directly against the provider API.
+   */
+  async verifyAndConfirmWebhook(
+    rail: PayoutRail,
+    rawBody: string,
+    signature: string,
+    options?: { stripeAccountId?: string; currentStatus?: PayoutStatus }
+  ): Promise<WebhookEvent> {
+    const event = this.verifyWebhook(rail, rawBody, signature);
+    const isReversal = /reversed/i.test(event.eventType);
+
+    if (
+      options?.currentStatus &&
+      !canTransitionStatus(options.currentStatus, event.status, isReversal)
+    ) {
+      return {
+        ...event,
+        status: options.currentStatus,
+      };
+    }
+
+    const confirmed = await this.getPayoutStatus({
+      transactionId: event.transactionId || event.reference,
+      reference: event.reference || undefined,
+      rail,
+      stripeAccountId: options?.stripeAccountId,
+    });
+
+    if (event.amount > 0 && confirmed.amount > 0 && Math.abs(event.amount - confirmed.amount) > 0.01) {
+      throw new Error(
+        `Webhook amount mismatch on ${rail}: webhook reported ${event.amount}, provider API reported ${confirmed.amount}`
+      );
+    }
+    if (event.currency && confirmed.currency && event.currency !== confirmed.currency) {
+      throw new Error(
+        `Webhook currency mismatch on ${rail}: webhook reported ${event.currency}, provider API reported ${confirmed.currency}`
+      );
+    }
+
+    const finalStatus =
+      options?.currentStatus &&
+      !canTransitionStatus(options.currentStatus, confirmed.status, isReversal)
+        ? options.currentStatus
+        : confirmed.status;
+
+    return {
+      ...event,
+      status: finalStatus,
+      providerStatus: confirmed.providerStatus || event.providerStatus,
+      amount: confirmed.amount || event.amount,
+      currency: confirmed.currency || event.currency,
+      fee: confirmed.fee ?? event.fee,
+      error: confirmed.error || event.error,
+    };
+  }
+
+  /**
+   * Compares an expected beneficiary name against a resolved bank account name,
+   * tolerating word-order differences and honorifics.
+   */
+  matchAccountNames(
+    expectedName: string,
+    resolvedName: string,
+    threshold = 0.66
+  ): NameMatchResult {
+    return matchAccountNames(expectedName, resolvedName, threshold);
+  }
+
+  /**
+   * Checks whether a payout status transition is valid (preventing out-of-order regressions).
+   */
+  canTransitionStatus(
+    currentStatus: PayoutStatus | undefined | null,
+    nextStatus: PayoutStatus,
+    allowReversal = false
+  ): boolean {
+    return canTransitionStatus(currentStatus, nextStatus, allowReversal);
+  }
+
+  /**
+   * Resolves an African bank account name using Flutterwave or Paystack,
+   * with automatic failover between configured providers when `rail` is omitted.
    */
   async resolveBankAccount(
     bankCode: string,
     accountNumber: string,
-    rail?: 'FLUTTERWAVE' | 'PAYSTACK'
+    rail?: 'FLUTTERWAVE' | 'PAYSTACK',
+    currency = 'NGN'
   ): Promise<BankResolutionResult> {
-    if (rail === 'PAYSTACK' || (!rail && !this.#flutterwave && this.#paystack)) {
+    if (rail === 'PAYSTACK') {
       if (!this.#paystack) {
         throw new Error('Paystack provider is not configured for bank resolution');
       }
-      return this.#paystack.resolveBankAccount(bankCode, accountNumber);
+      return this.#paystack.resolveBankAccount(
+        resolveProviderCode(bankCode, currency, 'PAYSTACK', false),
+        accountNumber
+      );
+    }
+    if (rail === 'FLUTTERWAVE') {
+      if (!this.#flutterwave) {
+        throw new Error('Flutterwave provider is not configured for bank resolution');
+      }
+      return this.#flutterwave.resolveBankAccount(
+        resolveProviderCode(bankCode, currency, 'FLUTTERWAVE', false),
+        accountNumber
+      );
     }
 
-    if (!this.#flutterwave) {
-      throw new Error('Flutterwave provider is not configured for bank resolution');
+    if (this.#flutterwave) {
+      try {
+        return await this.#flutterwave.resolveBankAccount(
+          resolveProviderCode(bankCode, currency, 'FLUTTERWAVE', false),
+          accountNumber
+        );
+      } catch (err) {
+        if (this.#paystack) {
+          return this.#paystack.resolveBankAccount(
+            resolveProviderCode(bankCode, currency, 'PAYSTACK', false),
+            accountNumber
+          );
+        }
+        throw err;
+      }
     }
-    return this.#flutterwave.resolveBankAccount(bankCode, accountNumber);
+
+    if (this.#paystack) {
+      return this.#paystack.resolveBankAccount(
+        resolveProviderCode(bankCode, currency, 'PAYSTACK', false),
+        accountNumber
+      );
+    }
+
+    throw new Error('Neither Flutterwave nor Paystack is configured for bank resolution');
   }
 
   /**
