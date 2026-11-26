@@ -60,18 +60,25 @@ Every method is available in both **TypeScript** (`camelCase`) and **Go** (`Pasc
 
 | Function (TS / Go) | What it does |
 | :--- | :--- |
-| `resolveRail(params)` / `ResolveRail(params)` | Selects the primary payout rail based on explicit `rail`, `stripeAccountId`, `mobileMoneyDetails`, `bankDetails`, or destination `currency`. |
-| `disburse(params)` / `Disburse(params)` | Executes a payout. Supports `fallbackRails`, `checkBalanceBeforeDisburse`, and automatic circuit-breaker skipping. Returns normalized `DisburseResult` with `status` (`PENDING`, `SUCCESSFUL`, `FAILED`), `providerStatus`, `reference`, `attemptedRails`, and `failoverFrom`. |
+| `resolveRoute(params)` / `ResolveRoute(params)` | Evaluates `routingRules` (country, currency, min/max limits, lowest provider fees) and returns the ordered candidate rail chain `[primary, ...fallbacks]`. |
+| `resolveRail(params)` / `ResolveRail(params)` | Returns the primary payout rail selected by `resolveRoute(params)`. |
+| `disburse(params)` / `Disburse(params)` / `DisburseContext(ctx, params)` | Executes a payout with concurrent singleflight deduplication, optional `IdempotencyStore`, `railLimits`, `HALF_OPEN` circuit breakers, retry backoff, float checks, and timeout-safe failover. |
 | `getPayoutStatus(params)` / `GetPayoutStatus(params)` | Queries the provider for the latest settlement status of a `PENDING` payout by `transactionId` (and optional `reference` / `stripeAccountId`). |
-| `getBalances(rail?)` / `GetBalances(rail)` | Returns available and pending float balances (`RailBalance[]`) for a specific rail, or across **all configured rails** when omitted/`""`. |
-| `getRailHealth(rail?)` / `GetRailHealth(rail)` | Returns live uptime/latency telemetry and circuit-breaker state (`healthy`, `circuitOpen`, `consecutiveFailures`, `avgLatencyMs`, `lastError`) for one or all rails. |
-| `verifyWebhook(rail, rawBody, signature)` / `VerifyWebhook(rail, rawBody, signature)` | Verifies the provider's webhook signature using constant-time comparison and normalizes the payload (including `fee` and M-Pesa `QUEUE_TIMEOUT`) into a unified `WebhookEvent`. |
+| `waitForSettlement(params, opts?)` / `WaitForSettlement(ctx, params, opts)` | Polls `getPayoutStatus` with exponential backoff until the payout reaches `SUCCESSFUL` or `FAILED`, or throws `RECONCILIATION_TIMEOUT`. |
+| `getBalances(rail?)` / `GetBalances(rail)` | Returns available and pending float balances (`RailBalance[]`) for a specific rail, or concurrently across **all configured rails** (with optional `balanceCacheTtlMs` / `invalidateBalanceCache`). |
+| `getRailHealth(rail?)` / `GetRailHealth(rail)` | Returns live uptime/latency telemetry and circuit-breaker state (`CLOSED`, `OPEN`, `HALF_OPEN`, `consecutiveFailures`, `avgLatencyMs`, `lastError`). |
+| `verifyWebhook(rail, rawBody, signature)` / `VerifyWebhook(...)` | Verifies the provider's webhook signature using constant-time comparison, flags/rejects duplicates via optional `WebhookStore`, and normalizes `fee` & M-Pesa `QUEUE_TIMEOUT`. *(TS also provides `verifyWebhookAsync` for async stores.)* |
 | `verifyAndConfirmWebhook(...)` / `VerifyAndConfirmWebhook(...)` | Verifies the webhook signature, blocks out-of-order status regressions (`canTransitionStatus`), and cross-checks the authoritative status & amount directly against the provider API. |
-| `resolveBankAccount(bankCode, accountNumber, rail?)` / `ResolveBankAccount(bankCode, accountNumber)` | Resolves and verifies an African bank account holder's legal name with automatic Flutterwave ↔ Paystack failover. |
+| `resolveBankAccount(bankCode, accountNumber, rail?)` / `ResolveBankAccount(...)` | Resolves and verifies an African bank account holder's legal name with automatic Flutterwave ↔ Paystack failover. |
 | `matchAccountNames(expected, resolved, threshold?)` / `MatchAccountNames(...)` | Compares expected vs. resolved legal names, tolerating word-order differences (`"Peter Chukwu"` vs `"CHUKWU CHIJIOKE PETER"`) and honorifics. |
 | `normalizeMsisdn(phone, currency?)` / `NormalizeMSISDN(phone, currency)` | Normalizes `+254 712-345-678` / `0712345678` phone numbers into bare E.164 MSISDN digits (`254712345678`) automatically across all mobile money rails. |
 | `encryptMpesaInitiatorPassword(pass, certPem)` / `EncryptMpesaInitiatorPassword(...)` | Encrypts plaintext Safaricom Daraja initiator passwords with X.509 / RSA PKCS#1 v1.5 padding automatically when `initiatorPassword` + `certificatePem` are supplied. |
-| `createConnectOnboardingLink(params)` *(TypeScript)* | Generates a hosted Stripe Connect Express onboarding URL for US/EU payees. |
+| `createConnectOnboardingLink(params)` / `CreateConnectOnboardingLink(params)` | Generates a hosted Stripe Connect Express onboarding URL for US/EU payees (full parity in both TS and Go). |
+
+### Normalized Error Codes (`PayoutErrorCode` / `ErrorCode`)
+All 6 providers map into consistent, actionable codes on `PayoutProviderError` / `ProviderError` (alongside `retryable: boolean` and `isAmbiguous: boolean`):
+
+`VALIDATION_ERROR` · `IDEMPOTENCY_CONFLICT` · `AUTH_FAILED` · `INVALID_ACCOUNT` · `INSUFFICIENT_FLOAT` · `LIMIT_EXCEEDED` · `RATE_LIMITED` · `PROVIDER_DOWN` · `AMBIGUOUS_TIMEOUT` · `DUPLICATE_REFERENCE` · `DUPLICATE_WEBHOOK` · `WEBHOOK_SIGNATURE_INVALID` · `RECONCILIATION_TIMEOUT` · `PROVIDER_ERROR`
 
 ---
 
@@ -134,17 +141,25 @@ func main() {
 	}
 	fmt.Printf("Status: %s via %s (FailoverFrom: %s, Ref: %s)\n", res.Status, res.Rail, res.FailoverFrom, res.Reference)
 
-	// 2. Check settlement status when a payout is accepted but not yet received
+	// 2. Poll until settled (exponential backoff reconciliation)
 	if res.Status == string(omnipayout.StatusPending) {
-		latest, _ := engine.GetPayoutStatus(omnipayout.PayoutStatusParams{
+		settled, err := engine.WaitForSettlement(ctx, omnipayout.PayoutStatusParams{
 			TransactionID: res.TransactionID,
 			Reference:     res.Reference,
 			Rail:          res.Rail,
+		}, &omnipayout.ReconcileOptions{
+			Interval:          2 * time.Second,
+			MaxAttempts:       10,
+			BackoffMultiplier: 1.5,
 		})
-		fmt.Printf("Latest: %s (%s)\n", latest.Status, latest.ProviderStatus)
+		if err != nil {
+			log.Printf("Still pending or error: %v", err)
+		} else {
+			fmt.Printf("Settled: %s (%s)\n", settled.Status, settled.ProviderStatus)
+		}
 	}
 
-	// 3. Inspect float balances and circuit-breaker health across all rails
+	// 3. Inspect float balances and circuit-breaker health (CLOSED / OPEN / HALF_OPEN)
 	balances, _ := engine.GetBalances("")
 	health := engine.GetRailHealth("")
 	fmt.Printf("Balances: %+v\nHealth: %+v\n", balances, health)
@@ -187,23 +202,70 @@ const payout = await payoutEngine.disburse({
   bankDetails: { bankCode: '058', accountNumber: '0123456789' },
 });
 
-// 2. Poll settlement status if accepted but not yet received
+// 2. Poll until settled with exponential backoff
 if (payout.status === 'PENDING') {
-  const latest = await payoutEngine.getPayoutStatus({
-    transactionId: payout.transactionId,
-    reference: payout.reference,
-    rail: payout.rail,
-  });
-  console.log(latest.status, latest.providerStatus);
+  const settled = await payoutEngine.waitForSettlement(
+    { transactionId: payout.transactionId, reference: payout.reference, rail: payout.rail },
+    { intervalMs: 2000, maxAttempts: 10, backoffMultiplier: 1.5 }
+  );
+  console.log(settled.status, settled.providerStatus);
 }
 
-// 3. Query float balances & live rail health
+// 3. Query float balances & live rail health (CLOSED / OPEN / HALF_OPEN)
 const balances = await payoutEngine.getBalances();
 const health = payoutEngine.getRailHealth();
 
-// 4. Verify & normalize incoming provider webhooks
-const event = payoutEngine.verifyWebhook('PAYSTACK', rawBody, signatureHeader);
-console.log(event.reference, event.status);
+// 4. Verify & confirm incoming provider webhooks against the provider API
+const event = await payoutEngine.verifyAndConfirmWebhook('PAYSTACK', rawBody, signatureHeader);
+console.log(event.reference, event.status, event.fee);
+```
+
+---
+
+## Pluggable Persistence, Smart Routing & Observability
+
+`omni-payout` is **stateless by default** with zero dependencies. Plug in your own Redis/Postgres stores, routing rules, retry policies, and monitoring hooks only when needed:
+
+```typescript
+import {
+  OmniPayoutEngine,
+  InMemoryIdempotencyStore,
+  InMemoryWebhookStore,
+} from '@peterchijioke/omni-payout';
+
+const engine = new OmniPayoutEngine({
+  timeoutMs: 30_000,
+  balanceCacheTtlMs: 10_000, // avoid redundant GET /balance calls during bursts
+  flutterwave: { secretKey: process.env.FLW_SECRET_KEY!, timeoutMs: 15_000 },
+  paystack: { secretKey: process.env.PAYSTACK_SECRET_KEY!, timeoutMs: 10_000 },
+
+  // Plug in Redis/Postgres implementing IdempotencyStore / WebhookStore (or built-in in-memory helpers)
+  idempotencyStore: new InMemoryIdempotencyStore(),
+  webhookStore: new InMemoryWebhookStore(),
+  webhookDeduplication: { ttlMs: 86_400_000, rejectDuplicates: false },
+
+  // Exponential backoff + full jitter for retryable 429 / 503 errors
+  retry: { maxRetries: 3, baseDelayMs: 250, maxDelayMs: 5_000, jitter: true },
+
+  // Route by country, currency, limits, and lowest provider fee
+  routingRules: [
+    {
+      currencies: ['NGN'],
+      countries: ['NG'],
+      rails: ['FLUTTERWAVE', 'PAYSTACK'],
+      fees: {
+        FLUTTERWAVE: { flat: 50, percent: 0.5 },
+        PAYSTACK: { flat: 10, percent: 0.1 }, // automatically prioritized first
+      },
+    },
+  ],
+  railLimits: {
+    PAYSTACK: { minAmount: 100, maxAmount: 10_000_000 },
+  },
+
+  // Wire into OpenTelemetry, Prometheus, Datadog, or structured logs
+  onTelemetry: (ev) => console.log('[omni-payout]', ev.type, ev.rail, ev.errorCode ?? ''),
+});
 ```
 
 ---

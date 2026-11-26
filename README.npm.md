@@ -79,12 +79,35 @@ const payoutEngine = new OmniPayoutEngine({
     resultUrl: 'https://api.example.com/webhooks/mpesa/result',
     queueTimeoutUrl: 'https://api.example.com/webhooks/mpesa/timeout',
   },
-  // Optional circuit-breaker thresholds per rail
+  // Optional circuit-breaker thresholds per rail (CLOSED -> OPEN -> HALF_OPEN)
   health: {
     failureThreshold: 3, // open circuit after 3 consecutive failures
-    cooldownMs: 30_000,  // skip unhealthy rail for 30s
+    cooldownMs: 30_000,  // transition to HALF_OPEN probe after 30s
     maxLatencyMs: 10_000,
   },
+  // Optional retry policy (exponential backoff + full jitter for retryable 429 / 503 errors)
+  retry: { maxRetries: 3, baseDelayMs: 250, maxDelayMs: 5_000, jitter: true },
+  // Optional short-TTL balance cache to minimize GET /balance calls under high throughput
+  balanceCacheTtlMs: 10_000,
+  // Optional smart routing rules (country, currency, min/max limits, lowest provider fees)
+  routingRules: [
+    {
+      currencies: ['NGN'],
+      countries: ['NG'],
+      rails: ['FLUTTERWAVE', 'PAYSTACK'],
+      fees: {
+        FLUTTERWAVE: { flat: 50, percent: 0.5 },
+        PAYSTACK: { flat: 10, percent: 0.1 },
+      },
+    },
+  ],
+  railLimits: {
+    PAYSTACK: { minAmount: 100, maxAmount: 10_000_000 },
+  },
+  // Optional storage-agnostic persistence & monitoring hooks (plug in Redis, Postgres, OpenTelemetry)
+  // idempotencyStore: myRedisIdempotencyStore,
+  // webhookStore: myRedisWebhookStore,
+  // onTelemetry: (event) => metrics.record(event),
 });
 ```
 
@@ -143,8 +166,8 @@ const usPayout = await payoutEngine.disburse({
 
 ---
 
-### 2. `getPayoutStatus(params)`
-Fetches the latest settlement status of a previously initiated payout (useful when `disburse()` returned `status: 'PENDING'`).
+### 2. `getPayoutStatus(params)` & `waitForSettlement(params, options?)`
+Fetches the latest settlement status of a previously initiated payout, or automatically polls with exponential backoff until `SUCCESSFUL` or `FAILED`.
 
 ```typescript
 const latest = await payoutEngine.getPayoutStatus({
@@ -153,29 +176,36 @@ const latest = await payoutEngine.getPayoutStatus({
   rail: payout.rail,
   // stripeAccountId: 'acct_1N23456789', // required for Stripe instant payouts (po_...)
 });
-console.log(latest.reference, latest.status, latest.providerStatus);
+
+// Automated polling until terminal state (throws RECONCILIATION_TIMEOUT if still pending)
+const settled = await payoutEngine.waitForSettlement(
+  { transactionId: payout.transactionId, reference: payout.reference, rail: payout.rail },
+  { intervalMs: 2_000, maxAttempts: 10, backoffMultiplier: 1.5, maxIntervalMs: 15_000 }
+);
+console.log(settled.reference, settled.status, settled.providerStatus);
 ```
 
 ---
 
-### 3. `getBalances(rail?)`
-Returns available and pending float balances across **all configured rails**, or for a single specified rail.
+### 3. `getBalances(rail?)` & `invalidateBalanceCache(rail?)`
+Returns available and pending float balances across **all configured rails**, or for a single specified rail. When `balanceCacheTtlMs` is set, repeated float checks are served from cache until TTL expires or `invalidateBalanceCache()` is called.
 
 ```typescript
 const allBalances = await payoutEngine.getBalances();
 // [{ rail: 'STRIPE_CONNECT', currency: 'USD', available: 2500, pending: 500 }, ...]
 
 const flwBalances = await payoutEngine.getBalances('FLUTTERWAVE');
+payoutEngine.invalidateBalanceCache('FLUTTERWAVE');
 ```
 
 ---
 
 ### 4. `getRailHealth(rail?)`
-Inspects live uptime, latency, and circuit-breaker state for one or all configured rails. When a rail's circuit is open (`circuitOpen: true`), `disburse()` automatically skips it if a `fallbackRails` option is provided.
+Inspects live uptime, latency, and circuit-breaker state (`'CLOSED' | 'OPEN' | 'HALF_OPEN'`) for one or all configured rails. When a rail's circuit is `'OPEN'`, `disburse()` proactively skips it if a fallback rail exists; after `cooldownMs`, it enters `'HALF_OPEN'` and allows a single recovery probe.
 
 ```typescript
 const health = payoutEngine.getRailHealth();
-// [{ rail: 'FLUTTERWAVE', healthy: false, circuitOpen: true, consecutiveFailures: 3, avgLatencyMs: 8420, ... }]
+// [{ rail: 'FLUTTERWAVE', state: 'OPEN', healthy: false, circuitOpen: true, consecutiveFailures: 3, avgLatencyMs: 8420 }]
 ```
 
 ---
@@ -237,17 +267,37 @@ console.log(link.url);
 
 ---
 
-### 8. `resolveRail(params)`
-Returns the primary `PayoutRail` that `disburse()` would select for a given request without executing a payout.
+### 8. `resolveRoute(params)` & `resolveRail(params)`
+Evaluates configured `routingRules` (by country, currency, amount limits, and lowest fees) without executing a payout.
 
 ```typescript
-const rail = payoutEngine.resolveRail({
-  amount: 2500,
-  currency: 'KES',
+const route = payoutEngine.resolveRoute({
+  amount: 25000,
+  currency: 'NGN',
+  country: 'NG',
   reference: 'REF-1',
-  mobileMoneyDetails: { phone: '254712345678', network: 'MPESA' },
+  bankDetails: { bankCode: '058', accountNumber: '0123456789' },
 });
+// ['PAYSTACK', 'FLUTTERWAVE']
 ```
+
+---
+
+### 9. Normalized Error Codes (`PayoutProviderError`)
+All provider errors are normalized into `PayoutProviderError` with `.code`, `.retryable`, `.isAmbiguous`, and `.rail`:
+
+| Code | Meaning |
+| :--- | :--- |
+| `INSUFFICIENT_FLOAT` | Partner wallet balance is below the payout amount |
+| `INVALID_ACCOUNT` | Destination bank account, recipient, or MSISDN is invalid |
+| `IDEMPOTENCY_CONFLICT` | Same `reference` reused concurrently or with different amount/currency |
+| `AMBIGUOUS_TIMEOUT` | Post-dispatch timeout/`502`/`504`; failover halted to prevent double payout |
+| `LIMIT_EXCEEDED` | Amount falls outside `railLimits` or provider min/max bounds |
+| `RATE_LIMITED` | HTTP `429` (`retryable: true`) |
+| `PROVIDER_DOWN` | HTTP `503`/circuit open (`retryable: true`) |
+| `AUTH_FAILED` | Invalid API key, token, or signature credentials |
+| `DUPLICATE_WEBHOOK` | Duplicate webhook rejected when `webhookDeduplication.rejectDuplicates` is true |
+| `RECONCILIATION_TIMEOUT` | `waitForSettlement()` exhausted `maxAttempts` while payout remained `PENDING` |
 
 ---
 
