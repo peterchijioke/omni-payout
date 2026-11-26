@@ -1,4 +1,5 @@
 // src/adapters/stripe.adapter.ts
+import crypto from "crypto";
 function normalizeStripeStatus(rawStatus, defaultStatus) {
   if (!rawStatus) return defaultStatus;
   switch (rawStatus.toLowerCase()) {
@@ -15,11 +16,13 @@ function normalizeStripeStatus(rawStatus, defaultStatus) {
   }
 }
 var StripeConnectAdapter = class {
-  constructor(secretKey) {
+  constructor(secretKey, webhookSecret) {
     this.secretKey = secretKey;
+    this.webhookSecret = webhookSecret;
     if (!secretKey) throw new Error("Stripe secret key is required");
   }
   secretKey;
+  webhookSecret;
   async request(endpoint, options = {}) {
     const url = `https://api.stripe.com/v1${endpoint}`;
     const headers = {
@@ -134,9 +137,72 @@ var StripeConnectAdapter = class {
       expiresAt: data.expires_at ? new Date(data.expires_at * 1e3) : void 0
     };
   }
+  async getBalances() {
+    const data = await this.request("/balance", { method: "GET" });
+    const byCurrency = /* @__PURE__ */ new Map();
+    for (const entry of data.available || []) {
+      const currency = String(entry.currency || "").toUpperCase();
+      byCurrency.set(currency, {
+        rail: "STRIPE_CONNECT",
+        currency,
+        available: typeof entry.amount === "number" ? entry.amount / 100 : 0,
+        pending: 0
+      });
+    }
+    for (const entry of data.pending || []) {
+      const currency = String(entry.currency || "").toUpperCase();
+      const existing = byCurrency.get(currency) || {
+        rail: "STRIPE_CONNECT",
+        currency,
+        available: 0,
+        pending: 0
+      };
+      existing.pending = typeof entry.amount === "number" ? entry.amount / 100 : 0;
+      byCurrency.set(currency, existing);
+    }
+    return Array.from(byCurrency.values());
+  }
+  verifyWebhook(rawBody, signatureHeader) {
+    if (!this.webhookSecret) {
+      throw new Error("Stripe webhookSecret is required to verify webhooks");
+    }
+    const parts = Object.fromEntries(
+      (signatureHeader || "").split(",").map((part) => part.trim().split("=")).filter((pair) => pair.length === 2)
+    );
+    const timestamp = parts.t;
+    const signature = parts.v1;
+    if (!timestamp || !signature) {
+      throw new Error("Invalid Stripe-Signature header format");
+    }
+    const signedPayload = `${timestamp}.${rawBody}`;
+    const expected = crypto.createHmac("sha256", this.webhookSecret).update(signedPayload).digest("hex");
+    const sigBuf = Buffer.from(signature, "utf8");
+    const expBuf = Buffer.from(expected, "utf8");
+    if (sigBuf.length !== expBuf.length || !crypto.timingSafeEqual(sigBuf, expBuf)) {
+      throw new Error("Invalid Stripe webhook signature");
+    }
+    const payload = JSON.parse(rawBody);
+    const eventType = String(payload.type || "");
+    const obj = payload.data?.object || {};
+    const defaultStatus = eventType === "payout.paid" ? "SUCCESSFUL" : eventType === "payout.failed" || eventType === "payout.canceled" ? "FAILED" : "PENDING";
+    const status = normalizeStripeStatus(obj.status, defaultStatus);
+    return {
+      rail: "STRIPE_CONNECT",
+      eventType,
+      transactionId: String(obj.id || ""),
+      reference: String(obj.metadata?.reference || obj.id || ""),
+      status,
+      providerStatus: obj.status,
+      amount: typeof obj.amount === "number" ? obj.amount / 100 : 0,
+      currency: String(obj.currency || "").toUpperCase(),
+      error: status === "FAILED" ? obj.failure_message || "Stripe payout failed" : void 0,
+      rawPayload: payload
+    };
+  }
 };
 
 // src/adapters/flutterwave.adapter.ts
+import crypto2 from "crypto";
 function normalizeFlutterwaveStatus(rawStatus) {
   if (!rawStatus) return "PENDING";
   switch (rawStatus.toUpperCase()) {
@@ -153,11 +219,13 @@ function normalizeFlutterwaveStatus(rawStatus) {
   }
 }
 var FlutterwaveAdapter = class {
-  constructor(secretKey) {
+  constructor(secretKey, webhookSecret) {
     this.secretKey = secretKey;
+    this.webhookSecret = webhookSecret;
     if (!secretKey) throw new Error("Flutterwave secret key is required");
   }
   secretKey;
+  webhookSecret;
   async request(endpoint, options = {}) {
     const url = `https://api.flutterwave.com/v3${endpoint}`;
     const headers = {
@@ -252,6 +320,204 @@ var FlutterwaveAdapter = class {
       rawResponse: res
     };
   }
+  async getBalances() {
+    const res = await this.request("/balances", { method: "GET" });
+    const rows = Array.isArray(res.data) ? res.data : [];
+    return rows.map((row) => ({
+      rail: "FLUTTERWAVE",
+      currency: String(row.currency || "").toUpperCase(),
+      available: Number(row.available_balance || 0),
+      pending: row.ledger_balance !== void 0 ? Number(row.ledger_balance) - Number(row.available_balance || 0) : void 0
+    }));
+  }
+  verifyWebhook(rawBody, verifHash) {
+    if (!this.webhookSecret) {
+      throw new Error("Flutterwave webhookSecret is required to verify webhooks");
+    }
+    const sigBuf = Buffer.from(verifHash || "", "utf8");
+    const expBuf = Buffer.from(this.webhookSecret, "utf8");
+    if (sigBuf.length !== expBuf.length || !crypto2.timingSafeEqual(sigBuf, expBuf)) {
+      throw new Error("Invalid Flutterwave webhook signature");
+    }
+    const payload = JSON.parse(rawBody);
+    const eventType = String(payload.event || "");
+    const data = payload.data || {};
+    const status = normalizeFlutterwaveStatus(data.status);
+    return {
+      rail: "FLUTTERWAVE",
+      eventType,
+      transactionId: String(data.id || ""),
+      reference: String(data.reference || ""),
+      status,
+      providerStatus: data.status,
+      amount: data.amount ? Number(data.amount) : 0,
+      currency: String(data.currency || "").toUpperCase(),
+      error: status === "FAILED" ? data.complete_message || "Flutterwave transfer failed" : void 0,
+      rawPayload: payload
+    };
+  }
+};
+
+// src/adapters/paystack.adapter.ts
+import crypto3 from "crypto";
+function normalizePaystackStatus(rawStatus) {
+  if (!rawStatus) return "PENDING";
+  switch (rawStatus.toLowerCase()) {
+    case "success":
+    case "successful":
+      return "SUCCESSFUL";
+    case "failed":
+    case "reversed":
+    case "abandoned":
+      return "FAILED";
+    default:
+      return "PENDING";
+  }
+}
+var PaystackAdapter = class {
+  constructor(secretKey, webhookSecret) {
+    this.secretKey = secretKey;
+    this.webhookSecret = webhookSecret;
+    if (!secretKey) throw new Error("Paystack secret key is required");
+  }
+  secretKey;
+  webhookSecret;
+  async request(endpoint, options = {}) {
+    const url = `https://api.paystack.co${endpoint}`;
+    const headers = {
+      Authorization: `Bearer ${this.secretKey}`,
+      ...options.headers
+    };
+    if (options.method && options.method.toUpperCase() !== "GET" && !headers["Content-Type"]) {
+      headers["Content-Type"] = "application/json";
+    }
+    const res = await fetch(url, { ...options, headers });
+    const data = await res.json();
+    if (!res.ok || data?.status === false) {
+      throw new Error(data?.message || `Paystack request failed with status ${res.status}`);
+    }
+    return data;
+  }
+  async resolveBankAccount(bankCode, accountNumber) {
+    const query = new URLSearchParams({
+      account_number: accountNumber,
+      bank_code: bankCode
+    });
+    const res = await this.request(`/bank/resolve?${query.toString()}`, {
+      method: "GET"
+    });
+    return {
+      accountName: res.data?.account_name || "",
+      accountNumber: res.data?.account_number || accountNumber,
+      bankCode
+    };
+  }
+  async disburse(params) {
+    if (!params.bankDetails && !params.mobileMoneyDetails) {
+      throw new Error("Either bankDetails or mobileMoneyDetails must be provided for Paystack disbursements");
+    }
+    const currency = params.currency.toUpperCase();
+    const amountInSubunit = Math.round(params.amount * 100);
+    const recipientPayload = params.bankDetails ? {
+      type: currency === "GHS" ? "ghipss" : currency === "ZAR" ? "basa" : "nuban",
+      name: params.bankDetails.accountName || params.bankDetails.accountNumber,
+      account_number: params.bankDetails.accountNumber,
+      bank_code: params.bankDetails.bankCode,
+      currency
+    } : {
+      type: "mobile_money",
+      name: params.mobileMoneyDetails.phone,
+      account_number: params.mobileMoneyDetails.phone,
+      bank_code: params.mobileMoneyDetails.network.toUpperCase(),
+      currency
+    };
+    const recipientRes = await this.request("/transferrecipient", {
+      method: "POST",
+      body: JSON.stringify(recipientPayload)
+    });
+    const recipientCode = recipientRes.data?.recipient_code;
+    if (!recipientCode) {
+      throw new Error("Paystack failed to return a transfer recipient_code");
+    }
+    const transferRes = await this.request("/transfer", {
+      method: "POST",
+      body: JSON.stringify({
+        source: "balance",
+        amount: amountInSubunit,
+        recipient: recipientCode,
+        currency,
+        reference: params.reference,
+        reason: params.narration || "Marketplace disbursement"
+      })
+    });
+    const transferData = transferRes.data || {};
+    const status = normalizePaystackStatus(transferData.status);
+    return {
+      success: status !== "FAILED",
+      transactionId: String(transferData.transfer_code || transferData.id || params.reference),
+      reference: transferData.reference || params.reference,
+      status,
+      providerStatus: transferData.status,
+      rail: "PAYSTACK",
+      amount: params.amount,
+      currency,
+      error: status === "FAILED" ? transferData.failures || transferRes.message : void 0,
+      rawResponse: transferRes
+    };
+  }
+  async getPayoutStatus(transactionId, reference) {
+    const endpoint = reference ? `/transfer/verify/${encodeURIComponent(reference)}` : `/transfer/${encodeURIComponent(transactionId)}`;
+    const res = await this.request(endpoint, { method: "GET" });
+    const transferData = res.data || {};
+    const status = normalizePaystackStatus(transferData.status);
+    return {
+      success: status !== "FAILED",
+      transactionId: String(transferData.transfer_code || transferData.id || transactionId),
+      reference: transferData.reference || reference || transactionId,
+      status,
+      providerStatus: transferData.status,
+      rail: "PAYSTACK",
+      amount: typeof transferData.amount === "number" ? transferData.amount / 100 : 0,
+      currency: (transferData.currency || "").toUpperCase(),
+      error: status === "FAILED" ? transferData.failures || res.message : void 0,
+      rawResponse: res
+    };
+  }
+  async getBalances() {
+    const res = await this.request("/balance", { method: "GET" });
+    const rows = Array.isArray(res.data) ? res.data : [];
+    return rows.map((row) => ({
+      rail: "PAYSTACK",
+      currency: String(row.currency || "").toUpperCase(),
+      available: typeof row.balance === "number" ? row.balance / 100 : 0
+    }));
+  }
+  verifyWebhook(rawBody, signature) {
+    const secret = this.webhookSecret || this.secretKey;
+    const expected = crypto3.createHmac("sha512", secret).update(rawBody).digest("hex");
+    const sigBuf = Buffer.from(signature || "", "utf8");
+    const expBuf = Buffer.from(expected, "utf8");
+    if (sigBuf.length !== expBuf.length || !crypto3.timingSafeEqual(sigBuf, expBuf)) {
+      throw new Error("Invalid Paystack webhook signature");
+    }
+    const payload = JSON.parse(rawBody);
+    const eventType = String(payload.event || "");
+    const data = payload.data || {};
+    const rawStatus = data.status || (eventType === "transfer.success" ? "success" : eventType === "transfer.failed" || eventType === "transfer.reversed" ? "failed" : "pending");
+    const status = normalizePaystackStatus(rawStatus);
+    return {
+      rail: "PAYSTACK",
+      eventType,
+      transactionId: String(data.transfer_code || data.id || ""),
+      reference: String(data.reference || ""),
+      status,
+      providerStatus: rawStatus,
+      amount: typeof data.amount === "number" ? data.amount / 100 : 0,
+      currency: String(data.currency || "").toUpperCase(),
+      error: status === "FAILED" ? data.reason || data.failures || "Paystack transfer failed" : void 0,
+      rawPayload: payload
+    };
+  }
 };
 
 // src/engine.ts
@@ -259,35 +525,34 @@ var AFRICAN_CURRENCIES = /* @__PURE__ */ new Set(["NGN", "KES", "GHS", "UGX", "T
 var OmniPayoutEngine = class {
   stripe;
   flutterwave;
+  paystack;
   constructor(config) {
     if (config.stripe?.secretKey) {
-      this.stripe = new StripeConnectAdapter(config.stripe.secretKey);
+      this.stripe = new StripeConnectAdapter(config.stripe.secretKey, config.stripe.webhookSecret);
     }
     if (config.flutterwave?.secretKey) {
-      this.flutterwave = new FlutterwaveAdapter(config.flutterwave.secretKey);
+      this.flutterwave = new FlutterwaveAdapter(
+        config.flutterwave.secretKey,
+        config.flutterwave.webhookSecret
+      );
+    }
+    if (config.paystack?.secretKey) {
+      this.paystack = new PaystackAdapter(config.paystack.secretKey, config.paystack.webhookSecret);
     }
   }
   /**
-   * Automatically resolves the best payout rail based on explicit parameters or currency.
+   * Automatically resolves the best primary payout rail based on explicit parameters or currency.
    */
   resolveRail(params) {
     if (params.rail) return params.rail;
     if (params.stripeAccountId) return "STRIPE_CONNECT";
-    if (params.bankDetails || params.mobileMoneyDetails) return "FLUTTERWAVE";
-    if (AFRICAN_CURRENCIES.has(params.currency.toUpperCase())) return "FLUTTERWAVE";
+    if (params.bankDetails || params.mobileMoneyDetails || AFRICAN_CURRENCIES.has(params.currency.toUpperCase())) {
+      if (!this.flutterwave && this.paystack) return "PAYSTACK";
+      return "FLUTTERWAVE";
+    }
     return "STRIPE_CONNECT";
   }
-  /**
-   * Unified disbursement method across all international and domestic rails.
-   */
-  async disburse(params) {
-    if (params.amount <= 0) {
-      throw new Error("Disbursement amount must be greater than zero");
-    }
-    if (!params.reference) {
-      throw new Error("Unique reference is required for idempotent disbursement");
-    }
-    const rail = this.resolveRail(params);
+  async disburseOnRail(rail, params) {
     if (rail === "STRIPE_CONNECT") {
       if (!this.stripe) {
         throw new Error("Stripe Connect provider is not configured (missing secretKey)");
@@ -300,7 +565,88 @@ var OmniPayoutEngine = class {
       }
       return this.flutterwave.disburse(params);
     }
+    if (rail === "PAYSTACK") {
+      if (!this.paystack) {
+        throw new Error("Paystack provider is not configured (missing secretKey)");
+      }
+      return this.paystack.disburse(params);
+    }
     throw new Error(`Unsupported payout rail: ${rail}`);
+  }
+  /**
+   * Unified disbursement method with optional pre-flight balance checks and automatic failover.
+   */
+  async disburse(params) {
+    if (params.amount <= 0) {
+      throw new Error("Disbursement amount must be greater than zero");
+    }
+    if (!params.reference) {
+      throw new Error("Unique reference is required for idempotent disbursement");
+    }
+    const primaryRail = this.resolveRail(params);
+    const candidateRails = [primaryRail];
+    for (const fallback of params.fallbackRails || []) {
+      if (!candidateRails.includes(fallback)) {
+        candidateRails.push(fallback);
+      }
+    }
+    const attemptedRails = [];
+    let lastError;
+    let lastFailedResult;
+    const currency = params.currency.toUpperCase();
+    for (let i = 0; i < candidateRails.length; i++) {
+      const rail = candidateRails[i];
+      const hasFallback = i < candidateRails.length - 1;
+      attemptedRails.push(rail);
+      if (params.checkBalanceBeforeDisburse) {
+        try {
+          const balances = await this.getBalances(rail);
+          const match = balances.find((b) => b.currency === currency);
+          if (match && match.available < params.amount) {
+            const insufficientErr = new Error(
+              `Insufficient ${currency} balance on ${rail}: available ${match.available}, required ${params.amount}`
+            );
+            lastError = insufficientErr;
+            if (hasFallback) {
+              continue;
+            }
+            throw insufficientErr;
+          }
+        } catch (err) {
+          lastError = err instanceof Error ? err : new Error(String(err));
+          if (hasFallback) {
+            continue;
+          }
+          throw lastError;
+        }
+      }
+      try {
+        const result = await this.disburseOnRail(rail, params);
+        if (result.status === "FAILED" && hasFallback) {
+          lastFailedResult = result;
+          lastError = new Error(result.error || `${rail} disbursement returned FAILED`);
+          continue;
+        }
+        return {
+          ...result,
+          attemptedRails,
+          failoverFrom: rail !== primaryRail ? primaryRail : void 0
+        };
+      } catch (err) {
+        lastError = err instanceof Error ? err : new Error(String(err));
+        if (hasFallback) {
+          continue;
+        }
+        throw lastError;
+      }
+    }
+    if (lastFailedResult) {
+      return {
+        ...lastFailedResult,
+        attemptedRails
+      };
+    }
+    throw lastError || new Error("All configured payout rails failed");
   }
   /**
    * Fetches the latest settlement status for a previously initiated payout.
@@ -325,12 +671,65 @@ var OmniPayoutEngine = class {
       }
       return this.flutterwave.getPayoutStatus(params.transactionId, params.reference);
     }
+    if (params.rail === "PAYSTACK") {
+      if (!this.paystack) {
+        throw new Error("Paystack provider is not configured (missing secretKey)");
+      }
+      return this.paystack.getPayoutStatus(params.transactionId, params.reference);
+    }
     throw new Error(`Unsupported payout rail: ${params.rail}`);
   }
   /**
-   * Resolves a Nigerian / African bank account name using NIP inquiry.
+   * Queries available float balances for a specific rail or across all configured rails.
    */
-  async resolveBankAccount(bankCode, accountNumber) {
+  async getBalances(rail) {
+    if (rail === "STRIPE_CONNECT") {
+      if (!this.stripe) throw new Error("Stripe Connect provider is not configured (missing secretKey)");
+      return this.stripe.getBalances();
+    }
+    if (rail === "FLUTTERWAVE") {
+      if (!this.flutterwave) throw new Error("Flutterwave provider is not configured (missing secretKey)");
+      return this.flutterwave.getBalances();
+    }
+    if (rail === "PAYSTACK") {
+      if (!this.paystack) throw new Error("Paystack provider is not configured (missing secretKey)");
+      return this.paystack.getBalances();
+    }
+    const tasks = [];
+    if (this.stripe) tasks.push(this.stripe.getBalances());
+    if (this.flutterwave) tasks.push(this.flutterwave.getBalances());
+    if (this.paystack) tasks.push(this.paystack.getBalances());
+    const results = await Promise.all(tasks);
+    return results.flat();
+  }
+  /**
+   * Verifies a provider webhook signature and normalizes the event into a unified WebhookEvent.
+   */
+  verifyWebhook(rail, rawBody, signature) {
+    if (rail === "STRIPE_CONNECT") {
+      if (!this.stripe) throw new Error("Stripe Connect provider is not configured");
+      return this.stripe.verifyWebhook(rawBody, signature);
+    }
+    if (rail === "FLUTTERWAVE") {
+      if (!this.flutterwave) throw new Error("Flutterwave provider is not configured");
+      return this.flutterwave.verifyWebhook(rawBody, signature);
+    }
+    if (rail === "PAYSTACK") {
+      if (!this.paystack) throw new Error("Paystack provider is not configured");
+      return this.paystack.verifyWebhook(rawBody, signature);
+    }
+    throw new Error(`Unsupported payout rail: ${rail}`);
+  }
+  /**
+   * Resolves a Nigerian / African bank account name using Flutterwave or Paystack.
+   */
+  async resolveBankAccount(bankCode, accountNumber, rail) {
+    if (rail === "PAYSTACK" || !rail && !this.flutterwave && this.paystack) {
+      if (!this.paystack) {
+        throw new Error("Paystack provider is not configured for bank resolution");
+      }
+      return this.paystack.resolveBankAccount(bankCode, accountNumber);
+    }
     if (!this.flutterwave) {
       throw new Error("Flutterwave provider is not configured for bank resolution");
     }
@@ -349,6 +748,7 @@ var OmniPayoutEngine = class {
 export {
   FlutterwaveAdapter,
   OmniPayoutEngine,
+  PaystackAdapter,
   StripeConnectAdapter
 };
 //# sourceMappingURL=index.mjs.map

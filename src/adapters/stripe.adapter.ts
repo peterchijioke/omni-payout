@@ -1,9 +1,12 @@
+import crypto from 'crypto';
 import {
   DisburseParams,
   DisburseResult,
   OnboardingLinkParams,
   OnboardingLinkResult,
   PayoutStatus,
+  RailBalance,
+  WebhookEvent,
 } from '../types';
 
 function normalizeStripeStatus(
@@ -26,7 +29,10 @@ function normalizeStripeStatus(
 }
 
 export class StripeConnectAdapter {
-  constructor(private readonly secretKey: string) {
+  constructor(
+    private readonly secretKey: string,
+    private readonly webhookSecret?: string
+  ) {
     if (!secretKey) throw new Error('Stripe secret key is required');
   }
 
@@ -164,6 +170,88 @@ export class StripeConnectAdapter {
     return {
       url: data.url,
       expiresAt: data.expires_at ? new Date(data.expires_at * 1000) : undefined,
+    };
+  }
+
+  async getBalances(): Promise<RailBalance[]> {
+    const data = await this.request('/balance', { method: 'GET' });
+    const byCurrency = new Map<string, RailBalance>();
+
+    for (const entry of data.available || []) {
+      const currency = String(entry.currency || '').toUpperCase();
+      byCurrency.set(currency, {
+        rail: 'STRIPE_CONNECT',
+        currency,
+        available: typeof entry.amount === 'number' ? entry.amount / 100 : 0,
+        pending: 0,
+      });
+    }
+    for (const entry of data.pending || []) {
+      const currency = String(entry.currency || '').toUpperCase();
+      const existing = byCurrency.get(currency) || {
+        rail: 'STRIPE_CONNECT' as const,
+        currency,
+        available: 0,
+        pending: 0,
+      };
+      existing.pending = typeof entry.amount === 'number' ? entry.amount / 100 : 0;
+      byCurrency.set(currency, existing);
+    }
+
+    return Array.from(byCurrency.values());
+  }
+
+  verifyWebhook(rawBody: string, signatureHeader: string): WebhookEvent {
+    if (!this.webhookSecret) {
+      throw new Error('Stripe webhookSecret is required to verify webhooks');
+    }
+
+    const parts = Object.fromEntries(
+      (signatureHeader || '')
+        .split(',')
+        .map((part) => part.trim().split('='))
+        .filter((pair) => pair.length === 2)
+    );
+    const timestamp = parts.t;
+    const signature = parts.v1;
+    if (!timestamp || !signature) {
+      throw new Error('Invalid Stripe-Signature header format');
+    }
+
+    const signedPayload = `${timestamp}.${rawBody}`;
+    const expected = crypto
+      .createHmac('sha256', this.webhookSecret)
+      .update(signedPayload)
+      .digest('hex');
+
+    const sigBuf = Buffer.from(signature, 'utf8');
+    const expBuf = Buffer.from(expected, 'utf8');
+    if (sigBuf.length !== expBuf.length || !crypto.timingSafeEqual(sigBuf, expBuf)) {
+      throw new Error('Invalid Stripe webhook signature');
+    }
+
+    const payload = JSON.parse(rawBody);
+    const eventType = String(payload.type || '');
+    const obj = payload.data?.object || {};
+    const defaultStatus: PayoutStatus =
+      eventType === 'payout.paid'
+        ? 'SUCCESSFUL'
+        : eventType === 'payout.failed' || eventType === 'payout.canceled'
+          ? 'FAILED'
+          : 'PENDING';
+    const status = normalizeStripeStatus(obj.status, defaultStatus);
+
+    return {
+      rail: 'STRIPE_CONNECT',
+      eventType,
+      transactionId: String(obj.id || ''),
+      reference: String(obj.metadata?.reference || obj.id || ''),
+      status,
+      providerStatus: obj.status,
+      amount: typeof obj.amount === 'number' ? obj.amount / 100 : 0,
+      currency: String(obj.currency || '').toUpperCase(),
+      error: status === 'FAILED' ? obj.failure_message || 'Stripe payout failed' : undefined,
+      rawPayload: payload,
     };
   }
 }

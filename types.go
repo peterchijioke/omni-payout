@@ -8,6 +8,7 @@ type PayoutRail string
 const (
 	RailStripeConnect PayoutRail = "STRIPE_CONNECT"
 	RailFlutterwave   PayoutRail = "FLUTTERWAVE"
+	RailPaystack      PayoutRail = "PAYSTACK"
 )
 
 // PayoutSpeed specifies whether payout is standard ACH/batch or instant debit card.
@@ -33,16 +34,18 @@ type MobileMoneyDetails struct {
 
 // DisburseParams defines the unified payout request payload.
 type DisburseParams struct {
-	Amount             float64             `json:"amount"`
-	Currency           string              `json:"currency"`
-	Reference          string              `json:"reference"`
-	Narration          string              `json:"narration,omitempty"`
-	Rail               PayoutRail          `json:"rail,omitempty"` // Optional: auto-detected if omitted
-	StripeAccountID    string              `json:"stripeAccountId,omitempty"`
-	Speed              PayoutSpeed         `json:"speed,omitempty"`
-	BankDetails        *BankAccountDetails `json:"bankDetails,omitempty"`
-	MobileMoneyDetails *MobileMoneyDetails `json:"mobileMoneyDetails,omitempty"`
-	Metadata           map[string]string   `json:"metadata,omitempty"`
+	Amount                     float64             `json:"amount"`
+	Currency                   string              `json:"currency"`
+	Reference                  string              `json:"reference"`
+	Narration                  string              `json:"narration,omitempty"`
+	Rail                       PayoutRail          `json:"rail,omitempty"` // Optional: auto-detected if omitted
+	FallbackRails              []PayoutRail        `json:"fallbackRails,omitempty"`
+	CheckBalanceBeforeDisburse bool                `json:"checkBalanceBeforeDisburse,omitempty"`
+	StripeAccountID            string              `json:"stripeAccountId,omitempty"`
+	Speed                      PayoutSpeed         `json:"speed,omitempty"`
+	BankDetails                *BankAccountDetails `json:"bankDetails,omitempty"`
+	MobileMoneyDetails         *MobileMoneyDetails `json:"mobileMoneyDetails,omitempty"`
+	Metadata                   map[string]string   `json:"metadata,omitempty"`
 }
 
 // PayoutStatus represents the normalized settlement status of a payout.
@@ -56,16 +59,18 @@ const (
 
 // DisburseResult is the normalized result returned from any payout rail.
 type DisburseResult struct {
-	Success        bool       `json:"success"`
-	TransactionID  string     `json:"transactionId"`
-	Reference      string     `json:"reference"`
-	Status         string     `json:"status"` // "SUCCESSFUL", "PENDING", "FAILED"
-	ProviderStatus string     `json:"providerStatus,omitempty"`
-	Rail           PayoutRail `json:"rail"`
-	Amount         float64    `json:"amount"`
-	Currency       string     `json:"currency"`
-	Fee            float64    `json:"fee,omitempty"`
-	Error          string     `json:"error,omitempty"`
+	Success        bool         `json:"success"`
+	TransactionID  string       `json:"transactionId"`
+	Reference      string       `json:"reference"`
+	Status         string       `json:"status"` // "SUCCESSFUL", "PENDING", "FAILED"
+	ProviderStatus string       `json:"providerStatus,omitempty"`
+	Rail           PayoutRail   `json:"rail"`
+	AttemptedRails []PayoutRail `json:"attemptedRails,omitempty"`
+	FailoverFrom   PayoutRail   `json:"failoverFrom,omitempty"`
+	Amount         float64      `json:"amount"`
+	Currency       string       `json:"currency"`
+	Fee            float64      `json:"fee,omitempty"`
+	Error          string       `json:"error,omitempty"`
 }
 
 // PayoutStatusParams defines inputs to fetch the latest status of a payout.
@@ -74,6 +79,27 @@ type PayoutStatusParams struct {
 	Rail            PayoutRail `json:"rail"`
 	StripeAccountID string     `json:"stripeAccountId,omitempty"`
 	Reference       string     `json:"reference,omitempty"`
+}
+
+// RailBalance represents available and pending float balance for a rail and currency.
+type RailBalance struct {
+	Rail      PayoutRail `json:"rail"`
+	Currency  string     `json:"currency"`
+	Available float64    `json:"available"`
+	Pending   float64    `json:"pending,omitempty"`
+}
+
+// WebhookEvent is the verified, normalized webhook payload from any supported rail.
+type WebhookEvent struct {
+	Rail           PayoutRail `json:"rail"`
+	EventType      string     `json:"eventType"`
+	TransactionID  string     `json:"transactionId"`
+	Reference      string     `json:"reference"`
+	Status         string     `json:"status"`
+	ProviderStatus string     `json:"providerStatus,omitempty"`
+	Amount         float64    `json:"amount"`
+	Currency       string     `json:"currency"`
+	Error          string     `json:"error,omitempty"`
 }
 
 // BankResolutionResult holds the resolved account details from NIP inquiry.
@@ -97,8 +123,12 @@ type OnboardingLinkResult struct {
 	ExpiresAt *time.Time `json:"expiresAt,omitempty"`
 }
 
-// Config provides API credentials for Stripe and Flutterwave.
+// Config provides API credentials and webhook secrets for Stripe, Flutterwave, and Paystack.
 type Config struct {
-	StripeSecretKey      string
-	FlutterwaveSecretKey string
+	StripeSecretKey          string
+	StripeWebhookSecret      string
+	FlutterwaveSecretKey     string
+	FlutterwaveWebhookSecret string
+	PaystackSecretKey        string
+	PaystackWebhookSecret    string
 }

@@ -1,4 +1,12 @@
-import { BankResolutionResult, DisburseParams, DisburseResult, PayoutStatus } from '../types';
+import crypto from 'crypto';
+import {
+  BankResolutionResult,
+  DisburseParams,
+  DisburseResult,
+  PayoutStatus,
+  RailBalance,
+  WebhookEvent,
+} from '../types';
 
 function normalizeFlutterwaveStatus(rawStatus?: string): PayoutStatus {
   if (!rawStatus) return 'PENDING';
@@ -17,7 +25,10 @@ function normalizeFlutterwaveStatus(rawStatus?: string): PayoutStatus {
 }
 
 export class FlutterwaveAdapter {
-  constructor(private readonly secretKey: string) {
+  constructor(
+    private readonly secretKey: string,
+    private readonly webhookSecret?: string
+  ) {
     if (!secretKey) throw new Error('Flutterwave secret key is required');
   }
 
@@ -124,6 +135,47 @@ export class FlutterwaveAdapter {
       fee: transferData.fee ? Number(transferData.fee) : undefined,
       error: status === 'FAILED' ? transferData.complete_message || res.message : undefined,
       rawResponse: res,
+    };
+  }
+
+  async getBalances(): Promise<RailBalance[]> {
+    const res = await this.request('/balances', { method: 'GET' });
+    const rows = Array.isArray(res.data) ? res.data : [];
+    return rows.map((row: any) => ({
+      rail: 'FLUTTERWAVE' as const,
+      currency: String(row.currency || '').toUpperCase(),
+      available: Number(row.available_balance || 0),
+      pending: row.ledger_balance !== undefined ? Number(row.ledger_balance) - Number(row.available_balance || 0) : undefined,
+    }));
+  }
+
+  verifyWebhook(rawBody: string, verifHash: string): WebhookEvent {
+    if (!this.webhookSecret) {
+      throw new Error('Flutterwave webhookSecret is required to verify webhooks');
+    }
+
+    const sigBuf = Buffer.from(verifHash || '', 'utf8');
+    const expBuf = Buffer.from(this.webhookSecret, 'utf8');
+    if (sigBuf.length !== expBuf.length || !crypto.timingSafeEqual(sigBuf, expBuf)) {
+      throw new Error('Invalid Flutterwave webhook signature');
+    }
+
+    const payload = JSON.parse(rawBody);
+    const eventType = String(payload.event || '');
+    const data = payload.data || {};
+    const status = normalizeFlutterwaveStatus(data.status);
+
+    return {
+      rail: 'FLUTTERWAVE',
+      eventType,
+      transactionId: String(data.id || ''),
+      reference: String(data.reference || ''),
+      status,
+      providerStatus: data.status,
+      amount: data.amount ? Number(data.amount) : 0,
+      currency: String(data.currency || '').toUpperCase(),
+      error: status === 'FAILED' ? data.complete_message || 'Flutterwave transfer failed' : undefined,
+      rawPayload: payload,
     };
   }
 }

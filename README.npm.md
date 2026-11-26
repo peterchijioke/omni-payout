@@ -20,6 +20,8 @@ Cross-border marketplaces and platforms expanding between the **United States/Eu
 - 🚀 **Stripe Connect Express**: Supports instant debit card payouts, standard transfers, and onboarding links.
 - 🏦 **African Bank Name Resolution**: Validates account numbers and retrieves verified legal entity names via NIP inquiry before sending money.
 - 📱 **Mobile Money Support**: Native payouts to M-Pesa, MTN MoMo, Airtel, Vodafone, Orange, and Wave.
+- 🔄 **Multi-Rail Failover & Float Checks**: Supports **Stripe Connect**, **Flutterwave**, and **Paystack** with optional pre-flight balance checks (`checkBalanceBeforeDisburse`) and automatic failover (`fallbackRails`) while preserving the exact same `reference`.
+- 💰 **Unified Balance & Webhook APIs**: Query float balances across every configured rail (`getBalances()`) and verify/normalize Stripe, Flutterwave, and Paystack webhooks (`verifyWebhook()`).
 - 🔁 **Idempotent Retries & Clear Settlement Status**: Deterministic `Idempotency-Key` headers (Stripe) and stable `reference` tracking across retries, normalized `PENDING` / `SUCCESSFUL` / `FAILED` statuses (plus `providerStatus`), and `getPayoutStatus()` for checking unsettled payouts.
 - 🔒 **Zero Dependencies**: Pure standard library implementation using native `fetch`.
 

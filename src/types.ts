@@ -1,4 +1,4 @@
-export type PayoutRail = 'STRIPE_CONNECT' | 'FLUTTERWAVE';
+export type PayoutRail = 'STRIPE_CONNECT' | 'FLUTTERWAVE' | 'PAYSTACK';
 
 export type PayoutSpeed = 'standard' | 'instant';
 
@@ -21,6 +21,8 @@ export interface DisburseParams {
   reference: string;
   narration?: string;
   rail?: PayoutRail;
+  fallbackRails?: PayoutRail[];
+  checkBalanceBeforeDisburse?: boolean;
   stripeAccountId?: string;
   speed?: PayoutSpeed;
   bankDetails?: BankAccountDetails;
@@ -35,6 +37,8 @@ export interface DisburseResult {
   status: PayoutStatus;
   providerStatus?: string;
   rail: PayoutRail;
+  attemptedRails?: PayoutRail[];
+  failoverFrom?: PayoutRail;
   amount: number;
   currency: string;
   fee?: number;
@@ -47,6 +51,26 @@ export interface PayoutStatusParams {
   rail: PayoutRail;
   stripeAccountId?: string;
   reference?: string;
+}
+
+export interface RailBalance {
+  rail: PayoutRail;
+  currency: string;
+  available: number;
+  pending?: number;
+}
+
+export interface WebhookEvent {
+  rail: PayoutRail;
+  eventType: string;
+  transactionId: string;
+  reference: string;
+  status: PayoutStatus;
+  providerStatus?: string;
+  amount: number;
+  currency: string;
+  error?: string;
+  rawPayload?: any;
 }
 
 export interface BankResolutionResult {
@@ -75,6 +99,10 @@ export interface OmniPayoutConfig {
   flutterwave?: {
     secretKey: string;
     publicKey?: string;
+    webhookSecret?: string;
+  };
+  paystack?: {
+    secretKey: string;
     webhookSecret?: string;
   };
 }

@@ -1,9 +1,11 @@
+import crypto from 'crypto';
 import { OmniPayoutEngine } from '../src/engine';
 
 describe('OmniPayoutEngine', () => {
   const engine = new OmniPayoutEngine({
-    stripe: { secretKey: 'sk_test_mock_stripe' },
-    flutterwave: { secretKey: 'flw_sec_mock_flw' },
+    stripe: { secretKey: 'sk_test_mock_stripe', webhookSecret: 'whsec_test_stripe' },
+    flutterwave: { secretKey: 'flw_sec_mock_flw', webhookSecret: 'flw_hash_secret' },
+    paystack: { secretKey: 'sk_test_mock_paystack', webhookSecret: 'ps_webhook_secret' },
   });
 
   describe('Rail Resolution', () => {
@@ -254,6 +256,202 @@ describe('OmniPayoutEngine', () => {
       expect(flwStatus.status).toBe('SUCCESSFUL');
       expect(flwStatus.providerStatus).toBe('SUCCESSFUL');
       expect(flwStatus.reference).toBe('REF-FLW-PENDING-001');
+    });
+
+    it('disburses via Paystack cleanly', async () => {
+      global.fetch = jest
+        .fn()
+        .mockResolvedValueOnce({
+          ok: true,
+          json: async () => ({
+            status: true,
+            data: { recipient_code: 'RCP_mock_123' },
+          }),
+        } as any)
+        .mockResolvedValueOnce({
+          ok: true,
+          json: async () => ({
+            status: true,
+            data: {
+              id: 888999,
+              transfer_code: 'TRF_mock_123',
+              reference: 'REF-PS-001',
+              status: 'pending',
+            },
+          }),
+        } as any);
+
+      const res = await engine.disburse({
+        amount: 30000,
+        currency: 'NGN',
+        reference: 'REF-PS-001',
+        rail: 'PAYSTACK',
+        bankDetails: { bankCode: '058', accountNumber: '0123456789', accountName: 'Jane Doe' },
+      });
+
+      expect(res.success).toBe(true);
+      expect(res.rail).toBe('PAYSTACK');
+      expect(res.status).toBe('PENDING');
+      expect(res.transactionId).toBe('TRF_mock_123');
+      expect(res.reference).toBe('REF-PS-001');
+    });
+
+    it('fails over from Flutterwave to Paystack when Flutterwave float is insufficient, keeping the same reference', async () => {
+      global.fetch = jest
+        .fn()
+        // 1. Flutterwave balance check: only 5,000 NGN available (need 45,000)
+        .mockResolvedValueOnce({
+          ok: true,
+          json: async () => ({
+            status: 'success',
+            data: [{ currency: 'NGN', available_balance: 5000, ledger_balance: 5000 }],
+          }),
+        } as any)
+        // 2. Paystack balance check: 100,000 NGN available (10_000_000 kobo)
+        .mockResolvedValueOnce({
+          ok: true,
+          json: async () => ({
+            status: true,
+            data: [{ currency: 'NGN', balance: 10000000 }],
+          }),
+        } as any)
+        // 3. Paystack recipient creation
+        .mockResolvedValueOnce({
+          ok: true,
+          json: async () => ({
+            status: true,
+            data: { recipient_code: 'RCP_failover_1' },
+          }),
+        } as any)
+        // 4. Paystack transfer
+        .mockResolvedValueOnce({
+          ok: true,
+          json: async () => ({
+            status: true,
+            data: {
+              transfer_code: 'TRF_failover_1',
+              reference: 'PAYOUT-FAILOVER-001',
+              status: 'pending',
+            },
+          }),
+        } as any);
+
+      const res = await engine.disburse({
+        amount: 45000,
+        currency: 'NGN',
+        reference: 'PAYOUT-FAILOVER-001',
+        rail: 'FLUTTERWAVE',
+        fallbackRails: ['PAYSTACK'],
+        checkBalanceBeforeDisburse: true,
+        bankDetails: { bankCode: '058', accountNumber: '0123456789' },
+      });
+
+      expect(res.success).toBe(true);
+      expect(res.rail).toBe('PAYSTACK');
+      expect(res.failoverFrom).toBe('FLUTTERWAVE');
+      expect(res.attemptedRails).toEqual(['FLUTTERWAVE', 'PAYSTACK']);
+      expect(res.reference).toBe('PAYOUT-FAILOVER-001');
+    });
+
+    it('fetches unified balances across all configured rails', async () => {
+      global.fetch = jest.fn().mockImplementation(async (url: string) => {
+        if (url.includes('api.stripe.com')) {
+          return {
+            ok: true,
+            json: async () => ({
+              available: [{ currency: 'usd', amount: 250000 }],
+              pending: [{ currency: 'usd', amount: 50000 }],
+            }),
+          };
+        }
+        if (url.includes('api.flutterwave.com')) {
+          return {
+            ok: true,
+            json: async () => ({
+              status: 'success',
+              data: [{ currency: 'NGN', available_balance: 750000, ledger_balance: 800000 }],
+            }),
+          };
+        }
+        return {
+          ok: true,
+          json: async () => ({
+            status: true,
+            data: [{ currency: 'NGN', balance: 50000000 }],
+          }),
+        };
+      });
+
+      const balances = await engine.getBalances();
+      expect(balances).toEqual(
+        expect.arrayContaining([
+          { rail: 'STRIPE_CONNECT', currency: 'USD', available: 2500, pending: 500 },
+          { rail: 'FLUTTERWAVE', currency: 'NGN', available: 750000, pending: 50000 },
+          { rail: 'PAYSTACK', currency: 'NGN', available: 500000 },
+        ])
+      );
+    });
+
+    it('verifies and normalizes webhooks across Stripe, Flutterwave, and Paystack', () => {
+      // Stripe webhook
+      const stripeBody = JSON.stringify({
+        type: 'payout.paid',
+        data: {
+          object: {
+            id: 'po_wh_1',
+            status: 'paid',
+            amount: 15000,
+            currency: 'usd',
+            metadata: { reference: 'REF-STRIPE-WH' },
+          },
+        },
+      });
+      const ts = '1700000000';
+      const stripeSig = crypto
+        .createHmac('sha256', 'whsec_test_stripe')
+        .update(`${ts}.${stripeBody}`)
+        .digest('hex');
+      const stripeEvent = engine.verifyWebhook('STRIPE_CONNECT', stripeBody, `t=${ts},v1=${stripeSig}`);
+      expect(stripeEvent.status).toBe('SUCCESSFUL');
+      expect(stripeEvent.reference).toBe('REF-STRIPE-WH');
+      expect(stripeEvent.amount).toBe(150);
+
+      // Flutterwave webhook
+      const flwBody = JSON.stringify({
+        event: 'transfer.completed',
+        data: {
+          id: 9911,
+          reference: 'REF-FLW-WH',
+          status: 'SUCCESSFUL',
+          amount: 45000,
+          currency: 'NGN',
+        },
+      });
+      const flwEvent = engine.verifyWebhook('FLUTTERWAVE', flwBody, 'flw_hash_secret');
+      expect(flwEvent.status).toBe('SUCCESSFUL');
+      expect(flwEvent.reference).toBe('REF-FLW-WH');
+
+      // Paystack webhook
+      const psBody = JSON.stringify({
+        event: 'transfer.success',
+        data: {
+          transfer_code: 'TRF_wh_1',
+          reference: 'REF-PS-WH',
+          status: 'success',
+          amount: 4500000,
+          currency: 'NGN',
+        },
+      });
+      const psSig = crypto.createHmac('sha512', 'ps_webhook_secret').update(psBody).digest('hex');
+      const psEvent = engine.verifyWebhook('PAYSTACK', psBody, psSig);
+      expect(psEvent.status).toBe('SUCCESSFUL');
+      expect(psEvent.reference).toBe('REF-PS-WH');
+      expect(psEvent.amount).toBe(45000);
+
+      // Rejects invalid signature
+      expect(() => engine.verifyWebhook('PAYSTACK', psBody, 'bad-signature')).toThrow(
+        'Invalid Paystack webhook signature'
+      );
     });
   });
 });

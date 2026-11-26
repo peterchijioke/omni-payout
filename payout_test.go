@@ -2,6 +2,10 @@ package omnipayout
 
 import (
 	"bytes"
+	"crypto/hmac"
+	"crypto/sha256"
+	"crypto/sha512"
+	"encoding/hex"
 	"io"
 	"net/http"
 	"testing"
@@ -247,5 +251,110 @@ func TestGetPayoutStatus(t *testing.T) {
 	}
 	if flwRes.Status != string(StatusSuccessful) || flwRes.Reference != "REF-NG-PENDING" {
 		t.Errorf("unexpected flutterwave status result: %+v", flwRes)
+	}
+}
+
+func TestDisburseFailoverOnInsufficientFloat(t *testing.T) {
+	engine := NewEngine(Config{
+		FlutterwaveSecretKey: "flw_mock_sec",
+		PaystackSecretKey:    "sk_test_paystack",
+	})
+
+	engine.httpClient = &http.Client{
+		Transport: roundTripFunc(func(req *http.Request) *http.Response {
+			switch {
+			case req.URL.Host == "api.flutterwave.com" && req.URL.Path == "/v3/balances":
+				return &http.Response{
+					StatusCode: 200,
+					Body:       io.NopCloser(bytes.NewBufferString(`{"status":"success","data":[{"currency":"NGN","available_balance":5000,"ledger_balance":5000}]}`)),
+					Header:     make(http.Header),
+				}
+			case req.URL.Host == "api.paystack.co" && req.URL.Path == "/balance":
+				return &http.Response{
+					StatusCode: 200,
+					Body:       io.NopCloser(bytes.NewBufferString(`{"status":true,"data":[{"currency":"NGN","balance":10000000}]}`)),
+					Header:     make(http.Header),
+				}
+			case req.URL.Host == "api.paystack.co" && req.URL.Path == "/transferrecipient":
+				return &http.Response{
+					StatusCode: 200,
+					Body:       io.NopCloser(bytes.NewBufferString(`{"status":true,"data":{"recipient_code":"RCP_go_1"}}`)),
+					Header:     make(http.Header),
+				}
+			default:
+				return &http.Response{
+					StatusCode: 200,
+					Body:       io.NopCloser(bytes.NewBufferString(`{"status":true,"data":{"transfer_code":"TRF_go_1","reference":"PAYOUT-FAILOVER-GO","status":"pending"}}`)),
+					Header:     make(http.Header),
+				}
+			}
+		}),
+	}
+
+	res, err := engine.Disburse(DisburseParams{
+		Amount:                     45000,
+		Currency:                   "NGN",
+		Reference:                  "PAYOUT-FAILOVER-GO",
+		Rail:                       RailFlutterwave,
+		FallbackRails:              []PayoutRail{RailPaystack},
+		CheckBalanceBeforeDisburse: true,
+		BankDetails:                &BankAccountDetails{BankCode: "058", AccountNumber: "0123456789"},
+	})
+	if err != nil {
+		t.Fatalf("unexpected failover error: %v", err)
+	}
+	if res.Rail != RailPaystack || res.FailoverFrom != RailFlutterwave || res.Reference != "PAYOUT-FAILOVER-GO" || len(res.AttemptedRails) != 2 {
+		t.Errorf("unexpected failover result: %+v", res)
+	}
+}
+
+func TestVerifyWebhooks(t *testing.T) {
+	engine := NewEngine(Config{
+		StripeSecretKey:          "sk_test_mock",
+		StripeWebhookSecret:      "whsec_go_test",
+		FlutterwaveSecretKey:     "flw_mock",
+		FlutterwaveWebhookSecret: "flw_go_hash",
+		PaystackSecretKey:        "sk_ps_mock",
+		PaystackWebhookSecret:    "ps_go_secret",
+	})
+
+	// Stripe webhook
+	stripeBody := []byte(`{"type":"payout.paid","data":{"object":{"id":"po_go_1","status":"paid","amount":15000,"currency":"usd","metadata":{"reference":"REF-GO-STRIPE"}}}}`)
+	ts := "1700000000"
+	mac256 := hmac.New(sha256.New, []byte("whsec_go_test"))
+	mac256.Write([]byte(ts + "."))
+	mac256.Write(stripeBody)
+	stripeEv, err := engine.VerifyWebhook(RailStripeConnect, stripeBody, "t="+ts+",v1="+hex.EncodeToString(mac256.Sum(nil)))
+	if err != nil {
+		t.Fatalf("unexpected stripe webhook error: %v", err)
+	}
+	if stripeEv.Status != string(StatusSuccessful) || stripeEv.Reference != "REF-GO-STRIPE" || stripeEv.Amount != 150 {
+		t.Errorf("unexpected stripe webhook event: %+v", stripeEv)
+	}
+
+	// Flutterwave webhook
+	flwBody := []byte(`{"event":"transfer.completed","data":{"id":9911,"reference":"REF-GO-FLW","status":"SUCCESSFUL","amount":45000,"currency":"NGN"}}`)
+	flwEv, err := engine.VerifyWebhook(RailFlutterwave, flwBody, "flw_go_hash")
+	if err != nil {
+		t.Fatalf("unexpected flutterwave webhook error: %v", err)
+	}
+	if flwEv.Status != string(StatusSuccessful) || flwEv.Reference != "REF-GO-FLW" {
+		t.Errorf("unexpected flutterwave webhook event: %+v", flwEv)
+	}
+
+	// Paystack webhook
+	psBody := []byte(`{"event":"transfer.success","data":{"transfer_code":"TRF_go_wh","reference":"REF-GO-PS","status":"success","amount":4500000,"currency":"NGN"}}`)
+	mac512 := hmac.New(sha512.New, []byte("ps_go_secret"))
+	mac512.Write(psBody)
+	psEv, err := engine.VerifyWebhook(RailPaystack, psBody, hex.EncodeToString(mac512.Sum(nil)))
+	if err != nil {
+		t.Fatalf("unexpected paystack webhook error: %v", err)
+	}
+	if psEv.Status != string(StatusSuccessful) || psEv.Reference != "REF-GO-PS" || psEv.Amount != 45000 {
+		t.Errorf("unexpected paystack webhook event: %+v", psEv)
+	}
+
+	if _, err := engine.VerifyWebhook(RailPaystack, psBody, "invalid-sig"); err == nil {
+		t.Errorf("expected error for invalid paystack webhook signature")
 	}
 }
