@@ -2,11 +2,16 @@ import crypto from 'crypto';
 import {
   IdempotencyRecord,
   IdempotencyStore,
+  LocalLedgerRecord,
   NameMatchResult,
   PayoutErrorCode,
   PayoutRail,
   PayoutStatus,
+  ReconciliationMatch,
+  ReconciliationMismatch,
+  ReconciliationReport,
   RetryConfig,
+  SettlementRecord,
   WebhookStore,
 } from './types';
 
@@ -551,4 +556,142 @@ export function resolveProviderCode(
     : `${upperCode}_${upperCur}`;
   const mapped = CROSS_RAIL_BANK_CODES[compositeKey]?.[rail];
   return mapped || code.trim();
+}
+
+/**
+ * Pure, stateless two-path reconciliation diff engine ("two paths, same numbers").
+ * Compares your application's local ledger (including AMBIGUOUS / PENDING payouts)
+ * against an independent per-provider settlement export.
+ */
+export function reconcileBatch(
+  localRecords: LocalLedgerRecord[],
+  providerRecords: SettlementRecord[]
+): ReconciliationReport {
+  const providerByRef = new Map<string, SettlementRecord>();
+  let totalProviderAmount = 0;
+  let totalProviderFees = 0;
+
+  for (const p of providerRecords) {
+    const ref = (p.reference || p.transactionId || '').trim();
+    if (ref) providerByRef.set(ref, p);
+    totalProviderAmount += p.amount || 0;
+    totalProviderFees += p.fee || 0;
+  }
+
+  const matched: ReconciliationMatch[] = [];
+  const statusMismatches: ReconciliationMismatch[] = [];
+  const amountMismatches: ReconciliationMismatch[] = [];
+  const missingOnProvider: LocalLedgerRecord[] = [];
+  const seenProviderRefs = new Set<string>();
+  let totalLocalAmount = 0;
+  let resolvedAmbiguousCount = 0;
+
+  for (const local of localRecords) {
+    const ref = local.reference.trim();
+    totalLocalAmount += local.amount || 0;
+    const provider = providerByRef.get(ref);
+
+    if (!provider) {
+      missingOnProvider.push(local);
+      continue;
+    }
+
+    seenProviderRefs.add(ref);
+    const localCur = local.currency.toUpperCase();
+    const provCur = provider.currency.toUpperCase();
+    const amountDiff = Math.abs(local.amount - provider.amount) > 0.01 || (localCur && provCur && localCur !== provCur);
+    const statusDiff = local.status !== provider.status;
+
+    if (local.status === 'AMBIGUOUS') {
+      resolvedAmbiguousCount++;
+    }
+
+    if (amountDiff) {
+      amountMismatches.push({
+        reference: ref,
+        local,
+        provider,
+        reason: `Local ${local.amount} ${localCur} != provider ${provider.amount} ${provCur}`,
+      });
+    } else if (statusDiff) {
+      statusMismatches.push({
+        reference: ref,
+        local,
+        provider,
+        reason:
+          local.status === 'AMBIGUOUS'
+            ? `Resolved AMBIGUOUS payout: provider status is ${provider.status}`
+            : `Local status ${local.status} != provider status ${provider.status}`,
+      });
+    } else {
+      matched.push({ local, provider });
+    }
+  }
+
+  const missingInLedger: SettlementRecord[] = [];
+  for (const p of providerRecords) {
+    const ref = (p.reference || p.transactionId || '').trim();
+    if (!seenProviderRefs.has(ref)) {
+      missingInLedger.push(p);
+    }
+  }
+
+  const discrepancyCount =
+    statusMismatches.length +
+    amountMismatches.length +
+    missingOnProvider.length +
+    missingInLedger.length;
+
+  return {
+    matched,
+    statusMismatches,
+    amountMismatches,
+    missingOnProvider,
+    missingInLedger,
+    summary: {
+      totalLocalCount: localRecords.length,
+      totalProviderCount: providerRecords.length,
+      matchedCount: matched.length,
+      discrepancyCount,
+      resolvedAmbiguousCount,
+      totalLocalAmount: Number(totalLocalAmount.toFixed(2)),
+      totalProviderAmount: Number(totalProviderAmount.toFixed(2)),
+      totalProviderFees: Number(totalProviderFees.toFixed(2)),
+    },
+  };
+}
+
+function escapeCsvField(val: string | number | undefined): string {
+  if (val === undefined || val === null) return '';
+  let str = String(val);
+  // Neutralize spreadsheet formula injection (=, +, -, @) for safe accounting exports
+  if (/^[=+\-@\t\r]/.test(str)) {
+    str = `'${str}`;
+  }
+  if (/[",\n\r]/.test(str)) {
+    return `"${str.replace(/"/g, '""')}"`;
+  }
+  return str;
+}
+
+/**
+ * Formats normalized SettlementRecords as an RFC 4180 CSV string for accounting & audit imports,
+ * with automatic spreadsheet formula-injection neutralization.
+ */
+export function formatSettlementsCsv(records: SettlementRecord[]): string {
+  const header = 'rail,transactionId,reference,status,providerStatus,amount,currency,fee,createdAt';
+  const rows = records.map((r) =>
+    [
+      escapeCsvField(r.rail),
+      escapeCsvField(r.transactionId),
+      escapeCsvField(r.reference),
+      escapeCsvField(r.status),
+      escapeCsvField(r.providerStatus ?? ''),
+      escapeCsvField(r.amount),
+      escapeCsvField(r.currency),
+      escapeCsvField(r.fee ?? ''),
+      escapeCsvField(r.createdAt ? r.createdAt.toISOString() : ''),
+    ].join(',')
+  );
+  return [header, ...rows].join('\n');
 }

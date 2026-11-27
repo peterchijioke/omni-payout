@@ -4,6 +4,8 @@ import {
   DisburseResult,
   PayoutStatus,
   RailBalance,
+  SettlementExportParams,
+  SettlementRecord,
   WebhookEvent,
 } from '../types';
 import {
@@ -187,6 +189,26 @@ export class FlutterwaveAdapter {
         row.ledger_balance !== undefined
           ? Number(row.ledger_balance) - Number(row.available_balance || 0)
           : undefined,
+    }));
+  }
+
+  async exportSettlements(params: SettlementExportParams): Promise<SettlementRecord[]> {
+    const query = new URLSearchParams({
+      from: params.from.toISOString().slice(0, 10),
+      to: params.to.toISOString().slice(0, 10),
+    });
+    const res = await this.request(`/transfers?${query.toString()}`, { method: 'GET' });
+    const rows = Array.isArray(res.data) ? res.data : [];
+    return rows.map((row: any) => ({
+      rail: 'FLUTTERWAVE' as const,
+      transactionId: String(row.id || ''),
+      reference: String(row.reference || row.id || ''),
+      status: normalizeFlutterwaveStatus(row.status),
+      providerStatus: row.status,
+      amount: Number(row.amount || 0),
+      currency: String(row.currency || '').toUpperCase(),
+      fee: row.fee !== undefined ? Number(row.fee) : undefined,
+      createdAt: row.created_at ? new Date(row.created_at) : undefined,
     }));
   }
 

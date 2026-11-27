@@ -65,6 +65,9 @@ Every method is available in both **TypeScript** (`camelCase`) and **Go** (`Pasc
 | `disburse(params)` / `Disburse(params)` / `DisburseContext(ctx, params)` | Executes a payout with concurrent singleflight deduplication, optional `IdempotencyStore`, `railLimits`, `HALF_OPEN` circuit breakers, retry backoff, float checks, and timeout-safe failover. |
 | `getPayoutStatus(params)` / `GetPayoutStatus(params)` | Queries the provider for the latest settlement status of a `PENDING` payout by `transactionId` (and optional `reference` / `stripeAccountId`). |
 | `waitForSettlement(params, opts?)` / `WaitForSettlement(ctx, params, opts)` | Polls `getPayoutStatus` with exponential backoff until the payout reaches `SUCCESSFUL` or `FAILED`, or throws `RECONCILIATION_TIMEOUT`. |
+| `exportSettlements(params)` / `ExportSettlements(params)` | Independently pulls normalized transfer/payout records for a date range directly from one or all configured providers (Stripe, Flutterwave, Paystack, Yellow Card) for accounting & auditing. |
+| `reconcileBatch(local, provider)` / `ReconcileBatch(local, provider)` | Pure, stateless two-path diff comparing your local ledger (including `AMBIGUOUS` / `PENDING` records) against `exportSettlements()` — surfacing matched rows, resolved ambiguous payouts, status/amount mismatches, and missing records. |
+| `formatSettlementsCsv(records)` / `FormatSettlementsCSV(records)` | Exports normalized `SettlementRecord[]` as RFC 4180 CSV with automatic spreadsheet formula-injection neutralization. |
 | `getBalances(rail?)` / `GetBalances(rail)` | Returns available and pending float balances (`RailBalance[]`) for a specific rail, or concurrently across **all configured rails** (with optional `balanceCacheTtlMs` / `invalidateBalanceCache`). |
 | `getRailHealth(rail?)` / `GetRailHealth(rail)` | Returns live uptime/latency telemetry and circuit-breaker state (`CLOSED`, `OPEN`, `HALF_OPEN`, `consecutiveFailures`, `avgLatencyMs`, `lastError`). |
 | `verifyWebhook(rail, rawBody, signature)` / `VerifyWebhook(...)` | Verifies the provider's webhook signature using constant-time comparison, flags/rejects duplicates via optional `WebhookStore`, and normalizes `fee` & M-Pesa `QUEUE_TIMEOUT`. *(TS also provides `verifyWebhookAsync` for async stores.)* |
@@ -346,6 +349,72 @@ engine := omnipayout.NewEngine(omnipayout.Config{
 		log.Printf("event=%s rail=%s code=%s latency_ms=%d", ev.Type, ev.Rail, ev.ErrorCode, ev.LatencyMs)
 	},
 })
+```
+
+---
+
+## Two-Path Audit & Settlement Reconciliation ("Two Paths, Same Numbers")
+
+Run a scheduled reconciliation job that independently exports settlements directly from your providers and diffs them against your local ledger (including any `AMBIGUOUS` or `PENDING` payouts):
+
+### TypeScript
+
+```typescript
+// 1. Independently pull settled/pending transfers for the day from all configured rails
+const providerRecords = await engine.exportSettlements({
+  from: new Date('2026-11-26T00:00:00Z'),
+  to: new Date('2026-11-26T23:59:59Z'),
+  // rail: 'FLUTTERWAVE', // optional: filter to a single provider
+});
+
+// 2. Diff against your database's payout ledger (including AMBIGUOUS / PENDING rows)
+const report = engine.reconcileBatch(
+  [
+    { reference: 'PAY-US-001', amount: 150, currency: 'USD', status: 'SUCCESSFUL' },
+    { reference: 'PAY-NG-002', amount: 45000, currency: 'NGN', status: 'AMBIGUOUS' },
+  ],
+  providerRecords
+);
+
+console.log(report.summary);
+// { matchedCount, discrepancyCount, resolvedAmbiguousCount, totalLocalAmount, totalProviderAmount, totalProviderFees }
+console.log('Resolved AMBIGUOUS / status diffs:', report.statusMismatches);
+console.log('Amount mismatches:', report.amountMismatches);
+console.log('Missing on provider:', report.missingOnProvider);
+console.log('Paid by provider but missing in local DB:', report.missingInLedger);
+
+// 3. Export formula-safe CSV for finance/accounting
+const csv = engine.formatSettlementsCsv(providerRecords);
+```
+
+### Go (Golang)
+
+```go
+// 1. Independently pull settlements for the day across all configured rails
+providerRecords, err := engine.ExportSettlements(omnipayout.SettlementExportParams{
+	From: time.Date(2026, 11, 26, 0, 0, 0, 0, time.UTC),
+	To:   time.Date(2026, 11, 26, 23, 59, 59, 0, time.UTC),
+	// Rail: omnipayout.RailFlutterwave, // optional: filter to a single rail
+})
+if err != nil {
+	log.Fatalf("settlement export failed: %v", err)
+}
+
+// 2. Diff against your local ledger (including AMBIGUOUS payouts)
+report := engine.ReconcileBatch([]omnipayout.LocalLedgerRecord{
+	{Reference: "PAY-US-001", Amount: 150, Currency: "USD", Status: string(omnipayout.StatusSuccessful)},
+	{Reference: "PAY-NG-002", Amount: 45000, Currency: "NGN", Status: string(omnipayout.IdempotencyAmbiguous)},
+}, providerRecords)
+
+fmt.Printf("Matched: %d, Discrepancies: %d, Resolved AMBIGUOUS: %d\n",
+	report.Summary.MatchedCount,
+	report.Summary.DiscrepancyCount,
+	report.Summary.ResolvedAmbiguousCount,
+)
+
+// 3. Export formula-safe CSV for accounting
+csvData := engine.FormatSettlementsCSV(providerRecords)
+fmt.Println(csvData)
 ```
 
 ---

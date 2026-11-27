@@ -257,6 +257,69 @@ export interface OnboardingLinkResult {
   expiresAt?: Date;
 }
 
+export interface SettlementExportParams {
+  /** Omit to export concurrently across all configured rails that support bulk listing. */
+  rail?: PayoutRail;
+  from: Date;
+  to: Date;
+  limit?: number;
+  /** Optional Stripe connected account ID to export `/v1/payouts` instead of platform `/v1/transfers`. */
+  stripeAccountId?: string;
+}
+
+export interface SettlementRecord {
+  rail: PayoutRail;
+  transactionId: string;
+  reference: string;
+  status: PayoutStatus;
+  providerStatus?: string;
+  amount: number;
+  currency: string;
+  fee?: number;
+  createdAt?: Date;
+}
+
+export interface LocalLedgerRecord {
+  reference: string;
+  rail?: PayoutRail;
+  amount: number;
+  currency: string;
+  status: PayoutStatus | 'AMBIGUOUS';
+  transactionId?: string;
+}
+
+export interface ReconciliationMatch {
+  local: LocalLedgerRecord;
+  provider: SettlementRecord;
+}
+
+export interface ReconciliationMismatch {
+  reference: string;
+  local: LocalLedgerRecord;
+  provider: SettlementRecord;
+  reason: string;
+}
+
+export interface ReconciliationSummary {
+  totalLocalCount: number;
+  totalProviderCount: number;
+  matchedCount: number;
+  discrepancyCount: number;
+  resolvedAmbiguousCount: number;
+  totalLocalAmount: number;
+  totalProviderAmount: number;
+  totalProviderFees: number;
+}
+
+export interface ReconciliationReport {
+  matched: ReconciliationMatch[];
+  statusMismatches: ReconciliationMismatch[];
+  amountMismatches: ReconciliationMismatch[];
+  missingOnProvider: LocalLedgerRecord[];
+  missingInLedger: SettlementRecord[];
+  summary: ReconciliationSummary;
+}
+
 export interface OmniPayoutConfig {
   /** Default HTTP request timeout in milliseconds across providers (default: 30000ms). */
   timeoutMs?: number;

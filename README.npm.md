@@ -362,6 +362,44 @@ const payoutEngine = new OmniPayoutEngine({
 
 ---
 
+### 11. Two-Path Settlement Export & Reconciliation (`exportSettlements`, `reconcileBatch`, `formatSettlementsCsv`)
+
+To make automated payouts auditable ("two paths, same numbers"), run a scheduled job that independently exports settlements directly from your providers and diffs them against your database ledger (including any `AMBIGUOUS` or `PENDING` payouts):
+
+```typescript
+// 1. Independently pull settlements for a date window from one or all configured rails
+const providerRecords = await payoutEngine.exportSettlements({
+  from: new Date('2026-11-26T00:00:00Z'),
+  to: new Date('2026-11-26T23:59:59Z'),
+  // rail: 'FLUTTERWAVE', // optional: filter to a single provider
+  // stripeAccountId: 'acct_...', // optional: export Stripe connected-account payouts
+});
+
+// 2. Compare your local ledger (including AMBIGUOUS payouts) against the provider export
+const report = payoutEngine.reconcileBatch(
+  [
+    { reference: 'PAY-US-001', amount: 150, currency: 'USD', status: 'SUCCESSFUL' },
+    { reference: 'PAY-NG-002', amount: 45000, currency: 'NGN', status: 'AMBIGUOUS' },
+  ],
+  providerRecords
+);
+
+console.log(report.summary);
+// {
+//   totalLocalCount, totalProviderCount, matchedCount, discrepancyCount,
+//   resolvedAmbiguousCount, totalLocalAmount, totalProviderAmount, totalProviderFees
+// }
+console.log('Status / AMBIGUOUS diffs:', report.statusMismatches);
+console.log('Amount mismatches:', report.amountMismatches);
+console.log('Missing on provider:', report.missingOnProvider);
+console.log('Paid by provider but missing in local DB:', report.missingInLedger);
+
+// 3. Export RFC 4180 CSV (with spreadsheet formula-injection protection) for accounting
+const csv = payoutEngine.formatSettlementsCsv(providerRecords);
+```
+
+---
+
 ## License
 
 MIT © [Peter Chukwu](https://github.com/peterchijioke)

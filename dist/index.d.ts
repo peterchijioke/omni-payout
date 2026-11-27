@@ -199,6 +199,62 @@ interface OnboardingLinkResult {
     url: string;
     expiresAt?: Date;
 }
+interface SettlementExportParams {
+    /** Omit to export concurrently across all configured rails that support bulk listing. */
+    rail?: PayoutRail;
+    from: Date;
+    to: Date;
+    limit?: number;
+    /** Optional Stripe connected account ID to export `/v1/payouts` instead of platform `/v1/transfers`. */
+    stripeAccountId?: string;
+}
+interface SettlementRecord {
+    rail: PayoutRail;
+    transactionId: string;
+    reference: string;
+    status: PayoutStatus;
+    providerStatus?: string;
+    amount: number;
+    currency: string;
+    fee?: number;
+    createdAt?: Date;
+}
+interface LocalLedgerRecord {
+    reference: string;
+    rail?: PayoutRail;
+    amount: number;
+    currency: string;
+    status: PayoutStatus | 'AMBIGUOUS';
+    transactionId?: string;
+}
+interface ReconciliationMatch {
+    local: LocalLedgerRecord;
+    provider: SettlementRecord;
+}
+interface ReconciliationMismatch {
+    reference: string;
+    local: LocalLedgerRecord;
+    provider: SettlementRecord;
+    reason: string;
+}
+interface ReconciliationSummary {
+    totalLocalCount: number;
+    totalProviderCount: number;
+    matchedCount: number;
+    discrepancyCount: number;
+    resolvedAmbiguousCount: number;
+    totalLocalAmount: number;
+    totalProviderAmount: number;
+    totalProviderFees: number;
+}
+interface ReconciliationReport {
+    matched: ReconciliationMatch[];
+    statusMismatches: ReconciliationMismatch[];
+    amountMismatches: ReconciliationMismatch[];
+    missingOnProvider: LocalLedgerRecord[];
+    missingInLedger: SettlementRecord[];
+    summary: ReconciliationSummary;
+}
 interface OmniPayoutConfig {
     /** Default HTTP request timeout in milliseconds across providers (default: 30000ms). */
     timeoutMs?: number;
@@ -345,6 +401,17 @@ declare function encryptMpesaInitiatorPassword(initiatorPassword: string, certif
 declare function matchAccountNames(expectedName: string, resolvedName: string, threshold?: number): NameMatchResult;
 declare function canTransitionStatus(currentStatus: PayoutStatus | undefined | null, nextStatus: PayoutStatus, allowReversal?: boolean): boolean;
 declare function resolveProviderCode(code: string, currency: string, rail: PayoutRail, isMobileMoney?: boolean): string;
+/**
+ * Pure, stateless two-path reconciliation diff engine ("two paths, same numbers").
+ * Compares your application's local ledger (including AMBIGUOUS / PENDING payouts)
+ * against an independent per-provider settlement export.
+ */
+declare function reconcileBatch(localRecords: LocalLedgerRecord[], providerRecords: SettlementRecord[]): ReconciliationReport;
+/**
+ * Formats normalized SettlementRecords as an RFC 4180 CSV string for accounting & audit imports,
+ * with automatic spreadsheet formula-injection neutralization.
+ */
+declare function formatSettlementsCsv(records: SettlementRecord[]): string;
 
 declare class RailHealthTracker {
     private readonly failureThreshold;
@@ -372,6 +439,7 @@ declare class StripeConnectAdapter {
     getPayoutStatus(transactionId: string, stripeAccountId?: string, reference?: string): Promise<DisburseResult>;
     createOnboardingLink(params: OnboardingLinkParams): Promise<OnboardingLinkResult>;
     getBalances(): Promise<RailBalance[]>;
+    exportSettlements(params: SettlementExportParams): Promise<SettlementRecord[]>;
     verifyWebhook(rawBody: string, signatureHeader: string): WebhookEvent;
 }
 
@@ -383,6 +451,7 @@ declare class FlutterwaveAdapter {
     disburse(params: DisburseParams): Promise<DisburseResult>;
     getPayoutStatus(transactionId: string, reference?: string): Promise<DisburseResult>;
     getBalances(): Promise<RailBalance[]>;
+    exportSettlements(params: SettlementExportParams): Promise<SettlementRecord[]>;
     verifyWebhook(rawBody: string, verifHash: string): WebhookEvent;
 }
 
@@ -394,6 +463,7 @@ declare class PaystackAdapter {
     disburse(params: DisburseParams): Promise<DisburseResult>;
     getPayoutStatus(transactionId: string, reference?: string): Promise<DisburseResult>;
     getBalances(): Promise<RailBalance[]>;
+    exportSettlements(params: SettlementExportParams): Promise<SettlementRecord[]>;
     verifyWebhook(rawBody: string, signature: string): WebhookEvent;
 }
 
@@ -415,6 +485,7 @@ declare class YellowCardAdapter {
     disburse(params: DisburseParams): Promise<DisburseResult>;
     getPayoutStatus(transactionId: string, reference?: string): Promise<DisburseResult>;
     getBalances(): Promise<RailBalance[]>;
+    exportSettlements(params: SettlementExportParams): Promise<SettlementRecord[]>;
     verifyWebhook(rawBody: string, signature: string): WebhookEvent;
 }
 
@@ -507,6 +578,20 @@ declare class OmniPayoutEngine {
     canTransitionStatus(currentStatus: PayoutStatus | undefined | null, nextStatus: PayoutStatus, allowReversal?: boolean): boolean;
     resolveBankAccount(bankCode: string, accountNumber: string, rail?: 'FLUTTERWAVE' | 'PAYSTACK', currency?: string): Promise<BankResolutionResult>;
     createConnectOnboardingLink(params: OnboardingLinkParams): Promise<OnboardingLinkResult>;
+    /**
+     * Independently exports settled/pending payout records directly from a provider (or all configured
+     * bulk-exportable providers) for a date range — enabling "two paths, same numbers" auditing.
+     */
+    exportSettlements(params: SettlementExportParams): Promise<SettlementRecord[]>;
+    /**
+     * Pure two-path reconciliation diff comparing your local ledger (including AMBIGUOUS payouts)
+     * against an independent provider settlement export.
+     */
+    reconcileBatch(localRecords: LocalLedgerRecord[], providerRecords: SettlementRecord[]): ReconciliationReport;
+    /**
+     * Exports normalized SettlementRecords as a formula-injection-safe RFC 4180 CSV for accounting.
+     */
+    formatSettlementsCsv(records: SettlementRecord[]): string;
 }
 
-export { type BankAccountDetails, type BankResolutionResult, CURRENCY_COUNTRIES, type CircuitState, type DisburseParams, type DisburseResult, FlutterwaveAdapter, type HealthConfig, type IdempotencyRecord, type IdempotencyState, type IdempotencyStore, InMemoryIdempotencyStore, InMemoryWebhookStore, type MobileMoneyDetails, MpesaDarajaAdapter, type MpesaDarajaConfig, type NameMatchResult, type OmniPayoutConfig, OmniPayoutEngine, type OnboardingLinkParams, type OnboardingLinkResult, PawaPayAdapter, PayoutAmbiguousError, type PayoutErrorCode, PayoutProviderError, type PayoutRail, type PayoutSpeed, type PayoutStatus, type PayoutStatusParams, type PayoutTelemetryEvent, PaystackAdapter, type ProviderFeeRule, type RailBalance, type RailHealth, RailHealthTracker, type RailLimit, type ReconcileOptions, type RetryConfig, type RoutingRule, type RoutingStrategy, StripeConnectAdapter, type WebhookDeduplicationConfig, type WebhookEvent, type WebhookStore, YellowCardAdapter, canTransitionStatus, classifyProviderError, constantTimeHexEqual, constantTimeStringEqual, currencyExponent, encryptMpesaInitiatorPassword, fetchWithTimeout, fromMinorUnits, isHttpStatusAmbiguous, matchAccountNames, normalizeMsisdn, resolveProviderCode, sanitizeBaseUrl, sleepMs, toDeterministicUuid, toMinorUnits, validateDisburseInputs, validateSafeIdentifier, withRetry };
+export { type BankAccountDetails, type BankResolutionResult, CURRENCY_COUNTRIES, type CircuitState, type DisburseParams, type DisburseResult, FlutterwaveAdapter, type HealthConfig, type IdempotencyRecord, type IdempotencyState, type IdempotencyStore, InMemoryIdempotencyStore, InMemoryWebhookStore, type LocalLedgerRecord, type MobileMoneyDetails, MpesaDarajaAdapter, type MpesaDarajaConfig, type NameMatchResult, type OmniPayoutConfig, OmniPayoutEngine, type OnboardingLinkParams, type OnboardingLinkResult, PawaPayAdapter, PayoutAmbiguousError, type PayoutErrorCode, PayoutProviderError, type PayoutRail, type PayoutSpeed, type PayoutStatus, type PayoutStatusParams, type PayoutTelemetryEvent, PaystackAdapter, type ProviderFeeRule, type RailBalance, type RailHealth, RailHealthTracker, type RailLimit, type ReconcileOptions, type ReconciliationMatch, type ReconciliationMismatch, type ReconciliationReport, type ReconciliationSummary, type RetryConfig, type RoutingRule, type RoutingStrategy, type SettlementExportParams, type SettlementRecord, StripeConnectAdapter, type WebhookDeduplicationConfig, type WebhookEvent, type WebhookStore, YellowCardAdapter, canTransitionStatus, classifyProviderError, constantTimeHexEqual, constantTimeStringEqual, currencyExponent, encryptMpesaInitiatorPassword, fetchWithTimeout, formatSettlementsCsv, fromMinorUnits, isHttpStatusAmbiguous, matchAccountNames, normalizeMsisdn, reconcileBatch, resolveProviderCode, sanitizeBaseUrl, sleepMs, toDeterministicUuid, toMinorUnits, validateDisburseInputs, validateSafeIdentifier, withRetry };

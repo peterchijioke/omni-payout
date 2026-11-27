@@ -6,6 +6,8 @@ import {
   OnboardingLinkResult,
   PayoutStatus,
   RailBalance,
+  SettlementExportParams,
+  SettlementRecord,
   WebhookEvent,
 } from '../types';
 import {
@@ -246,6 +248,36 @@ export class StripeConnectAdapter {
     }
 
     return Array.from(byCurrency.values());
+  }
+
+  async exportSettlements(params: SettlementExportParams): Promise<SettlementRecord[]> {
+    const query = new URLSearchParams({
+      'created[gte]': String(Math.floor(params.from.getTime() / 1000)),
+      'created[lte]': String(Math.floor(params.to.getTime() / 1000)),
+      limit: String(Math.min(Math.max(params.limit ?? 100, 1), 100)),
+    });
+    const isPayouts = Boolean(params.stripeAccountId);
+    const endpoint = isPayouts ? `/payouts?${query.toString()}` : `/transfers?${query.toString()}`;
+    const headers: Record<string, string> = isPayouts
+      ? { 'Stripe-Account': params.stripeAccountId! }
+      : {};
+
+    const res = await this.request(endpoint, { method: 'GET', headers });
+    const rows = Array.isArray(res.data) ? res.data : [];
+    return rows.map((row: any) => {
+      const currency = String(row.currency || 'USD').toUpperCase();
+      return {
+        rail: 'STRIPE_CONNECT' as const,
+        transactionId: String(row.id || ''),
+        reference: String(row.metadata?.reference || row.id || ''),
+        status: normalizeStripeStatus(row.status, isPayouts ? 'PENDING' : 'SUCCESSFUL'),
+        providerStatus: row.status,
+        amount: typeof row.amount === 'number' ? fromMinorUnits(row.amount, currency) : 0,
+        currency,
+        fee: typeof row.fee === 'number' ? fromMinorUnits(row.fee, currency) : undefined,
+        createdAt: typeof row.created === 'number' ? new Date(row.created * 1000) : undefined,
+      };
+    });
   }
 
   verifyWebhook(rawBody: string, signatureHeader: string): WebhookEvent {

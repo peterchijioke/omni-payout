@@ -936,3 +936,59 @@ func TestMultiInstanceAmbiguousPersistenceAndRoutingStrategy(t *testing.T) {
 		t.Fatalf("expected 0 Paystack calls across both pods, got %d", psCalls.Load())
 	}
 }
+
+func TestExportSettlementsReconcileBatchAndCSV(t *testing.T) {
+	engine := NewEngine(Config{
+		StripeSecretKey:      "sk_test_mock",
+		FlutterwaveSecretKey: "flw_mock",
+		PaystackSecretKey:    "ps_mock",
+	})
+
+	engine.httpClient = &http.Client{
+		Transport: roundTripFunc(func(req *http.Request) *http.Response {
+			switch req.URL.Host {
+			case "api.stripe.com":
+				return &http.Response{
+					StatusCode: 200,
+					Body:       io.NopCloser(bytes.NewBufferString(`{"data":[{"id":"tr_exp_1","amount":15000,"currency":"usd","created":1732665600,"metadata":{"reference":"PAY-US-1"}}]}`)),
+					Header:     make(http.Header),
+				}
+			case "api.flutterwave.com":
+				return &http.Response{
+					StatusCode: 200,
+					Body:       io.NopCloser(bytes.NewBufferString(`{"status":"success","data":[{"id":901,"reference":"PAY-NG-AMB","status":"SUCCESSFUL","amount":45000,"currency":"NGN","fee":10.75,"created_at":"2026-11-26T10:00:00Z"},{"id":902,"reference":"PAY-NG-UNRECORDED","status":"SUCCESSFUL","amount":12000,"currency":"NGN","fee":10.75,"created_at":"2026-11-26T10:05:00Z"}]}`)),
+					Header:     make(http.Header),
+				}
+			default:
+				return &http.Response{
+					StatusCode: 200,
+					Body:       io.NopCloser(bytes.NewBufferString(`{"status":true,"data":[{"transfer_code":"TRF_exp_1","reference":"=PAY-PS-AMT","status":"success","amount":3000000,"fee":2688,"currency":"NGN","createdAt":"2026-11-26T10:10:00Z"}]}`)),
+					Header:     make(http.Header),
+				}
+			}
+		}),
+	}
+
+	from := time.Date(2026, 11, 26, 0, 0, 0, 0, time.UTC)
+	to := time.Date(2026, 11, 26, 23, 59, 59, 0, time.UTC)
+	exported, err := engine.ExportSettlements(SettlementExportParams{From: from, To: to})
+	if err != nil || len(exported) != 4 {
+		t.Fatalf("expected 4 exported settlement records, got %d err=%v", len(exported), err)
+	}
+
+	report := engine.ReconcileBatch([]LocalLedgerRecord{
+		{Reference: "PAY-US-1", Amount: 150, Currency: "USD", Status: string(StatusSuccessful)},
+		{Reference: "PAY-NG-AMB", Amount: 45000, Currency: "NGN", Status: string(IdempotencyAmbiguous)},
+		{Reference: "=PAY-PS-AMT", Amount: 25000, Currency: "NGN", Status: string(StatusSuccessful)},
+		{Reference: "PAY-MISSING-ON-PROV", Amount: 5000, Currency: "NGN", Status: string(StatusPending)},
+	}, exported)
+
+	if report.Summary.MatchedCount != 1 || report.Summary.ResolvedAmbiguousCount != 1 || len(report.StatusMismatches) != 1 || len(report.AmountMismatches) != 1 || len(report.MissingOnProvider) != 1 || len(report.MissingInLedger) != 1 {
+		t.Fatalf("unexpected reconciliation report: %+v", report)
+	}
+
+	csvOut := engine.FormatSettlementsCSV(exported)
+	if !strings.HasPrefix(csvOut, "rail,transactionId,reference,status,providerStatus,amount,currency,fee,createdAt\n") || !strings.Contains(csvOut, "'=PAY-PS-AMT") {
+		t.Fatalf("unexpected CSV export output: %s", csvOut)
+	}
+}

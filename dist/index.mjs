@@ -443,6 +443,111 @@ function resolveProviderCode(code, currency, rail, isMobileMoney = false) {
   const mapped = CROSS_RAIL_BANK_CODES[compositeKey]?.[rail];
   return mapped || code.trim();
 }
+function reconcileBatch(localRecords, providerRecords) {
+  const providerByRef = /* @__PURE__ */ new Map();
+  let totalProviderAmount = 0;
+  let totalProviderFees = 0;
+  for (const p of providerRecords) {
+    const ref = (p.reference || p.transactionId || "").trim();
+    if (ref) providerByRef.set(ref, p);
+    totalProviderAmount += p.amount || 0;
+    totalProviderFees += p.fee || 0;
+  }
+  const matched = [];
+  const statusMismatches = [];
+  const amountMismatches = [];
+  const missingOnProvider = [];
+  const seenProviderRefs = /* @__PURE__ */ new Set();
+  let totalLocalAmount = 0;
+  let resolvedAmbiguousCount = 0;
+  for (const local of localRecords) {
+    const ref = local.reference.trim();
+    totalLocalAmount += local.amount || 0;
+    const provider = providerByRef.get(ref);
+    if (!provider) {
+      missingOnProvider.push(local);
+      continue;
+    }
+    seenProviderRefs.add(ref);
+    const localCur = local.currency.toUpperCase();
+    const provCur = provider.currency.toUpperCase();
+    const amountDiff = Math.abs(local.amount - provider.amount) > 0.01 || localCur && provCur && localCur !== provCur;
+    const statusDiff = local.status !== provider.status;
+    if (local.status === "AMBIGUOUS") {
+      resolvedAmbiguousCount++;
+    }
+    if (amountDiff) {
+      amountMismatches.push({
+        reference: ref,
+        local,
+        provider,
+        reason: `Local ${local.amount} ${localCur} != provider ${provider.amount} ${provCur}`
+      });
+    } else if (statusDiff) {
+      statusMismatches.push({
+        reference: ref,
+        local,
+        provider,
+        reason: local.status === "AMBIGUOUS" ? `Resolved AMBIGUOUS payout: provider status is ${provider.status}` : `Local status ${local.status} != provider status ${provider.status}`
+      });
+    } else {
+      matched.push({ local, provider });
+    }
+  }
+  const missingInLedger = [];
+  for (const p of providerRecords) {
+    const ref = (p.reference || p.transactionId || "").trim();
+    if (!seenProviderRefs.has(ref)) {
+      missingInLedger.push(p);
+    }
+  }
+  const discrepancyCount = statusMismatches.length + amountMismatches.length + missingOnProvider.length + missingInLedger.length;
+  return {
+    matched,
+    statusMismatches,
+    amountMismatches,
+    missingOnProvider,
+    missingInLedger,
+    summary: {
+      totalLocalCount: localRecords.length,
+      totalProviderCount: providerRecords.length,
+      matchedCount: matched.length,
+      discrepancyCount,
+      resolvedAmbiguousCount,
+      totalLocalAmount: Number(totalLocalAmount.toFixed(2)),
+      totalProviderAmount: Number(totalProviderAmount.toFixed(2)),
+      totalProviderFees: Number(totalProviderFees.toFixed(2))
+    }
+  };
+}
+function escapeCsvField(val) {
+  if (val === void 0 || val === null) return "";
+  let str = String(val);
+  if (/^[=+\-@\t\r]/.test(str)) {
+    str = `'${str}`;
+  }
+  if (/[",\n\r]/.test(str)) {
+    return `"${str.replace(/"/g, '""')}"`;
+  }
+  return str;
+}
+function formatSettlementsCsv(records) {
+  const header = "rail,transactionId,reference,status,providerStatus,amount,currency,fee,createdAt";
+  const rows = records.map(
+    (r) => [
+      escapeCsvField(r.rail),
+      escapeCsvField(r.transactionId),
+      escapeCsvField(r.reference),
+      escapeCsvField(r.status),
+      escapeCsvField(r.providerStatus ?? ""),
+      escapeCsvField(r.amount),
+      escapeCsvField(r.currency),
+      escapeCsvField(r.fee ?? ""),
+      escapeCsvField(r.createdAt ? r.createdAt.toISOString() : "")
+    ].join(",")
+  );
+  return [header, ...rows].join("\n");
+}
 
 // src/health.ts
 var RailHealthTracker = class {
@@ -763,6 +868,32 @@ var StripeConnectAdapter = class {
     }
     return Array.from(byCurrency.values());
   }
+  async exportSettlements(params) {
+    const query = new URLSearchParams({
+      "created[gte]": String(Math.floor(params.from.getTime() / 1e3)),
+      "created[lte]": String(Math.floor(params.to.getTime() / 1e3)),
+      limit: String(Math.min(Math.max(params.limit ?? 100, 1), 100))
+    });
+    const isPayouts = Boolean(params.stripeAccountId);
+    const endpoint = isPayouts ? `/payouts?${query.toString()}` : `/transfers?${query.toString()}`;
+    const headers = isPayouts ? { "Stripe-Account": params.stripeAccountId } : {};
+    const res = await this.request(endpoint, { method: "GET", headers });
+    const rows = Array.isArray(res.data) ? res.data : [];
+    return rows.map((row) => {
+      const currency = String(row.currency || "USD").toUpperCase();
+      return {
+        rail: "STRIPE_CONNECT",
+        transactionId: String(row.id || ""),
+        reference: String(row.metadata?.reference || row.id || ""),
+        status: normalizeStripeStatus(row.status, isPayouts ? "PENDING" : "SUCCESSFUL"),
+        providerStatus: row.status,
+        amount: typeof row.amount === "number" ? fromMinorUnits(row.amount, currency) : 0,
+        currency,
+        fee: typeof row.fee === "number" ? fromMinorUnits(row.fee, currency) : void 0,
+        createdAt: typeof row.created === "number" ? new Date(row.created * 1e3) : void 0
+      };
+    });
+  }
   verifyWebhook(rawBody, signatureHeader) {
     if (!this.#webhookSecret) {
       throw new Error("Stripe webhookSecret is required to verify webhooks");
@@ -962,6 +1093,25 @@ var FlutterwaveAdapter = class {
       pending: row.ledger_balance !== void 0 ? Number(row.ledger_balance) - Number(row.available_balance || 0) : void 0
     }));
   }
+  async exportSettlements(params) {
+    const query = new URLSearchParams({
+      from: params.from.toISOString().slice(0, 10),
+      to: params.to.toISOString().slice(0, 10)
+    });
+    const res = await this.request(`/transfers?${query.toString()}`, { method: "GET" });
+    const rows = Array.isArray(res.data) ? res.data : [];
+    return rows.map((row) => ({
+      rail: "FLUTTERWAVE",
+      transactionId: String(row.id || ""),
+      reference: String(row.reference || row.id || ""),
+      status: normalizeFlutterwaveStatus(row.status),
+      providerStatus: row.status,
+      amount: Number(row.amount || 0),
+      currency: String(row.currency || "").toUpperCase(),
+      fee: row.fee !== void 0 ? Number(row.fee) : void 0,
+      createdAt: row.created_at ? new Date(row.created_at) : void 0
+    }));
+  }
   verifyWebhook(rawBody, verifHash) {
     if (!this.#webhookSecret) {
       throw new Error("Flutterwave webhookSecret is required to verify webhooks");
@@ -1149,6 +1299,29 @@ var PaystackAdapter = class {
         rail: "PAYSTACK",
         currency,
         available: typeof row.balance === "number" ? fromMinorUnits(row.balance, currency) : 0
+      };
+    });
+  }
+  async exportSettlements(params) {
+    const query = new URLSearchParams({
+      from: params.from.toISOString(),
+      to: params.to.toISOString(),
+      perPage: String(Math.min(Math.max(params.limit ?? 100, 1), 100))
+    });
+    const res = await this.request(`/transfer?${query.toString()}`, { method: "GET" });
+    const rows = Array.isArray(res.data) ? res.data : [];
+    return rows.map((row) => {
+      const currency = String(row.currency || "NGN").toUpperCase();
+      return {
+        rail: "PAYSTACK",
+        transactionId: String(row.transfer_code || row.id || ""),
+        reference: String(row.reference || row.transfer_code || row.id || ""),
+        status: normalizePaystackStatus(row.status),
+        providerStatus: row.status,
+        amount: typeof row.amount === "number" ? fromMinorUnits(row.amount, currency) : 0,
+        currency,
+        fee: typeof row.fee === "number" ? fromMinorUnits(row.fee, currency) : void 0,
+        createdAt: row.createdAt ? new Date(row.createdAt) : void 0
       };
     });
   }
@@ -1499,6 +1672,25 @@ var YellowCardAdapter = class {
       currency: String(row.currency || row.code || "").toUpperCase(),
       available: Number(row.availableBalance ?? row.balance ?? 0),
       pending: row.pendingBalance !== void 0 ? Number(row.pendingBalance) : void 0
+    }));
+  }
+  async exportSettlements(params) {
+    const query = new URLSearchParams({
+      startDate: params.from.toISOString(),
+      endDate: params.to.toISOString()
+    });
+    const res = await this.request(`/business/payments?${query.toString()}`, "GET");
+    const rows = Array.isArray(res.payments) ? res.payments : Array.isArray(res.data) ? res.data : Array.isArray(res) ? res : [];
+    return rows.map((row) => ({
+      rail: "YELLOW_CARD",
+      transactionId: String(row.id || ""),
+      reference: String(row.sequenceId || row.reference || row.id || ""),
+      status: normalizeYellowCardStatus(row.status),
+      providerStatus: row.status,
+      amount: Number(row.localAmount ?? row.amount ?? 0),
+      currency: String(row.currency || "").toUpperCase(),
+      fee: row.fee !== void 0 ? Number(row.fee) : row.serviceFee !== void 0 ? Number(row.serviceFee) : void 0,
+      createdAt: row.createdAt ? new Date(row.createdAt) : void 0
     }));
   }
   verifyWebhook(rawBody, signature) {
@@ -2565,6 +2757,63 @@ var OmniPayoutEngine = class {
     }
     return this.#stripe.createOnboardingLink(params);
   }
+  /**
+   * Independently exports settled/pending payout records directly from a provider (or all configured
+   * bulk-exportable providers) for a date range — enabling "two paths, same numbers" auditing.
+   */
+  async exportSettlements(params) {
+    if (!(params.from instanceof Date) || !(params.to instanceof Date) || params.from > params.to) {
+      throw new Error("Valid from and to Date bounds (from <= to) are required for settlement export");
+    }
+    const fetchForRail = async (rail) => withRetry(async () => {
+      if (rail === "STRIPE_CONNECT") {
+        if (!this.#stripe) throw new Error("Stripe Connect provider is not configured");
+        return this.#stripe.exportSettlements(params);
+      }
+      if (rail === "FLUTTERWAVE") {
+        if (!this.#flutterwave) throw new Error("Flutterwave provider is not configured");
+        return this.#flutterwave.exportSettlements(params);
+      }
+      if (rail === "PAYSTACK") {
+        if (!this.#paystack) throw new Error("Paystack provider is not configured");
+        return this.#paystack.exportSettlements(params);
+      }
+      if (rail === "YELLOW_CARD") {
+        if (!this.#yellowCard) throw new Error("Yellow Card provider is not configured");
+        return this.#yellowCard.exportSettlements(params);
+      }
+      throw new PayoutProviderError({
+        message: `Bulk settlement export is not supported directly by ${rail}; reconcile individual references via getPayoutStatus()`,
+        rail,
+        code: "PROVIDER_ERROR",
+        isAmbiguous: false,
+        retryable: false
+      });
+    }, this.#retryConfig);
+    if (params.rail) {
+      return fetchForRail(params.rail);
+    }
+    const exportable = [];
+    if (this.#stripe) exportable.push("STRIPE_CONNECT");
+    if (this.#flutterwave) exportable.push("FLUTTERWAVE");
+    if (this.#paystack) exportable.push("PAYSTACK");
+    if (this.#yellowCard) exportable.push("YELLOW_CARD");
+    const batches = await Promise.all(exportable.map((r) => fetchForRail(r)));
+    return batches.flat();
+  }
+  /**
+   * Pure two-path reconciliation diff comparing your local ledger (including AMBIGUOUS payouts)
+   * against an independent provider settlement export.
+   */
+  reconcileBatch(localRecords, providerRecords) {
+    return reconcileBatch(localRecords, providerRecords);
+  }
+  /**
+   * Exports normalized SettlementRecords as a formula-injection-safe RFC 4180 CSV for accounting.
+   */
+  formatSettlementsCsv(records) {
+    return formatSettlementsCsv(records);
+  }
 };
 export {
   CURRENCY_COUNTRIES,
@@ -2587,10 +2836,12 @@ export {
   currencyExponent,
   encryptMpesaInitiatorPassword,
   fetchWithTimeout,
+  formatSettlementsCsv,
   fromMinorUnits,
   isHttpStatusAmbiguous,
   matchAccountNames,
   normalizeMsisdn,
+  reconcileBatch,
   resolveProviderCode,
   sanitizeBaseUrl,
   sleepMs,

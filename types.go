@@ -291,6 +291,74 @@ type OnboardingLinkResult struct {
 	ExpiresAt *time.Time `json:"expiresAt,omitempty"`
 }
 
+// SettlementExportParams configures a per-provider or multi-rail settlement export date range.
+type SettlementExportParams struct {
+	Rail            PayoutRail `json:"rail,omitempty"`
+	From            time.Time  `json:"from"`
+	To              time.Time  `json:"to"`
+	Limit           int        `json:"limit,omitempty"`
+	StripeAccountID string     `json:"stripeAccountId,omitempty"`
+}
+
+// SettlementRecord is a normalized payout/transfer row exported directly from a provider.
+type SettlementRecord struct {
+	Rail           PayoutRail `json:"rail"`
+	TransactionID  string     `json:"transactionId"`
+	Reference      string     `json:"reference"`
+	Status         string     `json:"status"`
+	ProviderStatus string     `json:"providerStatus,omitempty"`
+	Amount         float64    `json:"amount"`
+	Currency       string     `json:"currency"`
+	Fee            float64    `json:"fee,omitempty"`
+	CreatedAt      *time.Time `json:"createdAt,omitempty"`
+}
+
+// LocalLedgerRecord represents your application's local payout record (including AMBIGUOUS or PENDING states).
+type LocalLedgerRecord struct {
+	Reference     string     `json:"reference"`
+	Rail          PayoutRail `json:"rail,omitempty"`
+	Amount        float64    `json:"amount"`
+	Currency      string     `json:"currency"`
+	Status        string     `json:"status"` // "PENDING", "SUCCESSFUL", "FAILED", or "AMBIGUOUS"
+	TransactionID string     `json:"transactionId,omitempty"`
+}
+
+// ReconciliationMatch pairs a matching local record and provider settlement record.
+type ReconciliationMatch struct {
+	Local    LocalLedgerRecord `json:"local"`
+	Provider SettlementRecord  `json:"provider"`
+}
+
+// ReconciliationMismatch captures a status or amount discrepancy between local and provider paths.
+type ReconciliationMismatch struct {
+	Reference string            `json:"reference"`
+	Local     LocalLedgerRecord `json:"local"`
+	Provider  SettlementRecord  `json:"provider"`
+	Reason    string            `json:"reason"`
+}
+
+// ReconciliationSummary aggregates counts and totals for audit reporting.
+type ReconciliationSummary struct {
+	TotalLocalCount        int     `json:"totalLocalCount"`
+	TotalProviderCount     int     `json:"totalProviderCount"`
+	MatchedCount           int     `json:"matchedCount"`
+	DiscrepancyCount       int     `json:"discrepancyCount"`
+	ResolvedAmbiguousCount int     `json:"resolvedAmbiguousCount"`
+	TotalLocalAmount       float64 `json:"totalLocalAmount"`
+	TotalProviderAmount    float64 `json:"totalProviderAmount"`
+	TotalProviderFees      float64 `json:"totalProviderFees"`
+}
+
+// ReconciliationReport is the structured result of a two-path audit diff.
+type ReconciliationReport struct {
+	Matched           []ReconciliationMatch    `json:"matched"`
+	StatusMismatches  []ReconciliationMismatch `json:"statusMismatches"`
+	AmountMismatches  []ReconciliationMismatch `json:"amountMismatches"`
+	MissingOnProvider []LocalLedgerRecord      `json:"missingOnProvider"`
+	MissingInLedger   []SettlementRecord       `json:"missingInLedger"`
+	Summary           ReconciliationSummary    `json:"summary"`
+}
+
 // MpesaDarajaConfig provides Safaricom M-Pesa Daraja B2C credentials.
 type MpesaDarajaConfig struct {
 	ConsumerKey        string        `json:"-"`

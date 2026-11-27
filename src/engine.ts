@@ -10,7 +10,9 @@ import {
   PayoutAmbiguousError,
   PayoutProviderError,
   canTransitionStatus,
+  formatSettlementsCsv,
   matchAccountNames,
+  reconcileBatch,
   resolveProviderCode,
   sleepMs,
   toMinorUnits,
@@ -22,6 +24,7 @@ import {
   DisburseParams,
   DisburseResult,
   IdempotencyStore,
+  LocalLedgerRecord,
   NameMatchResult,
   OnboardingLinkParams,
   OnboardingLinkResult,
@@ -34,8 +37,11 @@ import {
   RailHealth,
   RailLimit,
   ReconcileOptions,
+  ReconciliationReport,
   RetryConfig,
   RoutingRule,
+  SettlementExportParams,
+  SettlementRecord,
   WebhookDeduplicationConfig,
   WebhookEvent,
   WebhookStore,
@@ -1000,5 +1006,73 @@ export class OmniPayoutEngine {
       throw new Error('Stripe Connect provider is not configured for onboarding links');
     }
     return this.#stripe.createOnboardingLink(params);
+  }
+
+  /**
+   * Independently exports settled/pending payout records directly from a provider (or all configured
+   * bulk-exportable providers) for a date range — enabling "two paths, same numbers" auditing.
+   */
+  async exportSettlements(params: SettlementExportParams): Promise<SettlementRecord[]> {
+    if (!(params.from instanceof Date) || !(params.to instanceof Date) || params.from > params.to) {
+      throw new Error('Valid from and to Date bounds (from <= to) are required for settlement export');
+    }
+
+    const fetchForRail = async (rail: PayoutRail): Promise<SettlementRecord[]> =>
+      withRetry(async () => {
+        if (rail === 'STRIPE_CONNECT') {
+          if (!this.#stripe) throw new Error('Stripe Connect provider is not configured');
+          return this.#stripe.exportSettlements(params);
+        }
+        if (rail === 'FLUTTERWAVE') {
+          if (!this.#flutterwave) throw new Error('Flutterwave provider is not configured');
+          return this.#flutterwave.exportSettlements(params);
+        }
+        if (rail === 'PAYSTACK') {
+          if (!this.#paystack) throw new Error('Paystack provider is not configured');
+          return this.#paystack.exportSettlements(params);
+        }
+        if (rail === 'YELLOW_CARD') {
+          if (!this.#yellowCard) throw new Error('Yellow Card provider is not configured');
+          return this.#yellowCard.exportSettlements(params);
+        }
+        throw new PayoutProviderError({
+          message: `Bulk settlement export is not supported directly by ${rail}; reconcile individual references via getPayoutStatus()`,
+          rail,
+          code: 'PROVIDER_ERROR',
+          isAmbiguous: false,
+          retryable: false,
+        });
+      }, this.#retryConfig);
+
+    if (params.rail) {
+      return fetchForRail(params.rail);
+    }
+
+    const exportable: PayoutRail[] = [];
+    if (this.#stripe) exportable.push('STRIPE_CONNECT');
+    if (this.#flutterwave) exportable.push('FLUTTERWAVE');
+    if (this.#paystack) exportable.push('PAYSTACK');
+    if (this.#yellowCard) exportable.push('YELLOW_CARD');
+
+    const batches = await Promise.all(exportable.map((r) => fetchForRail(r)));
+    return batches.flat();
+  }
+
+  /**
+   * Pure two-path reconciliation diff comparing your local ledger (including AMBIGUOUS payouts)
+   * against an independent provider settlement export.
+   */
+  reconcileBatch(
+    localRecords: LocalLedgerRecord[],
+    providerRecords: SettlementRecord[]
+  ): ReconciliationReport {
+    return reconcileBatch(localRecords, providerRecords);
+  }
+
+  /**
+   * Exports normalized SettlementRecords as a formula-injection-safe RFC 4180 CSV for accounting.
+   */
+  formatSettlementsCsv(records: SettlementRecord[]): string {
+    return formatSettlementsCsv(records);
   }
 }

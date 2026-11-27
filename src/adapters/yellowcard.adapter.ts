@@ -1,5 +1,13 @@
 import crypto from 'crypto';
-import { DisburseParams, DisburseResult, PayoutStatus, RailBalance, WebhookEvent } from '../types';
+import {
+  DisburseParams,
+  DisburseResult,
+  PayoutStatus,
+  RailBalance,
+  SettlementExportParams,
+  SettlementRecord,
+  WebhookEvent,
+} from '../types';
 import {
   PayoutProviderError,
   constantTimeStringEqual,
@@ -200,6 +208,26 @@ export class YellowCardAdapter {
         available: Number(row.availableBalance ?? row.balance ?? 0),
         pending: row.pendingBalance !== undefined ? Number(row.pendingBalance) : undefined,
       }));
+  }
+
+  async exportSettlements(params: SettlementExportParams): Promise<SettlementRecord[]> {
+    const query = new URLSearchParams({
+      startDate: params.from.toISOString(),
+      endDate: params.to.toISOString(),
+    });
+    const res = await this.request(`/business/payments?${query.toString()}`, 'GET');
+    const rows = Array.isArray(res.payments) ? res.payments : Array.isArray(res.data) ? res.data : Array.isArray(res) ? res : [];
+    return rows.map((row: any) => ({
+      rail: 'YELLOW_CARD' as const,
+      transactionId: String(row.id || ''),
+      reference: String(row.sequenceId || row.reference || row.id || ''),
+      status: normalizeYellowCardStatus(row.status),
+      providerStatus: row.status,
+      amount: Number(row.localAmount ?? row.amount ?? 0),
+      currency: String(row.currency || '').toUpperCase(),
+      fee: row.fee !== undefined ? Number(row.fee) : row.serviceFee !== undefined ? Number(row.serviceFee) : undefined,
+      createdAt: row.createdAt ? new Date(row.createdAt) : undefined,
+    }));
   }
 
   verifyWebhook(rawBody: string, signature: string): WebhookEvent {

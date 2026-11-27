@@ -5,6 +5,8 @@ import {
   DisburseResult,
   PayoutStatus,
   RailBalance,
+  SettlementExportParams,
+  SettlementRecord,
   WebhookEvent,
 } from '../types';
 import {
@@ -211,6 +213,30 @@ export class PaystackAdapter {
         rail: 'PAYSTACK' as const,
         currency,
         available: typeof row.balance === 'number' ? fromMinorUnits(row.balance, currency) : 0,
+      };
+    });
+  }
+
+  async exportSettlements(params: SettlementExportParams): Promise<SettlementRecord[]> {
+    const query = new URLSearchParams({
+      from: params.from.toISOString(),
+      to: params.to.toISOString(),
+      perPage: String(Math.min(Math.max(params.limit ?? 100, 1), 100)),
+    });
+    const res = await this.request(`/transfer?${query.toString()}`, { method: 'GET' });
+    const rows = Array.isArray(res.data) ? res.data : [];
+    return rows.map((row: any) => {
+      const currency = String(row.currency || 'NGN').toUpperCase();
+      return {
+        rail: 'PAYSTACK' as const,
+        transactionId: String(row.transfer_code || row.id || ''),
+        reference: String(row.reference || row.transfer_code || row.id || ''),
+        status: normalizePaystackStatus(row.status),
+        providerStatus: row.status,
+        amount: typeof row.amount === 'number' ? fromMinorUnits(row.amount, currency) : 0,
+        currency,
+        fee: typeof row.fee === 'number' ? fromMinorUnits(row.fee, currency) : undefined,
+        createdAt: row.createdAt ? new Date(row.createdAt) : undefined,
       };
     });
   }

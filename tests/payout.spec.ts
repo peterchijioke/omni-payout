@@ -1173,5 +1173,107 @@ describe('OmniPayoutEngine', () => {
       await expect(podB.disburse(params)).rejects.toThrow('Failover halted');
       expect(psCalls).toBe(0);
     });
+
+    it('exports per-provider settlements, reconciles AMBIGUOUS & mismatched ledger rows, and generates safe accounting CSV', async () => {
+      global.fetch = jest.fn().mockImplementation(async (url: string) => {
+        if (url.includes('api.stripe.com/v1/transfers')) {
+          return {
+            ok: true,
+            status: 200,
+            json: async () => ({
+              data: [
+                {
+                  id: 'tr_exp_1',
+                  amount: 15000,
+                  currency: 'usd',
+                  created: 1732665600,
+                  metadata: { reference: 'PAY-US-1' },
+                },
+              ],
+            }),
+          };
+        }
+        if (url.includes('api.flutterwave.com/v3/transfers')) {
+          return {
+            ok: true,
+            status: 200,
+            json: async () => ({
+              status: 'success',
+              data: [
+                {
+                  id: 901,
+                  reference: 'PAY-NG-AMB',
+                  status: 'SUCCESSFUL',
+                  amount: 45000,
+                  currency: 'NGN',
+                  fee: 10.75,
+                  created_at: '2026-11-26T10:00:00Z',
+                },
+                {
+                  id: 902,
+                  reference: 'PAY-NG-UNRECORDED',
+                  status: 'SUCCESSFUL',
+                  amount: 12000,
+                  currency: 'NGN',
+                  fee: 10.75,
+                  created_at: '2026-11-26T10:05:00Z',
+                },
+              ],
+            }),
+          };
+        }
+        return {
+          ok: true,
+          status: 200,
+          json: async () => ({
+            status: true,
+            data: [
+              {
+                transfer_code: 'TRF_exp_1',
+                reference: '=PAY-PS-AMT',
+                status: 'success',
+                amount: 3000000,
+                fee: 2688,
+                currency: 'NGN',
+                createdAt: '2026-11-26T10:10:00Z',
+              },
+            ],
+          }),
+        };
+      });
+
+      const exported = await engine.exportSettlements({
+        from: new Date('2026-11-26T00:00:00Z'),
+        to: new Date('2026-11-26T23:59:59Z'),
+      });
+      expect(exported).toHaveLength(4);
+
+      const report = engine.reconcileBatch(
+        [
+          { reference: 'PAY-US-1', amount: 150, currency: 'USD', status: 'SUCCESSFUL' },
+          { reference: 'PAY-NG-AMB', amount: 45000, currency: 'NGN', status: 'AMBIGUOUS' },
+          { reference: '=PAY-PS-AMT', amount: 25000, currency: 'NGN', status: 'SUCCESSFUL' },
+          { reference: 'PAY-MISSING-ON-PROV', amount: 5000, currency: 'NGN', status: 'PENDING' },
+        ],
+        exported
+      );
+
+      expect(report.summary.matchedCount).toBe(1);
+      expect(report.summary.resolvedAmbiguousCount).toBe(1);
+      expect(report.statusMismatches).toHaveLength(1);
+      expect(report.statusMismatches[0].reference).toBe('PAY-NG-AMB');
+      expect(report.amountMismatches).toHaveLength(1);
+      expect(report.missingOnProvider).toHaveLength(1);
+      expect(report.missingInLedger).toHaveLength(1);
+      expect(report.missingInLedger[0].reference).toBe('PAY-NG-UNRECORDED');
+      expect(report.summary.discrepancyCount).toBe(4);
+
+      const csv = engine.formatSettlementsCsv(exported);
+      expect(csv.split('\n')[0]).toBe(
+        'rail,transactionId,reference,status,providerStatus,amount,currency,fee,createdAt'
+      );
+      // Formula-injection neutralization: "=PAY-PS-AMT" is prefixed with single quote
+      expect(csv).toContain("'=PAY-PS-AMT");
+    });
   });
 });
